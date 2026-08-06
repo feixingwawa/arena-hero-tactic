@@ -1,0 +1,42 @@
+sequenceDiagram
+    autonumber
+    participant M as main.py
+    participant D as strategy.decide(turn, config, memory)
+    participant Mem as MemoryMap
+    participant R as roles.assign_roles
+    participant E as economy.command_workers
+    participant P as pathing
+    participant U as Worker / SDK
+
+    M->>D: turn(tick, resources, resource_cells, obstacle_cells, events, beacon)
+    D->>D: tick / pop / core_pos / beacon 提取
+    D->>Mem: observe(turn, tick)  % 资源可见性、障碍累积、事件(掉落)
+    Mem-->>D: 状态已更新
+    D->>R: assign_roles(turn, config, core_pos)
+    R-->>D: RolePlan(threat_positions, assignments)
+    D->>E: command_workers(turn, plan, config, core_pos, memory)
+    E->>E: cargo>0 ? → deposit / return_deposit (clamp_step_toward_memo)
+
+    alt 站在可见资源格
+        E->>U: harvest()
+        E->>Mem: mark_harvested(pos, tick)
+    else 有可见/可回访资源目标
+        E->>Mem: revisit_candidates(core, tick, pos, max_dist)
+        Mem-->>E: 候选资源点（claim 去重）
+        E->>U: move(to_resource) / harvest()
+    else 无资源 → 螺旋扫掠
+        E->>E: 读 SpiralState[worker]（ring / sector / index / target）
+        E->>P: spiral_target(core, sector_id, sector_count, ring, index)
+        P-->>E: target Position
+        E->>P: clamp_step_toward_memo(pos, target, obstacles, last_dir)
+        P-->>E: (direction, last_dir)
+        alt 到达目标
+            E->>E: index+1；本环扫完则 ring+1
+        else 连续 N tick 无进展（stall）
+            E->>E: 软回撤：ring-1 / 换目标 / 朝 Core 一步（SpiralState 重置）
+        end
+        E->>U: move(direction)
+    end
+
+    E-->>D: logs（explore:ring=..:sec=..:stall=..）
+    D->>M: turn.submit()（main.py 负责提交，decide 不解耦 I/O）

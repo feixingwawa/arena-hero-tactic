@@ -243,7 +243,9 @@ def main() -> int:
         f"role={plan_cargo.assignments[0].role.value}",
     )
 
-    # 两 worker 无资源：探索方向必须不同（修复同格振荡）
+    # 两 worker 无资源：螺旋目标必须不同（扇区分散，防扎堆）
+    from bot.pathing import spiral_target
+
     wa = StubUnit(position=(10, 10), cargo=0, unit_type="WORKER")
     wb = StubUnit(position=(10, 10), cargo=0, unit_type="WORKER")
     te = StubTurn(
@@ -255,24 +257,15 @@ def main() -> int:
     )
     plane = assign_roles(te, config=config)
     logs_e = command_workers(te, plane, config=config)
-    dirs = []
-    for line in logs_e:
-        if ":explore:" in line:
-            # worker:id:explore:DIR 或 worker:id:explore:DIR:r=N:ph=M
-            parts = line.split(":")
-            # 找到 explore 后的方向字段
-            try:
-                ei = parts.index("explore")
-                dirs.append(parts[ei + 1])
-            except (ValueError, IndexError):
-                dirs.append(line.rsplit(":", 1)[-1])
     check(
         "explore_dirs_differ",
         wa.action == "move"
         and wb.action == "move"
-        and len(dirs) == 2
-        and dirs[0] != dirs[1],
-        f"dirs={dirs} args={[wa.action_args, wb.action_args]}",
+        and len(logs_e) == 2
+        and not any(":recall" in line for line in logs_e)
+        and spiral_target((10, 10), 0, config.sector_count, config.spiral_base_ring, 0)
+        != spiral_target((10, 10), 1, config.sector_count, config.spiral_base_ring, 0),
+        f"logs={logs_e}",
     )
     # pathing 辅助：两 worker 目标点不同
     targets = explore_targets((10, 10), 2, tick=1, base_radius=4)
@@ -342,7 +335,9 @@ def main() -> int:
         f"role_ok={role_recall_ok} dir={dir_recall} nxt={nxt_recall} logs={logs_recall}",
     )
 
-    # 探索不朝 Core 收缩：worker (30,10) dist=20 < 32 → explore 方向不减距 Core 距离
+    # 探索改目标点导航：worker (30,10) 朝螺旋目标行进，缩短与目标距离
+    from bot.pathing import manhattan as _manhattan
+
     w_expl = StubUnit(position=(30, 10), cargo=0, unit_type="WORKER")
     t_expl = StubTurn(
         resources=5,
@@ -358,12 +353,13 @@ def main() -> int:
         dir_expl
     ]
     nxt_expl = (30 + delta_expl[0], 10 + delta_expl[1])
+    _tg = spiral_target((10, 10), 0, config.sector_count, config.spiral_base_ring, 0)
     check(
-        "worker_explore_respects_max_radius",
+        "worker_explore_navigates_to_target",
         w_expl.action == "move"
-        and manhattan(nxt_expl, (10, 10)) >= 20
-        and not any(":recall" in line for line in logs_expl),
-        f"dir={dir_expl} nxt={nxt_expl} logs={logs_expl}",
+        and _manhattan(nxt_expl, _tg) < _manhattan((30, 10), _tg)
+        and not any(":recall_soft" in line for line in logs_expl),
+        f"dir={dir_expl} nxt={nxt_expl} target={_tg} logs={logs_expl}",
     )
 
     # 满货 worker 在 Core 正下方 3 格、中间 (10,11) 有障碍：连续 6 tick 不得横跳
@@ -408,25 +404,10 @@ def main() -> int:
     )
 
     # recall 边界（d=37/36 对抖，线上 35d30567 现象）：10 tick 不回到旧位置
-    from bot.economy import (
-        _explore_axis,
-        _explore_phase,
-        _explore_ticks,
-        _last_explore_dir,
-        _last_explore_pos,
-        _prev_explore_pos,
-    )
+    from bot.economy import _spiral_state
 
-    for _d in (
-        _last_move_dir,
-        _last_explore_dir,
-        _last_explore_pos,
-        _prev_explore_pos,
-        _explore_phase,
-        _explore_ticks,
-        _explore_axis,
-    ):
-        _d.clear()
+    _spiral_state.clear()
+    _last_move_dir.clear()
     _w_rec = StubUnit(position=(47, 10), cargo=0, unit_type="WORKER")  # d=37
     _t_rec = StubTurn(
         resources=5,
@@ -457,7 +438,7 @@ def main() -> int:
             _rec_left_steps += 1
     check(
         "worker_recall_boundary_no_oscillation",
-        _rec_ok and _rec_left_steps >= 1,
+        _rec_ok and _rec_left_steps >= 5,
         f"revisit={not _rec_ok} left_steps={_rec_left_steps} pos={_rec_pos}",
     )
 
@@ -606,6 +587,112 @@ def main() -> int:
         "counts",
         count_by_type(tcnt) == {"WORKER": 3, "VANGUARD": 1, "RANGER": 1}
         and total_population(tcnt) == 5,
+    )
+
+    print("=== new features (T01-T05) ===")
+    from bot.rules import unit_cost_for, core_resource_capacity, chunk_quota as q_quota
+
+    check(
+        "dynamic_price",
+        unit_cost_for("WORKER", 19) == 5
+        and unit_cost_for("WORKER", 20) == 7
+        and unit_cost_for("VANGUARD", 25) == 17
+        and unit_cost_for("RANGER", 30) == 26,
+    )
+    check(
+        "core_capacity",
+        core_resource_capacity(0) == 10 and core_resource_capacity(10) == 50,
+    )
+    check(
+        "chunk_quota",
+        q_quota(0) == 16 and q_quota(8) == 8 and q_quota(56) == 2,
+    )
+
+    from bot.pathing import (
+        ring_points,
+        sector_points,
+        spiral_target,
+        chunk_of,
+        chunk_ring,
+    )
+
+    _r5 = ring_points((10, 10), 5)
+    _secs = [set(sector_points((10, 10), 5, s, 4)) for s in range(4)]
+    check(
+        "ring_sectors",
+        len(_r5) == 20
+        and all(not (_secs[i] & _secs[j]) for i in range(4) for j in range(i + 1, 4))
+        and len(set().union(*_secs)) == 20,
+    )
+    check(
+        "spiral_targets_differ",
+        spiral_target((10, 10), 0, 4, 5, 0) != spiral_target((10, 10), 1, 4, 5, 0),
+    )
+    check(
+        "chunk_helpers",
+        chunk_of((31, 31)) == (0, 0)
+        and chunk_of((32, 32)) == (1, 1)
+        and chunk_ring(chunk_of((74, 10)), chunk_of((10, 10))) == 2,
+    )
+
+    from bot.memory import MemoryMap, DEPLETED, REVISIT_DUE
+
+    _mem = MemoryMap(refresh_interval_ticks=4)
+    _m1 = StubTurn(tick=1, core=StubCore(position=(10, 10)), resource_cells={(14, 10)})
+    _mem.observe(_m1, 1)
+    _m2 = StubTurn(tick=2, core=StubCore(position=(10, 10)), resource_cells=set())
+    _mem.observe(_m2, 2)
+    _m3 = StubTurn(tick=6, core=StubCore(position=(10, 10)), resource_cells=set())
+    _mem.observe(_m3, 6)
+    check(
+        "memory_state_machine",
+        _mem.resource_points[(14, 10)].state == REVISIT_DUE
+        and (14, 10) in _mem.revisit_candidates((10, 10), 6, (10, 10), 40),
+    )
+
+    from tests.stubs import StubBeacon, StubEvent
+
+    _wb = StubUnit(position=(15, 10), cargo=0, unit_type="WORKER")
+    _tb = StubTurn(
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[_wb],
+        resource_cells=set(),
+        beacon=StubBeacon(position=(15, 10), status="GROUND", carrier_id=None),
+    )
+    _pb = assign_roles(_tb, config=config)
+    command_workers(_tb, _pb, config=config)
+    check("beacon_pickup", _wb.action == "pickup_beacon")
+
+    _mc = MemoryMap()
+    _mc.observe(
+        StubTurn(
+            tick=1,
+            core=StubCore(position=(10, 10)),
+            events=[
+                StubEvent(
+                    event_type="WORKER_CARGO_DROPPED",
+                    position=(30, 10),
+                    values={"amount": 3},
+                )
+            ],
+        ),
+        1,
+    )
+    _wc = StubUnit(position=(20, 10), cargo=0, unit_type="WORKER")
+    _tc = StubTurn(
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[_wc],
+        resource_cells=set(),
+        visible_enemies=[],
+    )
+    _pc = assign_roles(_tc, config=config)
+    _logs_c = command_workers(_tc, _pc, config=config, memory=_mc)
+    check(
+        "cargo_reclaim",
+        _wc.action == "move" and any(":to_cargo:" in line for line in _logs_c),
+        f"logs={_logs_c}",
     )
 
     print(f"\n=== RESULT: {passed} passed, {failed} failed ===")

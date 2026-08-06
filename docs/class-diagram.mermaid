@@ -1,0 +1,125 @@
+classDiagram
+    direction LR
+
+    class ResourcePointState {
+        +Position pos
+        +str state  % VISIBLE | DEPLETED | REVISIT_DUE
+        +int seen_tick
+        +int depleted_tick
+        +int refresh_due_tick
+        +int chunk_ring
+        +mark_visible(tick) None
+        +mark_depleted(tick, interval) None
+        +is_revisit_due(tick) bool
+    }
+
+    class DroppedCargoState {
+        +Position pos
+        +int amount
+        +int drop_tick
+        +bool collected
+    }
+
+    class MemoryMap {
+        +dict resource_points
+        +set obstacles
+        +dict dropped_cargo
+        +dict chunk_quota_cache
+        +observe(turn, tick) None
+        +mark_harvested(pos, tick) None
+        +revisit_candidates(core, tick, worker_pos, max_dist) list
+        +is_obstacle(pos) bool
+        +remember_dropped_cargo(pos, amount, tick) None
+        +chunk_of(pos) tuple
+        +chunk_quota(chunk) int
+        +refresh_due(pos, tick) bool
+    }
+
+    class SpiralState {
+        +int ring
+        +int sector_id
+        +int index
+        +Position target
+        +int stalled_ticks
+        +bool ring_done
+    }
+
+    class TacticConfig {
+        +int max_population
+        +int target_workers
+        +int target_vanguards
+        +int target_rangers
+        +int reserve_resources
+        +int sector_count
+        +int spiral_base_ring
+        +int spiral_max_ring
+        +int recall_stall_ticks
+        +int refresh_interval_ticks
+        +int revisit_max_distance
+        +int early_game_pop
+    }
+
+    class rules {
+        +unit_cost_for(type_name, population) int
+        +core_resource_capacity(population) int
+    }
+
+    class RoleAssignment {
+        +UUID unit_id
+        +Role role
+        +Position hint_target
+        +int sector_id
+    }
+
+    class RolePlan {
+        +list assignments
+        +list threat_positions
+        +get(unit_id) RoleAssignment
+        +by_role(role) list
+    }
+
+    class DecisionResult {
+        +int tick
+        +int population
+        +int resources
+        +dict counts
+        +list logs
+        +summary() str
+    }
+
+    class pathing {
+        +ring_points(center, radius) list
+        +sector_points(center, radius, sector_id, sector_count, phase_offset) list
+        +spiral_target(core, sector_id, sector_count, ring, index) Position
+        +clamp_step_toward_memo(origin, target, obstacles, last_dir, memo) tuple
+        +chunk_of(pos) tuple
+        +chunk_ring(chunk, center_chunk) int
+    }
+
+    class economy {
+        +choose_spawn(turn, config, has_near_threat, has_far_threat) str
+        +command_workers(turn, role_plan, config, core_position, memory) list
+        +can_afford(resources, cost, reserve) bool
+    }
+
+    class strategy {
+        +decide(turn, config, memory) DecisionResult
+    }
+
+    class roles {
+        +assign_roles(turn, config, core_position) RolePlan
+    }
+
+    MemoryMap --> ResourcePointState : contains
+    MemoryMap --> DroppedCargoState : contains
+    MemoryMap ..> rules : uses chunk_quota
+    MemoryMap ..> pathing : chunk_of / chunk_ring
+    economy --> MemoryMap : reads / writes
+    economy --> SpiralState : per-worker explore state
+    economy --> pathing : clamp_step_toward_memo / spiral_target
+    economy ..> rules : unit_cost_for
+    strategy --> economy : command_workers / command_core_economy
+    strategy --> roles : assign_roles
+    roles --> RolePlan : builds
+    RolePlan --> RoleAssignment : contains
+    strategy --> MemoryMap : observe + inject

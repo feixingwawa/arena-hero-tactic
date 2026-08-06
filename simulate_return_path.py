@@ -22,16 +22,8 @@ from tests.stubs import StubCore, StubTurn, StubUnit
 # 清空方向记忆模块级状态，保证模拟从头开始
 import bot.economy as economy
 
-for d in (
-    economy._last_explore_pos,
-    economy._prev_explore_pos,
-    economy._explore_phase,
-    economy._explore_ticks,
-    economy._explore_axis,
-    economy._last_explore_dir,
-    economy._last_move_dir,
-):
-    d.clear()
+economy._spiral_state.clear()
+economy._last_move_dir.clear()
 
 config = TacticConfig(
     max_population=18,

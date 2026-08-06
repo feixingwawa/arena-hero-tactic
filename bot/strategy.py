@@ -18,6 +18,7 @@ from bot.combat import (
 )
 from bot.config import TacticConfig, DEFAULT_CONFIG
 from bot.economy import command_core_economy, command_workers
+from bot.memory import MemoryMap, WORLD_MEMORY
 from bot.pathing import manhattan
 from bot.roles import assign_roles, count_by_type, total_population, _as_position
 
@@ -53,6 +54,7 @@ def _core_position(turn: Any) -> Optional[tuple[int, int]]:
 def decide(
     turn: Any,
     config: TacticConfig = DEFAULT_CONFIG,
+    memory: Optional[MemoryMap] = None,
 ) -> DecisionResult:
     """对当前 Turn 执行「均衡扩张 + 防守」决策并排队全部动作。
 
@@ -60,6 +62,8 @@ def decide(
         turn: arena_hero.Turn 或兼容 stub（需提供 workers/vanguards/rangers/
               core/resources/visible_enemies/resource_cells 等属性）。
         config: 可注入的战术参数。
+        memory: 可选地图记忆；None 时使用模块级 WORLD_MEMORY 单例。
+                tick 早期会调用 memory.observe(turn, tick) 更新记忆。
 
     Returns:
         DecisionResult 决策摘要。不会调用 turn.submit()。
@@ -69,6 +73,7 @@ def decide(
     counts = count_by_type(turn)
     pop = total_population(turn)
     core_pos = _core_position(turn)
+    mem = memory if memory is not None else WORLD_MEMORY
 
     result = DecisionResult(
         tick=tick,
@@ -92,6 +97,14 @@ def decide(
         result.logs.append("strategy:no_core")
         result.core_action = "absent"
         return result
+
+    # tick 早期：更新地图记忆（资源可见性 / 障碍 / 掉落 cargo）
+    mem.observe(turn, tick)
+
+    # Beacon 提取（P2-1 预留：decide 负责读取，economy 消费 turn.beacon）
+    beacon = getattr(turn, "beacon", None)
+    if beacon is not None:
+        result.logs.append(f"strategy:beacon:pos={_as_position(beacon.position)}")
 
     # 1) 角色分配 + 威胁评估
     role_plan = assign_roles(turn, config=config, core_position=core_pos)
@@ -130,7 +143,7 @@ def decide(
 
     # 3) Worker 经济
     w_logs = command_workers(
-        turn, role_plan, config=config, core_position=core_pos
+        turn, role_plan, config=config, core_position=core_pos, memory=mem
     )
     result.logs.extend(w_logs)
 

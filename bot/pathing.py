@@ -10,6 +10,9 @@ from typing import Iterable, Optional, Sequence
 # 位置类型：(x, y)
 Position = tuple[int, int]
 
+# chunk 尺寸：地图记忆按 32×32 chunk 划分（与刷新配额/回访调度相关）
+CHUNK_SIZE: int = 32
+
 # 四向位移（与 arena_hero.Direction 语义对齐）
 DIR_UP: Position = (0, -1)
 DIR_DOWN: Position = (0, 1)
@@ -52,6 +55,16 @@ def opposite_name(name: Optional[str]) -> Optional[str]:
 def manhattan(a: Position, b: Position) -> int:
     """曼哈顿距离 |dx| + |dy|。"""
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+def chunk_of(pos: Position) -> tuple[int, int]:
+    """返回位置所属 chunk（32×32 格，向下取整）。"""
+    return (int(pos[0]) // CHUNK_SIZE, int(pos[1]) // CHUNK_SIZE)
+
+
+def chunk_ring(chunk: tuple[int, int], center_chunk: tuple[int, int]) -> int:
+    """返回 chunk 相对 Core chunk 的曼哈顿环序号。"""
+    return manhattan((int(chunk[0]), int(chunk[1])), (int(center_chunk[0]), int(center_chunk[1])))
 
 
 def add_pos(a: Position, delta: Position) -> Position:
@@ -344,6 +357,85 @@ def _angle_key(origin: Position, point: Position) -> float:
     import math
 
     return math.atan2(point[1] - origin[1], point[0] - origin[0])
+
+
+def ring_points(center: Position, radius: int) -> list[Position]:
+    """返回以 center 为中心的曼哈顿菱形环上全部点（顺时针稳定排序）。
+
+    radius=0 返回 [center]；radius>0 时环上恰有 4*radius 个点。
+    排序键 = (角度, x, y)，确定性，供扇区切分与螺旋扫掠复用。
+    """
+    if radius <= 0:
+        return [center]
+    ring: list[Position] = []
+    for dx in range(-radius, radius + 1):
+        dy = radius - abs(dx)
+        ring.append((center[0] + dx, center[1] + dy))
+        if dy != 0:
+            ring.append((center[0] + dx, center[1] - dy))
+    unique = sorted(set(ring), key=lambda p: (_angle_key(center, p), p[0], p[1]))
+    return unique
+
+
+def sector_points(
+    center: Position,
+    radius: int,
+    sector_id: int,
+    sector_count: int = 4,
+    phase_offset: int = 0,
+) -> list[Position]:
+    """返回环上属于给定扇区的点（确定性扇区切分）。
+
+    规则：环上第 i 个点（稳定排序）当 `(i + phase_offset) % sector_count ==
+    sector_id` 时属于该扇区。扇区之间天然不重叠，合起来覆盖整环。
+    """
+    if sector_count <= 0:
+        sector_count = 1
+    pts = ring_points(center, radius)
+    sid = sector_id % sector_count
+    result: list[Position] = []
+    for i, p in enumerate(pts):
+        if (i + phase_offset) % sector_count == sid:
+            result.append(p)
+    return result
+
+
+def spiral_target(
+    core: Position,
+    sector_id: int,
+    sector_count: int,
+    ring: int,
+    index: int,
+) -> Position:
+    """返回螺旋扫掠的当前目标点。
+
+    在第 ring 环上取 sector_id 扇区的第 index 个点；index 越界时取模回绕，
+    保证永远返回具体 Position（确定性）。
+    """
+    pts = sector_points(core, ring, sector_id, sector_count)
+    if not pts:
+        return core
+    return pts[index % len(pts)]
+
+
+def point_sector(
+    center: Position,
+    pos: Position,
+    sector_count: int = 4,
+    phase_offset: int = 0,
+) -> int:
+    """返回 pos 相对 center 所属扇区（与 sector_points 同一套切分规则）。"""
+    if sector_count <= 0:
+        sector_count = 1
+    r = manhattan(center, pos)
+    if r <= 0:
+        return 0
+    pts = ring_points(center, r)
+    try:
+        idx = pts.index(pos)
+    except ValueError:
+        return 0
+    return (idx + phase_offset) % sector_count
 
 
 def cells_toward_ring(

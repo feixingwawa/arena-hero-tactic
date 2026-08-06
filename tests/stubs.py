@@ -58,6 +58,10 @@ class StubUnit:
         self.action = "self_destruct"
         self.action_args = None
 
+    def pickup_beacon(self) -> None:
+        self.action = "pickup_beacon"
+        self.action_args = None
+
     def clear_action(self) -> None:
         self.action = None
         self.action_args = None
@@ -99,10 +103,15 @@ class StubCore:
 
 @dataclass
 class StubState:
+    """PlayerState 轻量 stub。
+
+    注意：v0.14 已移除 `upkeep_next_tick` 字段，本类不再声明；
+    旧测试若仍对其 setattr，仅作为普通实例属性存在，经济模块不再读取。
+    """
+
     resources: int = 5
     population: int = 1
     population_tier: int = 0
-    upkeep_next_tick: int = 0
     status: str = "ACTIVE"
     respawn_at_tick: Optional[int] = None
 
@@ -117,6 +126,27 @@ class StubEnemy:
 
 
 @dataclass
+class StubBeacon:
+    """ChampionBeacon 轻量 stub（status 用字符串 "GROUND"/"CARRIED"）。"""
+
+    position: Position = (0, 0)
+    status: Optional[str] = "GROUND"
+    carrier_id: Optional[UUID] = None
+
+
+@dataclass
+class StubEvent:
+    """ResolutionEvent 轻量 stub。"""
+
+    event_type: str = ""
+    position: Optional[Position] = None
+    values: Optional[dict[str, Any]] = None
+    tick: int = 0
+    actor_id: Optional[UUID] = None
+    reason_code: Optional[str] = None
+
+
+@dataclass
 class StubTurn:
     tick: int = 1
     resources: int = 5
@@ -128,6 +158,8 @@ class StubTurn:
     visible_enemies: list[StubEnemy] = field(default_factory=list)
     resource_cells: set[Position] = field(default_factory=set)
     obstacle_cells: set[Position] = field(default_factory=set)
+    events: list[StubEvent] = field(default_factory=list)
+    beacon: Optional[StubBeacon] = None
     state: Optional[StubState] = None
     submitted: bool = False
 
@@ -139,7 +171,6 @@ class StubTurn:
             self.state = StubState(
                 resources=self.resources,
                 population=pop,
-                upkeep_next_tick=0 if pop < 20 else 1,
             )
 
     @property

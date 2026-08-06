@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional, Sequence
+from typing import Any, Optional
 from uuid import UUID
 
 from bot.config import TacticConfig, DEFAULT_CONFIG
@@ -49,6 +49,8 @@ class RoleAssignment:
     cargo: int = 0
     # 可选提示目标（资源点 / 防守位 / 敌人）
     hint_target: Optional[Position] = None
+    # 螺旋扫掠扇区（worker_index % sector_count；非 Worker 为 None）
+    sector_id: Optional[int] = None
 
 
 @dataclass
@@ -150,6 +152,12 @@ def assign_roles(
         snap = snapshot_from_unit(w, "WORKER", config.worker_max_hp)
         role = Role.HARVESTER
         hint: Optional[Position] = None
+        # 扇区 = worker 在列表中的下标 % sector_count（与 economy 探索一致）
+        try:
+            widx = workers.index(w)
+        except (ValueError, TypeError):
+            widx = 0
+        sector_id = widx % max(1, config.sector_count)
 
         # 低血：优先回 Core 治疗
         if snap.hp <= config.unit_heal_hp_threshold and snap.hp < snap.max_hp:
@@ -187,6 +195,7 @@ def assign_roles(
                 hp=snap.hp,
                 cargo=snap.cargo,
                 hint_target=hint,
+                sector_id=sector_id,
             )
         )
 

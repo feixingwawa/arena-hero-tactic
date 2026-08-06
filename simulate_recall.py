@@ -1,9 +1,9 @@
 """跑飞回撤 + 螺旋扫掠 短模拟脚本。
 
-场景：worker 从 (50,10) 出发（距 Core(10,10) = 40，超出探索上限 32+4），
-连续 5 tick 无敌人、无资源。预期：
-- 先逐步回撤靠近 Core（每 tick manhattan 递减或至少不增超过 2）
-- 之后进入垂直轴扫掠（方向切垂直轴）
+场景：worker 从 (50,10) 出发（距 Core(10,10) = 40），
+连续 5 tick 无敌人、无资源。预期（v0.14 优化后）：
+- 目标点导航朝螺旋目标行进（方向单调、无 RIGHT↔LEFT 横跳）
+- 每 tick manhattan 不暴增（<= +2）
 
 用法：.venv/Scripts/python.exe simulate_recall.py
 """
@@ -23,15 +23,8 @@ from tests.stubs import StubCore, StubTurn, StubUnit
 # 清空探索模块级状态，保证模拟从头开始
 import bot.economy as economy
 
-for d in (
-    economy._last_explore_pos,
-    economy._prev_explore_pos,
-    economy._explore_phase,
-    economy._explore_ticks,
-    economy._explore_axis,
-    economy._last_explore_dir,
-):
-    d.clear()
+economy._spiral_state.clear()
+economy._last_move_dir.clear()
 
 config = TacticConfig(
     max_population=18,

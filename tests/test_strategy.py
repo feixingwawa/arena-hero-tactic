@@ -148,10 +148,59 @@ def test_pathing_helpers() -> None:
         assert abs(s[0] - 10) + abs(s[1] - 10) == 2
 
 
-def test_default_config_keeps_upkeep_zero() -> None:
-    """默认编制人口应 < 20。"""
+def test_decide_memory_injection_smoke(config: TacticConfig) -> None:
+    """decide 注入干净 memory：observe 生效、回访候选驱动采集。"""
+    from bot.memory import MemoryMap
+
+    mem = MemoryMap(refresh_interval_ticks=4)
+    worker = StubUnit(position=(11, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        tick=1,
+        resources=5,
+        core=StubCore(position=(10, 10), hp=5, shield=5),
+        workers=[worker],
+        resource_cells={(14, 10)},
+    )
+    result = decide(turn, config=config, memory=mem)
+    # observe 已记录资源点
+    assert (14, 10) in mem.resource_points
+    # worker 走向可见资源（move）
+    assert worker.action in ("move", "harvest")
+    assert "threat:" in "".join(result.logs)
+
+
+def test_decide_memory_observe_updates_on_tick(config: TacticConfig) -> None:
+    """decide 每 tick observe：资源点消失后进入 DEPLETED。"""
+    from bot.memory import DEPLETED, MemoryMap
+
+    mem = MemoryMap(refresh_interval_ticks=4)
+    worker = StubUnit(position=(11, 10), cargo=0, unit_type="WORKER")
+    core = StubCore(position=(10, 10), hp=5, shield=5)
+    t1 = StubTurn(tick=1, resources=5, core=core, workers=[worker],
+                  resource_cells={(14, 10)})
+    decide(t1, config=config, memory=mem)
+    assert mem.resource_points[(14, 10)].state == "VISIBLE"
+
+    t2 = StubTurn(tick=2, resources=5, core=core, workers=[worker],
+                  resource_cells=set())
+    decide(t2, config=config, memory=mem)
+    assert mem.resource_points[(14, 10)].state == DEPLETED
+
+
+def test_default_config_new_defaults() -> None:
+    """v0.14 优化默认值：编制 ≤ 人口上限；新增螺旋/记忆参数；无 upkeep 字段。"""
     cfg = DEFAULT_CONFIG
     total = cfg.target_workers + cfg.target_vanguards + cfg.target_rangers
     assert total <= cfg.max_population
-    assert total < 20
-    assert cfg.max_population < 20
+    assert cfg.max_population == 30
+    assert cfg.target_workers == 14
+    assert cfg.sector_count == 4
+    assert cfg.spiral_base_ring == 5
+    assert cfg.spiral_max_ring == 32
+    assert cfg.recall_stall_ticks == 6
+    assert cfg.refresh_interval_ticks == 4
+    assert cfg.revisit_max_distance == 40
+    # v0.14 已移除维护费与固定成本字段
+    assert not hasattr(cfg, "upkeep_soft_cap")
+    assert not hasattr(cfg, "upkeep_hard_cap")
+    assert not hasattr(cfg, "worker_cost")

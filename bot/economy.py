@@ -1,26 +1,26 @@
-"""经济模块：采集 / 交付 / 生产优先级 / 维护费控制。
+"""经济模块：采集 / 交付 / 生产优先级 / 探索。
 
 与 I/O 解耦：接收 turn + RolePlan，直接在单位对象上排队动作。
+v0.14：无维护费；动态价格走 bot.rules.unit_cost_for；探索为螺旋扫掠 + 软回撤。
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Optional, Sequence
-from uuid import UUID
 
-from bot.config import TacticConfig, DEFAULT_CONFIG, population_upkeep
+from bot.config import TacticConfig, DEFAULT_CONFIG
+from bot.memory import MemoryMap
+from bot.rules import unit_cost_for
 from bot.pathing import (
-    EXPLORE_DIRS,
     NAME_TO_DELTA,
     Position,
     add_pos,
-    clamp_step_toward,
     clamp_step_toward_memo,
-    explore_radius,
-    explore_target,
     manhattan,
     nearest,
-    outward_step,
+    sector_points,
+    spiral_target,
 )
 from bot.roles import (
     Role,
@@ -39,19 +39,6 @@ def _get_resources(turn: Any) -> int:
     if state is not None and hasattr(state, "resources"):
         return int(state.resources)
     return 0
-
-
-def _get_upkeep_next(turn: Any) -> int:
-    """读取下 tick 维护费。"""
-    state = getattr(turn, "state", None)
-    if state is not None and hasattr(state, "upkeep_next_tick"):
-        return int(state.upkeep_next_tick or 0)
-    pop = total_population(turn)
-    if hasattr(turn, "state") and turn.state is not None:
-        pop_attr = getattr(turn.state, "population", None)
-        if pop_attr is not None:
-            pop = int(pop_attr)
-    return population_upkeep(pop)
 
 
 def _resource_cells(turn: Any) -> list[Position]:
@@ -95,23 +82,37 @@ def can_afford(resources: int, cost: int, reserve: int) -> bool:
 
 
 def effective_reserve(pop: int, config: TacticConfig) -> int:
-    """早期人口时 reserve 视为 0，便于 resources>=worker_cost 即可出 WORKER。"""
+    """早期人口时 reserve 视为 0，便于 resources 刚够动态价即可出 WORKER。"""
     if pop < config.early_game_pop:
         return 0
     return config.reserve_resources
 
 
-# 振荡检测：worker 最近位置（按 id 字符串键）
-_last_explore_pos: dict[str, Position] = {}
-_prev_explore_pos: dict[str, Position] = {}  # 上上格，检测 A↔B 对抖
-_explore_phase: dict[str, int] = {}
-# 用「进程内相对探索时长」扩半径，避免世界 tick 过大导致半径恒顶满却无换向节奏
-_explore_ticks: dict[str, int] = {}
-# 粘性探索主轴（RIGHT/LEFT/UP/DOWN），防止远敌避让造成横跳
-_explore_axis: dict[str, str] = {}
-_last_explore_dir: dict[str, str] = {}
+@dataclass
+class SpiralState:
+    """单个 Worker 的螺旋扫掠探索状态。
+
+    Attributes:
+        ring: 当前曼哈顿环半径。
+        sector_id: 扇区（worker_index % sector_count）。
+        index: 当前环扇区点列表中的下标。
+        target: 当前目标点（None 表示待生成）。
+        stalled_ticks: 连续无进展 tick 数（软回撤阈值 recall_stall_ticks）。
+        ring_done: 当前环已扫完标记。
+    """
+
+    ring: int = 5
+    sector_id: int = 0
+    index: int = 0
+    target: Optional[Position] = None
+    stalled_ticks: int = 0
+    ring_done: bool = False
+
+
 # 非探索移动（return_deposit / to_resource / retreat / recall）的方向记忆，防 A↔B 对抖
 _last_move_dir: dict[str, str] = {}
+# 螺旋扫掠探索状态（按 worker id 字符串键）
+_spiral_state: dict[str, SpiralState] = {}
 
 
 def _worker_key(uid: Any) -> str:
@@ -144,11 +145,6 @@ def _perpendicular_dirs(name: str) -> tuple[str, str]:
     return ("LEFT", "RIGHT")
 
 
-def _axis_from_index(widx: int) -> str:
-    """稳定主轴：0 RIGHT, 1 DOWN, 2 LEFT, 3 UP …"""
-    return ("RIGHT", "DOWN", "LEFT", "UP")[widx % 4]
-
-
 def _pick_explore_direction_avoiding_enemies(
     pos: Position,
     preferred: Optional[str],
@@ -156,12 +152,16 @@ def _pick_explore_direction_avoiding_enemies(
     core_position: Position,
     obstacles: set[Position],
 ) -> tuple[Optional[str], bool]:
-    """探索时避敌：保持主轴；危险时垂直外扩，禁止直接反向（防横跳）。
+    """探索时避敌改道：preferred 若安全则保留；否则选不更靠近敌人的方向。
+
+    这是「改道」而非「强制外扩」：不再要求避敌方向必须远离 Core（删除
+    「绝不朝 Core 收缩」守卫，避免制造 d=36/37 单维势阱）。
+    仅禁止直接反向（防 A↔B 对抖）与靠近敌人。
 
     规则：
     1. 无敌人 → 原方向
     2. preferred 不更靠近敌人 → 保留 preferred
-    3. preferred 会靠近敌人 → 优先垂直方向中「不靠近敌 + 外扩」的一步
+    3. preferred 会靠近敌人 → 优先垂直方向中「不更靠近敌」的一步
     4. 绝不优先选 preferred 的正反方向（LEFT↔RIGHT / UP↔DOWN）
     """
     if not enemies:
@@ -172,7 +172,6 @@ def _pick_explore_direction_avoiding_enemies(
         return preferred, False
 
     dist_now = manhattan(pos, nearest_enemy)
-    core_now = manhattan(pos, core_position)
     opp = _opposite_dir(preferred) if preferred else None
 
     # preferred 安全则绝不改道
@@ -202,7 +201,6 @@ def _pick_explore_direction_avoiding_enemies(
         if nxt in obstacles:
             continue
         dist_after = manhattan(nxt, nearest_enemy)
-        core_after = manhattan(nxt, core_position)
         score = 0
         if dist_after < dist_now:
             score -= 200
@@ -210,15 +208,11 @@ def _pick_explore_direction_avoiding_enemies(
             score += 50
         else:
             score += 15
-        if core_after > core_now:
-            score += 60 + (core_after - core_now) * 12
-        elif core_after < core_now:
-            score -= 80  # 禁止借避敌缩回 Core
         if name == preferred:
             score += 20
         if name == opp:
             score -= 100  # 强力惩罚反向横跳
-        # 垂直外扩额外加分
+        # 垂直改道额外加分（不要求外扩）
         if preferred and name in _perpendicular_dirs(preferred):
             score += 35
         if score > best_score:
@@ -243,43 +237,30 @@ def choose_spawn(
     1. workers 不足目标 → WORKER
     2. 有威胁且战斗单位不足 → Vanguard（近）/ Ranger（远）
     3. 补齐目标编制的 Vanguard / Ranger
-    4. 人口/维护费/资源不足 → None
+    4. 人口/资源不足 → None
 
-    早期（pop < early_game_pop）spawn 时 reserve 视为 0。
+    成本一律走 `rules.unit_cost_for(name, pop + 1)`（spawn 后人口估算，
+    v0.14 动态价格，无维护费）。早期（pop < early_game_pop）reserve 视为 0。
     """
     counts = count_by_type(turn)
     pop = total_population(turn)
     resources = _get_resources(turn)
-    upkeep = _get_upkeep_next(turn)
     reserve = effective_reserve(pop, config)
-
-    # 已在维护费档位：除非严重缺防，停止扩军
-    if upkeep > 0 or pop >= config.upkeep_hard_cap:
-        combat = counts["VANGUARD"] + counts["RANGER"]
-        if not (has_near_threat and combat == 0):
-            return None
 
     if pop >= config.max_population:
         return None
 
-    # 软上限：只允许补防
-    soft_blocked = pop >= config.upkeep_soft_cap
-
-    def try_type(name: str, cost: int) -> Optional[str]:
+    def try_type(name: str) -> Optional[str]:
+        cost = unit_cost_for(name, pop + 1)
         if not can_afford(resources, cost, reserve):
             return None
         if pop + 1 > config.max_population:
             return None
-        # 预测 upkeep
-        if population_upkeep(pop + 1) > 0 and not (
-            has_near_threat and counts["VANGUARD"] + counts["RANGER"] == 0
-        ):
-            return None
         return name
 
     # 1) Worker 优先（早期经济）
-    if counts["WORKER"] < config.target_workers and not soft_blocked:
-        chosen = try_type("WORKER", config.worker_cost)
+    if counts["WORKER"] < config.target_workers:
+        chosen = try_type("WORKER")
         if chosen:
             return chosen
 
@@ -290,37 +271,34 @@ def choose_spawn(
         if counts["VANGUARD"] < config.target_vanguards or (
             has_near_threat and counts["VANGUARD"] == 0
         ):
-            chosen = try_type("VANGUARD", config.vanguard_cost)
+            chosen = try_type("VANGUARD")
             if chosen:
                 return chosen
         if has_far_threat and counts["RANGER"] < max(1, config.target_rangers):
-            chosen = try_type("RANGER", config.ranger_cost)
+            chosen = try_type("RANGER")
             if chosen:
                 return chosen
         if combat_total < combat_target:
             # 更便宜的 Vanguard 优先
             if counts["VANGUARD"] < config.target_vanguards:
-                chosen = try_type("VANGUARD", config.vanguard_cost)
+                chosen = try_type("VANGUARD")
                 if chosen:
                     return chosen
-            chosen = try_type("RANGER", config.ranger_cost)
+            chosen = try_type("RANGER")
             if chosen:
                 return chosen
 
-    if soft_blocked:
-        return None
-
     # 3) 和平补齐编制
     if counts["WORKER"] < config.target_workers:
-        chosen = try_type("WORKER", config.worker_cost)
+        chosen = try_type("WORKER")
         if chosen:
             return chosen
     if counts["VANGUARD"] < config.target_vanguards:
-        chosen = try_type("VANGUARD", config.vanguard_cost)
+        chosen = try_type("VANGUARD")
         if chosen:
             return chosen
     if counts["RANGER"] < config.target_rangers:
-        chosen = try_type("RANGER", config.ranger_cost)
+        chosen = try_type("RANGER")
         if chosen:
             return chosen
 
@@ -332,9 +310,14 @@ def command_workers(
     role_plan: RolePlan,
     config: TacticConfig = DEFAULT_CONFIG,
     core_position: Optional[Position] = None,
+    memory: Optional[MemoryMap] = None,
 ) -> list[str]:
     """为 Worker 排队 harvest / deposit / move。
 
+    无可见资源时执行螺旋扫掠（目标点导航 + 软回撤），不再使用
+    recall_dist 硬边界与「绝不朝 Core 收缩」守卫（修复 d=36/37 势阱）。
+    传入 memory 后，采集分支优先记忆回访候选（revisit_candidates，
+    按 worker 扇区优先），并在采集成功后 mark_harvested。
     返回日志字符串列表（便于调试与测试断言）。
     """
     logs: list[str] = []
@@ -350,9 +333,29 @@ def command_workers(
     workers = list(getattr(turn, "workers", None) or ())
     # 探索避敌：使用角色计划中的威胁位置（可见敌人）
     enemy_positions: list[Position] = list(role_plan.threat_positions or [])
+    tick = int(getattr(turn, "tick", 0) or 0)
 
     # 资源目标去重：多个 worker 尽量分配不同资源点
     claimed: set[Position] = set()
+
+    # Beacon 提取（P2-1）：持有者优先采集；GROUND 同格可拾取
+    beacon = getattr(turn, "beacon", None)
+    beacon_carrier_ids: set[str] = set()
+    beacon_ground_pos: Optional[Position] = None
+    if beacon is not None:
+        status = getattr(beacon, "status", None)
+        status_str = getattr(status, "value", status)
+        if status_str == "CARRIED":
+            cid = getattr(beacon, "carrier_id", None)
+            if cid is not None:
+                beacon_carrier_ids.add(str(cid))
+        elif status_str == "GROUND":
+            bpos = getattr(beacon, "position", None)
+            if bpos is not None:
+                try:
+                    beacon_ground_pos = _as_position(bpos)
+                except Exception:
+                    beacon_ground_pos = None
 
     for w in workers:
         uid = w.id
@@ -360,6 +363,8 @@ def command_workers(
         pos = _as_position(w.position)
         cargo = int(getattr(w, "cargo", 0) or 0)
         role = assignment.role if assignment else Role.HARVESTER
+        wkey = _worker_key(uid)
+        is_beacon_carrier = wkey in beacon_carrier_ids
 
         # 撤退 / 治疗：走向 Core
         if role in (Role.RETREAT, Role.HEAL):
@@ -416,22 +421,61 @@ def command_workers(
                 logs.append(f"worker:{uid}:return_deposit:{direction}")
             continue
 
-        # 站在资源格 → harvest
+        # 拾取地面 Beacon（P2-1：同格 GROUND → pickup_beacon）
+        if (
+            beacon_ground_pos is not None
+            and pos == beacon_ground_pos
+            and hasattr(w, "pickup_beacon")
+        ):
+            w.pickup_beacon()
+            logs.append(f"worker:{uid}:pickup_beacon")
+            continue
+
+        # 站在资源格 → harvest（记忆标记已消耗）
         if pos in set(resources_cells):
             if hasattr(w, "harvest"):
                 w.harvest()
                 logs.append(f"worker:{uid}:harvest")
+                if memory is not None:
+                    memory.mark_harvested(pos, tick)
             continue
 
-        # 走向最近未声称资源
-        available = [c for c in resources_cells if c not in claimed]
-        target = nearest(pos, available) if available else nearest(pos, resources_cells)
+        # 候选 = 可见资源 ∪ 记忆回访候选（按 worker 扇区优先；无本扇区候选则放宽）
+        # Beacon 持有者（P2-1：1 点 → 2 资源）跳过扇区限制，全图找最近资源
+        candidates: list[Position] = list(resources_cells)
+        if memory is not None:
+            sector_id = None if is_beacon_carrier else (
+                getattr(assignment, "sector_id", None) if assignment else None
+            )
+            mem_cands = memory.revisit_candidates(
+                core_position,
+                tick,
+                pos,
+                max_dist=config.revisit_max_distance,
+                sector_id=sector_id,
+            )
+            if not mem_cands and sector_id is not None:
+                mem_cands = memory.revisit_candidates(
+                    core_position,
+                    tick,
+                    pos,
+                    max_dist=config.revisit_max_distance,
+                )
+            for c in mem_cands:
+                if c not in candidates:
+                    candidates.append(c)
+
+        # 走向最近未声称候选资源
+        available = [c for c in candidates if c not in claimed]
+        target = nearest(pos, available) if available else nearest(pos, candidates)
         if target is not None:
             claimed.add(target)
             if pos == target:
                 if hasattr(w, "harvest"):
                     w.harvest()
                     logs.append(f"worker:{uid}:harvest")
+                    if memory is not None:
+                        memory.mark_harvested(pos, tick)
             else:
                 wkey = _worker_key(uid)
                 direction, _ = clamp_step_toward_memo(
@@ -447,175 +491,221 @@ def command_workers(
                 elif hasattr(w, "wait"):
                     w.wait()
                     logs.append(f"worker:{uid}:wait")
-        else:
-            # 无可见资源：粘性主轴外扩；遇敌垂直避让，禁止反向横跳
-            widx = _worker_index(uid, workers, fallback=len(logs))
-            wkey = _worker_key(uid)
-            local_t = _explore_ticks.get(wkey, 0) + 1
-            _explore_ticks[wkey] = local_t
-            phase = _explore_phase.get(wkey, 0)
-            axis = _explore_axis.get(wkey) or _axis_from_index(widx)
-            _explore_axis[wkey] = axis
-
-            prev = _last_explore_pos.get(wkey)
-            prev2 = _prev_explore_pos.get(wkey)
-            last_dir = _last_explore_dir.get(wkey)
-
-            # 原地卡住 → 改垂直主轴
-            if prev is not None and prev == pos:
-                axis = _perpendicular_dirs(axis)[widx % 2]
-                _explore_axis[wkey] = axis
-                phase = (phase + 1) % 8
-            # A↔B 对抖 → 强制垂直轴，清 last_dir
-            elif prev is not None and prev2 is not None and pos == prev2 and pos != prev:
-                axis = _perpendicular_dirs(axis)[0]
-                _explore_axis[wkey] = axis
-                phase = (phase + 1) % 8
-                last_dir = None
-            # 慢换向：每 12 tick 微旋相位，主轴尽量粘住
-            if local_t % 12 == 0:
-                phase = (phase + 1) % 8
-            phase %= 8
-            _explore_phase[wkey] = phase
-            _prev_explore_pos[wkey] = prev if prev is not None else pos
-            _last_explore_pos[wkey] = pos
-
-            r_plan = explore_radius(
-                local_t,
-                base=config.explore_base_radius,
-                max_radius=config.explore_max_radius,
-                expand_every=config.explore_expand_every,
-            )
-            dist_core = manhattan(pos, core_position)
-            # 修复：探索半径严格封顶 explore_max_radius，绝不用 dist_core 顶上去。
-            # 旧代码 r_now=max(r_plan, dist_core+2, base) 让 Worker 永远在
-            # 「当前距离 +2」外扩，单 worker 越走越远最终回不了 Core。
-            r_now = min(
-                max(r_plan, config.explore_base_radius),
-                config.explore_max_radius,
-            )
-
-            # 跑飞回撤：Worker 距 Core 已超出探索上限 + 环带余量 → 回撤一步靠近 Core。
-            recall_dist = config.explore_max_radius + 4
-            if dist_core > recall_dist:
-                direction, _ = clamp_step_toward_memo(
-                    pos,
-                    core_position,
-                    obstacles,
-                    last_dir=_last_move_dir.get(wkey) or _last_explore_dir.get(wkey),
-                )
-                if direction is None:
-                    direction = outward_step(
+        elif memory is not None and cargo == 0:
+            # cargo 回收（P2-2）：空载 worker 优先前往未回收掉落 cargo
+            cargo_target: Optional[Position] = None
+            for cpos, cst in memory.dropped_cargo.items():
+                if cst.collected:
+                    continue
+                if manhattan(pos, cpos) > config.revisit_max_distance:
+                    continue
+                if cargo_target is None or manhattan(pos, cpos) < manhattan(
+                    pos, cargo_target
+                ):
+                    cargo_target = cpos
+            if cargo_target is not None and cargo_target not in claimed:
+                claimed.add(cargo_target)
+                if pos == cargo_target:
+                    if hasattr(w, "harvest"):
+                        w.harvest()
+                        memory.mark_cargo_collected(cargo_target)
+                        logs.append(f"worker:{uid}:reclaim_cargo")
+                else:
+                    direction, _ = clamp_step_toward_memo(
                         pos,
-                        core_position,
-                        preferred=None,
-                        obstacles=obstacles,
-                        last_dir=_last_explore_dir.get(wkey),
+                        cargo_target,
+                        obstacles,
+                        last_dir=_last_move_dir.get(wkey),
                     )
-                if direction and hasattr(w, "move"):
-                    _last_move_dir[wkey] = direction
-                    # 回撤方向也写回 explore 记忆，阻止下一 tick explore 立刻反向（d=36/37 对抖）
-                    _last_explore_dir[wkey] = direction
-                    w.move(_resolve_direction(w, direction))
-                    logs.append(
-                        f"worker:{uid}:explore:{direction}:recall:r={r_now}:d={dist_core}"
-                        f":ph={phase % 8}:ax={axis}"
-                    )
-                elif hasattr(w, "wait"):
-                    w.wait()
-                    logs.append(f"worker:{uid}:wait_idle")
+                    if direction and hasattr(w, "move"):
+                        _last_move_dir[wkey] = direction
+                        w.move(_resolve_direction(w, direction))
+                        logs.append(f"worker:{uid}:to_cargo:{direction}")
+                    elif hasattr(w, "wait"):
+                        w.wait()
+                        logs.append(f"worker:{uid}:wait")
                 continue
-
-            # 超出当前目标半径：不再沿原射线外扩，切垂直轴扫掠一步，
-            # 粘住垂直轴（_explore_axis 更新）并相位+1，触发下一轮换向扫掠。
-            if dist_core > r_now + 2:
-                side = _perpendicular_dirs(axis)[phase % 2]
-                axis = side
-                _explore_axis[wkey] = axis
-                phase = (phase + 1) % 8
-                _explore_phase[wkey] = phase
-
-            ax_delta = NAME_TO_DELTA[axis]
-            side = _perpendicular_dirs(axis)[phase % 2]
-            side_delta = NAME_TO_DELTA[side]
-            explore = (
-                core_position[0] + ax_delta[0] * r_now + side_delta[0] * (phase % 3),
-                core_position[1] + ax_delta[1] * r_now + side_delta[1] * (phase % 3),
-            )
-
-            # 默认：沿主轴外扩一步（不依赖可能落在身后的目标点）
-            direction = outward_step(
-                pos,
-                core_position,
-                preferred=axis,
-                obstacles=obstacles,
-                last_dir=_last_explore_dir.get(wkey),
-            )
-            # 若目标确实在更外侧，允许朝目标走，但仍禁止靠近 Core
-            step_to = clamp_step_toward(pos, explore, obstacles)
-            if step_to:
-                nxt = add_pos(pos, NAME_TO_DELTA[step_to])
-                if manhattan(nxt, core_position) >= dist_core:
-                    direction = step_to
-            preferred = direction or axis
-
-            # 禁止紧接反向横跳 → 改垂直外扩
-            if last_dir and direction and direction == _opposite_dir(last_dir):
-                for cand in _perpendicular_dirs(last_dir):
-                    nxt = add_pos(pos, NAME_TO_DELTA[cand])
-                    if nxt not in obstacles and manhattan(nxt, core_position) >= dist_core:
-                        direction = cand
-                        preferred = cand
-                        axis = cand
-                        _explore_axis[wkey] = axis
-                        break
-
-            avoided = False
-            if enemy_positions:
-                direction, avoided = _pick_explore_direction_avoiding_enemies(
-                    pos,
-                    preferred=preferred or axis,
-                    enemies=enemy_positions,
+            # 无 cargo 可回收 → 螺旋探索
+            logs.extend(
+                _explore_spiral_step(
+                    w=w,
+                    workers=workers,
+                    wkey=wkey,
+                    uid=uid,
+                    pos=pos,
                     core_position=core_position,
                     obstacles=obstacles,
+                    enemy_positions=enemy_positions,
+                    config=config,
                 )
-                # 避敌成功且未反向：可短暂粘垂直轴；若选了反向则强制垂直
-                if direction:
-                    if direction == _opposite_dir(axis):
-                        for cand in _perpendicular_dirs(axis):
-                            nxt = add_pos(pos, NAME_TO_DELTA[cand])
-                            if nxt not in obstacles:
-                                direction = cand
-                                avoided = True
-                                break
-                    if direction in _perpendicular_dirs(axis):
-                        _explore_axis[wkey] = direction
-                        axis = direction
-
-            # 最终守卫：绝不朝 Core 收缩（除非贴身撤退，此处是 explore）
-            if direction:
-                nxt = add_pos(pos, NAME_TO_DELTA[direction])
-                if manhattan(nxt, core_position) < dist_core:
-                    direction = outward_step(
-                        pos,
-                        core_position,
-                        preferred=axis,
-                        obstacles=obstacles,
-                        last_dir=_last_explore_dir.get(wkey),
-                    )
-                    avoided = True
-
-            if direction and hasattr(w, "move"):
-                w.move(_resolve_direction(w, direction))
-                _last_explore_dir[wkey] = direction
-                suffix = ":avoid" if avoided else ""
-                logs.append(
-                    f"worker:{uid}:explore:{direction}:r={r_now}:d={dist_core}"
-                    f":ph={phase % 8}:ax={axis}{suffix}"
+            )
+        else:
+            # 无可见资源：螺旋扫掠 + 目标点导航 + 软回撤（替代旧 recall 硬边界）
+            logs.extend(
+                _explore_spiral_step(
+                    w=w,
+                    workers=workers,
+                    wkey=wkey,
+                    uid=uid,
+                    pos=pos,
+                    core_position=core_position,
+                    obstacles=obstacles,
+                    enemy_positions=enemy_positions,
+                    config=config,
                 )
-            elif hasattr(w, "wait"):
-                w.wait()
-                logs.append(f"worker:{uid}:wait_idle")
+            )
+
+    return logs
+
+
+def _explore_spiral_step(
+    w: Any,
+    workers: Sequence[Any],
+    wkey: str,
+    uid: Any,
+    pos: Position,
+    core_position: Position,
+    obstacles: set[Position],
+    enemy_positions: Sequence[Position],
+    config: TacticConfig,
+) -> list[str]:
+    """无可见资源时的螺旋扫掠一步（目标点导航 + 软回撤）。
+
+    设计要点（决策 1）：
+    - 删除 recall_dist 硬边界与「绝不朝 Core 收缩」守卫——目标点导航沿环切向
+      移动允许曼哈顿距离暂时持平/微降，不再制造 d=36/37 单维势阱。
+    - 到达目标 → index+1；本环扫完 → ring+1；ring 超 spiral_max_ring → 回
+      base ring 重新开始。
+    - 连续 recall_stall_ticks 无进展 → 软回撤：推进环内下一目标点；环到尽头
+      则 ring-1（向内收缩一环）；绝对安全网（d > spiral_max_ring + 8）直接
+      朝 Core 一步。
+    - 避敌仅改道（_pick_explore_direction_avoiding_enemies），不强制外扩。
+
+    返回本 worker 的日志行列表（含 :ring=..:sec=..:stall=.. 字段）。
+    """
+    logs: list[str] = []
+    sector_count = max(1, config.sector_count)
+    widx = _worker_index(uid, workers, fallback=0)
+    st = _spiral_state.get(wkey)
+    if st is None:
+        st = SpiralState(
+            ring=config.spiral_base_ring,
+            sector_id=widx % sector_count,
+            index=0,
+            target=None,
+            stalled_ticks=0,
+            ring_done=False,
+        )
+        _spiral_state[wkey] = st
+
+    dist_core = manhattan(pos, core_position)
+
+    # 绝对安全网（极少触发）：距 Core 过远直接朝 Core 一步
+    if dist_core > config.spiral_max_ring + 8:
+        direction, _ = clamp_step_toward_memo(
+            pos, core_position, obstacles, last_dir=_last_move_dir.get(wkey)
+        )
+        if direction and hasattr(w, "move"):
+            _last_move_dir[wkey] = direction
+            st.stalled_ticks = 0
+            w.move(_resolve_direction(w, direction))
+            logs.append(
+                f"worker:{uid}:explore:{direction}:ring={st.ring}:sec={st.sector_id}"
+                f":stall={st.stalled_ticks}:d={dist_core}:recall_soft"
+            )
+        elif hasattr(w, "wait"):
+            w.wait()
+            logs.append(f"worker:{uid}:wait_idle")
+        return logs
+
+    # 目标点导航
+    if st.target is None:
+        st.target = spiral_target(
+            core_position, st.sector_id, sector_count, st.ring, st.index
+        )
+    dist_to_target = manhattan(pos, st.target)
+
+    # 到达目标 → 推进 index / ring
+    if pos == st.target:
+        st.index += 1
+        pts = sector_points(core_position, st.ring, st.sector_id, sector_count)
+        if st.index >= len(pts) or st.ring_done:
+            st.index = 0
+            st.ring_done = False
+            st.ring += 1
+            if st.ring > config.spiral_max_ring:
+                st.ring = config.spiral_base_ring  # 回 base ring 重新开始
+        st.stalled_ticks = 0
+        st.target = spiral_target(
+            core_position, st.sector_id, sector_count, st.ring, st.index
+        )
+        dist_to_target = manhattan(pos, st.target)
+
+    direction, _ = clamp_step_toward_memo(
+        pos, st.target, obstacles, last_dir=_last_move_dir.get(wkey)
+    )
+
+    # 进度追踪：方向为空（卡住）或未缩短与目标距离 → stall+1
+    if direction is None:
+        st.stalled_ticks += 1
+    else:
+        nxt = add_pos(pos, NAME_TO_DELTA[direction])
+        if manhattan(nxt, st.target) >= dist_to_target:
+            st.stalled_ticks += 1
+        else:
+            st.stalled_ticks = 0
+
+    # 软回撤：连续 recall_stall_ticks 无进展
+    soft_recall = False
+    if st.stalled_ticks >= config.recall_stall_ticks:
+        st.stalled_ticks = 0
+        soft_recall = True
+        # 优先推进环内下一目标点；若当前环已到 sector 尽头则 ring-1（向内收缩一环）
+        st.index += 1
+        pts = sector_points(core_position, st.ring, st.sector_id, sector_count)
+        if st.index >= len(pts):
+            st.index = 0
+            if st.ring > config.spiral_base_ring:
+                st.ring -= 1
+        st.target = spiral_target(
+            core_position, st.sector_id, sector_count, st.ring, st.index
+        )
+        direction, _ = clamp_step_toward_memo(
+            pos, st.target, obstacles, last_dir=_last_move_dir.get(wkey)
+        )
+        if direction is None:
+            # 兜底：朝 Core 一步
+            direction, _ = clamp_step_toward_memo(
+                pos, core_position, obstacles, last_dir=_last_move_dir.get(wkey)
+            )
+
+    # 避敌改道（不强制外扩）
+    avoided = False
+    if enemy_positions and direction:
+        direction, avoided = _pick_explore_direction_avoiding_enemies(
+            pos,
+            preferred=direction,
+            enemies=enemy_positions,
+            core_position=core_position,
+            obstacles=obstacles,
+        )
+
+    if direction and hasattr(w, "move"):
+        _last_move_dir[wkey] = direction
+        w.move(_resolve_direction(w, direction))
+        suffix = ":avoid" if avoided else ""
+        rl = ":recall_soft" if soft_recall else ""
+        logs.append(
+            f"worker:{uid}:explore:{direction}:ring={st.ring}:sec={st.sector_id}"
+            f":stall={st.stalled_ticks}:d={dist_core}{rl}{suffix}"
+        )
+    elif hasattr(w, "wait"):
+        w.wait()
+        rl = ":recall_soft" if soft_recall else ""
+        logs.append(
+            f"worker:{uid}:explore:None:ring={st.ring}:sec={st.sector_id}"
+            f":stall={st.stalled_ticks}:d={dist_core}{rl}"
+        )
 
     return logs
 

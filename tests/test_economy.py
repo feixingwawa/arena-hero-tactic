@@ -1,22 +1,22 @@
-"""经济模块单测：生产优先级、维护费、采集交付。"""
+"""经济模块单测：生产优先级、动态单位价格、采集交付、记忆回访。"""
 
 from __future__ import annotations
 
-from uuid import uuid4
-
-from bot.config import TacticConfig, population_upkeep
+from bot.config import TacticConfig
 from bot.economy import can_afford, choose_spawn, command_workers
-from bot.roles import RolePlan, assign_roles
+from bot.memory import MemoryMap
+from bot.roles import assign_roles
+from bot.rules import unit_cost_for
 from tests.stubs import StubCore, StubEnemy, StubTurn, StubUnit
 
 
-def test_population_upkeep_tiers() -> None:
-    assert population_upkeep(0) == 0
-    assert population_upkeep(19) == 0
-    assert population_upkeep(20) == 1
-    assert population_upkeep(39) == 1
-    assert population_upkeep(40) == 3
-    assert population_upkeep(60) == 6
+def test_unit_cost_dynamic_boundaries() -> None:
+    """动态价格：pop 19→20 涨价边界（Worker 5→7）。"""
+    assert unit_cost_for("WORKER", 19) == 5
+    assert unit_cost_for("WORKER", 20) == 7
+    # vanguard/ranger 同步涨价
+    assert unit_cost_for("VANGUARD", 20) == 13
+    assert unit_cost_for("RANGER", 20) == 16
 
 
 def test_can_afford_respects_reserve() -> None:
@@ -50,12 +50,63 @@ def test_spawn_skips_when_resources_low(config: TacticConfig) -> None:
     assert choice is None
 
 
-def test_spawn_stops_near_upkeep_cap(config: TacticConfig) -> None:
-    """人口接近 hard cap 时停止常规扩军。"""
+def test_spawn_dynamic_cost_at_pop_boundary(config: TacticConfig) -> None:
+    """pop 19→20 边界：spawn 成本按 pop+1=20 计（Worker 7），reserve 保留。
+
+    pop=19、resources=9、reserve=2 → 9-7=2 ≥ 2 可出；resources=8 → 不可。
+    不再有维护费阻断：pop≥20 也能按真实成本理性 spawn。
+    """
+    cfg = TacticConfig(
+        max_population=30,
+        target_workers=14,
+        target_vanguards=3,
+        target_rangers=2,
+        reserve_resources=2,
+        early_game_pop=4,
+    )
     workers = [StubUnit(unit_type="WORKER") for _ in range(12)]
     vanguards = [StubUnit(unit_type="VANGUARD", hp=4) for _ in range(4)]
     rangers = [StubUnit(unit_type="RANGER") for _ in range(3)]
-    # pop = 19
+    # pop = 19（12+4+3）
+    turn = StubTurn(
+        resources=9,
+        core=StubCore(),
+        workers=workers,
+        vanguards=vanguards,
+        rangers=rangers,
+    )
+    turn.state.population = 19
+    assert unit_cost_for("WORKER", 20) == 7
+    # 9 - 7 = 2 ≥ reserve(2) → 可出 WORKER（cost 按 spawn 后人口 20）
+    choice = choose_spawn(turn, config=cfg, has_near_threat=False)
+    assert choice == "WORKER"
+
+    turn_low = StubTurn(
+        resources=8,
+        core=StubCore(),
+        workers=workers,
+        vanguards=vanguards,
+        rangers=rangers,
+    )
+    turn_low.state.population = 19
+    # 8 - 7 = 1 < reserve(2) → 不可
+    assert choose_spawn(turn_low, config=cfg, has_near_threat=False) is None
+
+
+def test_spawn_allows_pop_over_20_with_dynamic_cost(config: TacticConfig) -> None:
+    """pop≥20 不再被维护费逻辑阻止：按动态价格可继续 spawn。"""
+    cfg30 = TacticConfig(
+        max_population=30,
+        target_workers=14,
+        target_vanguards=3,
+        target_rangers=2,
+        reserve_resources=2,
+        early_game_pop=4,
+    )
+    # pop = 20：13 worker（仍缺 1 个目标）+ 5 vanguard + 2 ranger
+    workers = [StubUnit(unit_type="WORKER") for _ in range(13)]
+    vanguards = [StubUnit(unit_type="VANGUARD", hp=4) for _ in range(5)]
+    rangers = [StubUnit(unit_type="RANGER") for _ in range(2)]
     turn = StubTurn(
         resources=50,
         core=StubCore(),
@@ -63,10 +114,10 @@ def test_spawn_stops_near_upkeep_cap(config: TacticConfig) -> None:
         vanguards=vanguards,
         rangers=rangers,
     )
-    turn.state.population = 19
-    turn.state.upkeep_next_tick = 0
-    choice = choose_spawn(turn, config=config, has_near_threat=False)
-    assert choice is None
+    turn.state.population = 20
+    # pop+1=21 时 Worker 成本仍为 7；50-7 远超 reserve → 可继续出
+    assert unit_cost_for("WORKER", 21) == 7
+    assert choose_spawn(turn, config=cfg30, has_near_threat=False) == "WORKER"
 
 
 def test_spawn_vanguard_on_near_threat(config: TacticConfig) -> None:
@@ -185,9 +236,14 @@ def test_worker_retreats_with_cargo_near_enemy(config: TacticConfig) -> None:
     assert worker.action == "move"
 
 
-def test_two_workers_explore_different_directions(config: TacticConfig) -> None:
-    """无可见资源时，两 worker 不得冲向同一固定格（修复振荡）。"""
-    from bot.pathing import explore_target
+def test_two_workers_explore_different_sectors(config: TacticConfig) -> None:
+    """无可见资源时，两 worker 分属不同扇区（螺旋目标不同，防扎堆）。
+
+    新螺旋扫掠按 sector_id = worker_index % sector_count 分扇区；
+    首 tick 方向可能相同（都朝各自环内目标），但 spiral_target 必须不同，
+    且不触发旧 recall 边界。
+    """
+    from bot.pathing import spiral_target
 
     wa = StubUnit(position=(10, 10), cargo=0, unit_type="WORKER")
     wb = StubUnit(position=(10, 10), cargo=0, unit_type="WORKER")
@@ -200,21 +256,15 @@ def test_two_workers_explore_different_directions(config: TacticConfig) -> None:
     )
     plan = assign_roles(turn, config=config)
     logs = command_workers(turn, plan, config=config)
-    dirs = []
-    for line in logs:
-        if ":explore:" not in line:
-            continue
-        parts = line.split(":")
-        try:
-            ei = parts.index("explore")
-            dirs.append(parts[ei + 1])
-        except (ValueError, IndexError):
-            dirs.append(line.rsplit(":", 1)[-1])
     assert wa.action == "move"
     assert wb.action == "move"
-    assert len(dirs) == 2
-    assert dirs[0] != dirs[1], f"both explored same dir: {dirs}"
-    assert explore_target((10, 10), 0) != explore_target((10, 10), 1)
+    assert not any(":recall" in line for line in logs), logs
+    # 两个 worker 的螺旋目标不同（扇区不同）
+    t0 = spiral_target((10, 10), 0, config.sector_count, config.spiral_base_ring, 0)
+    t1 = spiral_target((10, 10), 1, config.sector_count, config.spiral_base_ring, 0)
+    assert t0 != t1, f"same sector target: {t0}"
+    # 日志含螺旋字段
+    assert all(":ring=" in line and ":sec=" in line for line in logs if ":explore:" in line)
 
 
 def test_early_spawn_ignores_reserve(config: TacticConfig) -> None:
@@ -277,13 +327,16 @@ def test_worker_recall_when_too_far(config: TacticConfig) -> None:
     ), f"expected recall toward core, got dir={direction} logs={logs}"
 
 
-def test_worker_explore_respects_max_radius(config: TacticConfig) -> None:
-    """探索不朝 Core 收缩：worker at (30,10)（dist=20 < 32）方向不减距 Core 距离。
+def test_worker_explore_navigates_to_spiral_target(config: TacticConfig) -> None:
+    """探索改目标点导航：worker (30,10)（d=20）朝其螺旋目标走，逐步接近。
 
-    断言 explore 方向使 manhattan(nxt, core) >= 20（不朝 Core 收缩）。
+    新逻辑删除「绝不朝 Core 收缩」守卫——允许目标点导航暂时降低距 Core
+    距离（切向扫掠），但每一步必须缩短与螺旋目标的曼哈顿距离（有进展）。
     """
-    from bot.pathing import manhattan
+    from bot.economy import _spiral_state
+    from bot.pathing import manhattan, spiral_target
 
+    _spiral_state.clear()
     worker = StubUnit(position=(30, 10), cargo=0, unit_type="WORKER")
     turn = StubTurn(
         resources=5,
@@ -295,14 +348,21 @@ def test_worker_explore_respects_max_radius(config: TacticConfig) -> None:
     plan = assign_roles(turn, config=config)
     assert plan.assignments[0].role.value == "harvester"
 
+    # worker 下标 0 → sector 0，ring=base，index=0
+    target = spiral_target((10, 10), 0, config.sector_count, config.spiral_base_ring, 0)
+    pos = worker.position
+    dist_before = manhattan(pos, target)
     logs = command_workers(turn, plan, config=config)
     assert worker.action == "move"
     direction = str(worker.action_args)
     dx, dy = _DIR_DELTA[direction]
     new_pos = (30 + dx, 10 + dy)
-    assert manhattan(new_pos, (10, 10)) >= 20, (
-        f"explore shrank toward core: dir={direction} new_pos={new_pos} logs={logs}"
+    dist_after = manhattan(new_pos, target)
+    assert dist_after < dist_before, (
+        f"did not progress toward spiral target: dir={direction} new={new_pos} "
+        f"target={target} logs={logs}"
     )
+    assert not any(":recall_soft" in line for line in logs), logs
 
 
 def test_worker_return_deposit_avoids_oscillation(config: TacticConfig) -> None:
@@ -360,33 +420,16 @@ def test_worker_return_deposit_avoids_oscillation(config: TacticConfig) -> None:
 
 
 def test_worker_recall_boundary_no_oscillation(config: TacticConfig) -> None:
-    """recall 边界（d=37/36 对抖，线上 35d30567 现象）不再回到旧位置。
+    """d=36/37 势阱修复：worker 在 Core 右侧 d=37，连续 10 tick 无重复位置。
 
-    worker 在 Core 右侧 d=37（recall_dist=explore_max_radius+4=36），
-    连续 10 tick：任何位置不得被重复访问（无 A↔B 纯对抖），
-    且 recall 步必须朝 Core 方向推进（x 递减）。
+    新逻辑为目标点导航（无 recall_dist 硬边界）：worker 朝螺旋目标行进，
+    不再 RIGHT↔LEFT 横跳，且整体朝 Core 方向推进（x 递减）。
     """
-    from bot.economy import (
-        _explore_axis,
-        _explore_phase,
-        _explore_ticks,
-        _last_explore_dir,
-        _last_explore_pos,
-        _last_move_dir,
-        _prev_explore_pos,
-    )
+    from bot.economy import _last_move_dir, _spiral_state
     from bot.pathing import manhattan
 
-    for d in (
-        _last_move_dir,
-        _last_explore_dir,
-        _last_explore_pos,
-        _prev_explore_pos,
-        _explore_phase,
-        _explore_ticks,
-        _explore_axis,
-    ):
-        d.clear()
+    _spiral_state.clear()
+    _last_move_dir.clear()
 
     core_pos = (10, 10)
     worker = StubUnit(position=(47, 10), cargo=0, unit_type="WORKER")  # d=37
@@ -401,7 +444,7 @@ def test_worker_recall_boundary_no_oscillation(config: TacticConfig) -> None:
 
     seen: set[tuple[int, int]] = set()
     pos = worker.position
-    recall_steps = 0
+    left_steps = 0
     for _ in range(10):
         assert pos not in seen, f"position revisited (A↔B 对抖): {pos}"
         seen.add(pos)
@@ -414,10 +457,339 @@ def test_worker_recall_boundary_no_oscillation(config: TacticConfig) -> None:
         pos = (pos[0] + dx, pos[1] + dy)
         worker.position = pos
         if dx < 0:
-            # 回撤步（worker 在 Core 右侧，朝 Core 方向 = x 递减）
-            recall_steps += 1
+            # 朝 Core 方向推进（worker 在 Core 右侧 → x 递减）
+            left_steps += 1
 
-    assert recall_steps >= 1, "recall 步应至少出现一次并朝 Core 推进"
+    assert left_steps >= 5, "应持续朝 Core/目标方向推进，而非横跳"
     assert manhattan(worker.position, core_pos) <= manhattan((47, 10), core_pos), (
-        f"recall should not move away from core: pos={worker.position}"
+        f"explore moved away from core: pos={worker.position}"
     )
+
+
+def test_explore_spiral_advances_ring_after_target_reached(
+    config: TacticConfig,
+) -> None:
+    """到达螺旋目标后 index+1 / 扫完本环 ring+1。"""
+    from bot.economy import _spiral_state
+    from bot.pathing import spiral_target
+
+    _spiral_state.clear()
+    core_pos = (10, 10)
+    # sector 0 的目标点 (6,9)：让 worker 从目标点开始，第一 tick 应推进 index
+    target = spiral_target(core_pos, 0, config.sector_count, config.spiral_base_ring, 0)
+    worker = StubUnit(position=target, cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        resources=5,
+        core=StubCore(position=core_pos),
+        workers=[worker],
+        resource_cells=set(),
+        visible_enemies=[],
+    )
+    plan = assign_roles(turn, config=config)
+    command_workers(turn, plan, config=config)
+    st = _spiral_state[str(worker.id)]
+    # 已从 index=0 推进到 index=1（ring 不变，sector 0 环 5 有 5 个点）
+    assert st.index == 1
+    assert st.ring == config.spiral_base_ring
+    assert st.target != target
+
+
+def test_explore_soft_retreat_after_stall(config: TacticConfig) -> None:
+    """连续 recall_stall_ticks 无进展 → 软回撤（换目标 / ring-1），而非横跳。"""
+    from bot.economy import _last_move_dir, _spiral_state
+
+    _spiral_state.clear()
+    _last_move_dir.clear()
+    core_pos = (10, 10)
+    # worker (20,10) 四向被障碍围死 → 目标点不可达 → 持续 stall
+    worker = StubUnit(position=(20, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        resources=5,
+        core=StubCore(position=core_pos),
+        workers=[worker],
+        resource_cells=set(),
+        obstacle_cells={(19, 10), (20, 9), (20, 11), (21, 10)},
+        visible_enemies=[],
+    )
+    plan = assign_roles(turn, config=config)
+    saw_soft_recall = False
+    for _ in range(config.recall_stall_ticks + 3):
+        worker.clear_action()
+        logs = command_workers(turn, plan, config=config)
+        if any(":recall_soft" in line for line in logs):
+            saw_soft_recall = True
+            break
+    assert saw_soft_recall, f"expected soft recall after stall, logs={logs}"
+
+
+def test_explore_absolute_safety_net(config: TacticConfig) -> None:
+    """绝对安全网：d > spiral_max_ring + 8 时直接朝 Core 一步。"""
+    from bot.economy import _last_move_dir, _spiral_state
+    from bot.pathing import manhattan
+
+    _spiral_state.clear()
+    _last_move_dir.clear()
+    core_pos = (10, 10)
+    start = (55, 10)  # d=45 > 32+8=40
+    worker = StubUnit(position=start, cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        resources=5,
+        core=StubCore(position=core_pos),
+        workers=[worker],
+        resource_cells=set(),
+        visible_enemies=[],
+    )
+    plan = assign_roles(turn, config=config)
+    logs = command_workers(turn, plan, config=config)
+    assert worker.action == "move"
+    direction = str(worker.action_args)
+    dx, dy = _DIR_DELTA[direction]
+    new_pos = (start[0] + dx, start[1] + dy)
+    assert manhattan(new_pos, core_pos) < manhattan(start, core_pos), (
+        f"expected recall_soft toward core: dir={direction} logs={logs}"
+    )
+    assert any(":recall_soft" in line for line in logs), logs
+
+
+def test_worker_harvest_marks_memory(config: TacticConfig) -> None:
+    """采集成功后 mark_harvested → 记忆资源点进入 DEPLETED。"""
+    mem = MemoryMap(refresh_interval_ticks=4)
+    worker = StubUnit(position=(12, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        tick=1,
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[worker],
+        resource_cells={(12, 10)},
+    )
+    mem.observe(turn, 1)  # 资源点入库
+    plan = assign_roles(turn, config=config)
+    command_workers(turn, plan, config=config, memory=mem)
+    assert worker.action == "harvest"
+    rp = mem.resource_points[(12, 10)]
+    assert rp.state == "DEPLETED"
+    assert rp.refresh_due_tick == 1 + 4
+
+
+def test_worker_goes_to_revisit_candidate_from_memory(config: TacticConfig) -> None:
+    """无可见资源时，记忆 REVISIT_DUE 候选优先于螺旋探索。"""
+    from bot.memory import DEPLETED, REVISIT_DUE
+
+    mem = MemoryMap(refresh_interval_ticks=4)
+    core_pos = (10, 10)
+    rp = (14, 10)  # dist 4
+    # 构造：tick1 可见 → tick2 消失(DEPLETED) → tick6 到期(REVISIT_DUE)
+    t1 = StubTurn(tick=1, core=StubCore(position=core_pos), resource_cells={rp})
+    mem.observe(t1, 1)
+    t2 = StubTurn(tick=2, core=StubCore(position=core_pos), resource_cells=set())
+    mem.observe(t2, 2)
+    assert mem.resource_points[rp].state == DEPLETED
+    t6 = StubTurn(tick=6, core=StubCore(position=core_pos), resource_cells=set())
+    mem.observe(t6, 6)
+    assert mem.resource_points[rp].state == REVISIT_DUE
+
+    worker = StubUnit(position=(11, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        tick=6,
+        resources=5,
+        core=StubCore(position=core_pos),
+        workers=[worker],
+        resource_cells=set(),
+        visible_enemies=[],
+    )
+    plan = assign_roles(turn, config=config)
+    logs = command_workers(turn, plan, config=config, memory=mem)
+    assert worker.action == "move"
+    assert any(":to_resource:" in line for line in logs), logs
+    assert not any(":explore:" in line for line in logs), logs
+
+
+def test_worker_revisit_sector_preference(config: TacticConfig) -> None:
+    """多 Worker 分工：回访候选按各自扇区优先，不扎堆同一资源点。"""
+    from bot.memory import REVISIT_DUE
+
+    mem = MemoryMap(refresh_interval_ticks=4, sector_count=4)
+    core_pos = (10, 10)
+    # ring 5 上两个不同扇区的点（与 pathing.sector_points 一致）
+    s0_point = (6, 9)  # 扇区 0
+    s1_point = (7, 8)  # 扇区 1
+    for p in (s0_point, s1_point):
+        t1 = StubTurn(tick=1, core=StubCore(position=core_pos), resource_cells={p})
+        mem.observe(t1, 1)
+        t2 = StubTurn(tick=2, core=StubCore(position=core_pos), resource_cells=set())
+        mem.observe(t2, 2)
+        t6 = StubTurn(tick=6, core=StubCore(position=core_pos), resource_cells=set())
+        mem.observe(t6, 6)
+        assert mem.resource_points[p].state == REVISIT_DUE
+
+    wa = StubUnit(position=(11, 10), cargo=0, unit_type="WORKER")  # 下标 0 → sector 0
+    wb = StubUnit(position=(11, 10), cargo=0, unit_type="WORKER")  # 下标 1 → sector 1
+    turn = StubTurn(
+        tick=6,
+        resources=5,
+        core=StubCore(position=core_pos),
+        workers=[wa, wb],
+        resource_cells=set(),
+        visible_enemies=[],
+    )
+    plan = assign_roles(turn, config=config)
+    assert plan.get(wa.id).sector_id == 0
+    assert plan.get(wb.id).sector_id == 1
+
+    # 扇区过滤：各自只看到本扇区候选（防扎堆的机制来源）
+    assert mem.revisit_candidates(core_pos, 6, (11, 10), 40, sector_id=0) == [s0_point]
+    assert mem.revisit_candidates(core_pos, 6, (11, 10), 40, sector_id=1) == [s1_point]
+
+    logs = command_workers(turn, plan, config=config, memory=mem)
+    to_res = [line for line in logs if ":to_resource:" in line]
+    # 两个 worker 都导航到记忆回访点（而非探索）
+    assert len(to_res) == 2, logs
+    assert wa.action == "move"
+    assert wb.action == "move"
+
+
+def test_beacon_pickup_ground(config: TacticConfig) -> None:
+    """GROUND Beacon 与 worker 同格 → pickup_beacon。"""
+    from tests.stubs import StubBeacon
+
+    worker = StubUnit(position=(15, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[worker],
+        resource_cells=set(),
+        beacon=StubBeacon(position=(15, 10), status="GROUND", carrier_id=None),
+    )
+    plan = assign_roles(turn, config=config)
+    logs = command_workers(turn, plan, config=config)
+    assert worker.action == "pickup_beacon"
+    assert any("pickup_beacon" in line for line in logs), logs
+
+
+def test_beacon_carrier_prefers_harvest_over_explore(config: TacticConfig) -> None:
+    """Beacon 持有者（1 点 → 2 资源）：跳过扇区限制优先采集记忆回访点。"""
+    from bot.memory import REVISIT_DUE
+    from tests.stubs import StubBeacon
+
+    mem = MemoryMap(refresh_interval_ticks=4, sector_count=4)
+    core_pos = (10, 10)
+    # 扇区 1 的资源点（worker 是扇区 0，若走扇区过滤会漏掉）
+    s1_point = (7, 8)
+    t1 = StubTurn(tick=1, core=StubCore(position=core_pos), resource_cells={s1_point})
+    mem.observe(t1, 1)
+    t2 = StubTurn(tick=2, core=StubCore(position=core_pos), resource_cells=set())
+    mem.observe(t2, 2)
+    t6 = StubTurn(tick=6, core=StubCore(position=core_pos), resource_cells=set())
+    mem.observe(t6, 6)
+    assert mem.resource_points[s1_point].state == REVISIT_DUE
+
+    worker = StubUnit(position=(11, 10), cargo=0, unit_type="WORKER")  # sector 0
+    turn = StubTurn(
+        tick=6,
+        resources=5,
+        core=StubCore(position=core_pos),
+        workers=[worker],
+        resource_cells=set(),
+        visible_enemies=[],
+        beacon=StubBeacon(position=(20, 20), status="CARRIED", carrier_id=worker.id),
+    )
+    plan = assign_roles(turn, config=config)
+    logs = command_workers(turn, plan, config=config, memory=mem)
+    # 持有者应导航到扇区 1 的回访点（to_resource），而非探索
+    assert worker.action == "move"
+    assert any(":to_resource:" in line for line in logs), logs
+    assert not any(":explore:" in line for line in logs), logs
+
+
+def test_cargo_reclaim_moves_to_dropped(config: TacticConfig) -> None:
+    """空载 worker 优先前往掉落 cargo 回收。"""
+    from tests.stubs import StubEvent
+
+    mem = MemoryMap()
+    events = [
+        StubEvent(
+            event_type="WORKER_CARGO_DROPPED",
+            position=(30, 10),
+            values={"amount": 3},
+        )
+    ]
+    t0 = StubTurn(tick=1, core=StubCore(position=(10, 10)), events=events)
+    mem.observe(t0, 1)
+    assert (30, 10) in mem.dropped_cargo
+
+    worker = StubUnit(position=(20, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        tick=2,
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[worker],
+        resource_cells=set(),
+        visible_enemies=[],
+    )
+    plan = assign_roles(turn, config=config)
+    logs = command_workers(turn, plan, config=config, memory=mem)
+    assert worker.action == "move"
+    assert any(":to_cargo:" in line for line in logs), logs
+    assert not any(":explore:" in line for line in logs), logs
+
+
+def test_cargo_reclaim_on_cell_harvests_and_collects(config: TacticConfig) -> None:
+    """worker 站在掉落 cargo 格 → harvest + 标记 collected。"""
+    from tests.stubs import StubEvent
+
+    mem = MemoryMap()
+    events = [
+        StubEvent(
+            event_type="WORKER_CARGO_DROPPED",
+            position=(15, 10),
+            values={"amount": 2},
+        )
+    ]
+    t0 = StubTurn(tick=1, core=StubCore(position=(10, 10)), events=events)
+    mem.observe(t0, 1)
+
+    worker = StubUnit(position=(15, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        tick=2,
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[worker],
+        resource_cells=set(),
+        visible_enemies=[],
+    )
+    plan = assign_roles(turn, config=config)
+    logs = command_workers(turn, plan, config=config, memory=mem)
+    assert worker.action == "harvest"
+    assert any(":reclaim_cargo" in line for line in logs), logs
+    assert mem.dropped_cargo[(15, 10)].collected is True
+
+
+def test_cargo_reclaim_ignored_when_full(config: TacticConfig) -> None:
+    """满货 worker 不回收 cargo：优先回 Core 交付。"""
+    from tests.stubs import StubEvent
+
+    mem = MemoryMap()
+    events = [
+        StubEvent(
+            event_type="WORKER_CARGO_DROPPED",
+            position=(30, 10),
+            values={"amount": 3},
+        )
+    ]
+    t0 = StubTurn(tick=1, core=StubCore(position=(10, 10)), events=events)
+    mem.observe(t0, 1)
+
+    worker = StubUnit(position=(20, 10), cargo=1, unit_type="WORKER")
+    turn = StubTurn(
+        tick=2,
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[worker],
+        resource_cells=set(),
+        visible_enemies=[],
+    )
+    plan = assign_roles(turn, config=config)
+    logs = command_workers(turn, plan, config=config, memory=mem)
+    assert worker.action == "move"
+    assert any(":return_deposit:" in line for line in logs), logs
+    assert not any(":to_cargo:" in line for line in logs), logs

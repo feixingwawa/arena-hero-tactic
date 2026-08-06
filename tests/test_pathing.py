@@ -1,4 +1,4 @@
-"""路径模块单测：带方向记忆的去抖寻路（防 A↔B 对抖）。"""
+"""路径模块单测：带方向记忆的去抖寻路（防 A↔B 对抖）+ 螺旋扫掠几何。"""
 
 from __future__ import annotations
 
@@ -9,6 +9,9 @@ from bot.pathing import (
     clamp_step_toward,
     clamp_step_toward_memo,
     manhattan,
+    ring_points,
+    sector_points,
+    spiral_target,
 )
 
 
@@ -114,3 +117,75 @@ def test_clamp_step_toward_memo_at_target() -> None:
     """已在目标格返回 (None, None) 且不清除 last_dir 语义（返回 None）。"""
     direction, last = clamp_step_toward_memo((10, 10), (10, 10), last_dir="UP")
     assert direction is None and last is None
+
+
+def test_ring_points_counts_and_manhattan() -> None:
+    """曼哈顿环：radius=0 单点；radius>0 共 4r 个点且均距中心 r。"""
+    assert ring_points((5, 5), 0) == [(5, 5)]
+    for r in (1, 2, 5, 8):
+        pts = ring_points((10, 10), r)
+        assert len(pts) == 4 * r, f"ring {r} has {len(pts)}"
+        assert all(manhattan(p, (10, 10)) == r for p in pts)
+    # 确定性
+    assert ring_points((10, 10), 5) == ring_points((10, 10), 5)
+
+
+def test_ring_points_sorted_by_angle() -> None:
+    """环上点按角度稳定排序（顺时针近似），相邻点角度不剧烈跳变。"""
+    import math
+
+    center = (0, 0)
+    pts = ring_points(center, 3)
+    angles = [math.atan2(p[1], p[0]) for p in pts]
+    assert angles == sorted(angles), "ring points should be angle-ordered"
+
+
+def test_sector_points_partition_ring() -> None:
+    """扇区切分：各扇区互不重叠，并集覆盖整环。"""
+    center = (10, 10)
+    for r in (1, 2, 5, 9):
+        pts = ring_points(center, r)
+        sectors = [set(sector_points(center, r, s, 4)) for s in range(4)]
+        # 不重叠
+        for i in range(4):
+            for j in range(i + 1, 4):
+                assert not (sectors[i] & sectors[j]), f"overlap r={r} {i},{j}"
+        # 覆盖
+        union = set().union(*sectors)
+        assert union == set(pts), f"union mismatch r={r}"
+        # 每扇区点数一致
+        counts = {len(s) for s in sectors}
+        assert len(counts) == 1, f"uneven sectors r={r}: {counts}"
+
+
+def test_sector_points_phase_offset_shifts() -> None:
+    """phase_offset 旋转扇区起点，不影响覆盖。"""
+    center = (0, 0)
+    s0 = set(sector_points(center, 5, 0, 4, phase_offset=1))
+    s1 = set(sector_points(center, 5, 1, 4, phase_offset=1))
+    assert not (s0 & s1)
+    assert len(s0 | s1 | set(sector_points(center, 5, 2, 4, phase_offset=1))
+               | set(sector_points(center, 5, 3, 4, phase_offset=1))) == 4 * 5
+
+
+def test_spiral_target_deterministic_and_in_ring() -> None:
+    """spiral_target：确定性、落在环上、index 越界回绕。"""
+    core = (10, 10)
+    t1 = spiral_target(core, 1, 4, 5, 0)
+    t2 = spiral_target(core, 1, 4, 5, 0)
+    assert t1 == t2
+    assert manhattan(t1, core) == 5
+    # index 越界 → 回绕到环内某点（仍在环上）
+    t_overflow = spiral_target(core, 1, 4, 5, 999)
+    assert manhattan(t_overflow, core) == 5
+
+
+def test_spiral_target_sectors_differ() -> None:
+    """不同扇区在同一 ring/index 的目标不同（分散探索）。"""
+    core = (10, 10)
+    targets = {spiral_target(core, s, 4, 5, 0) for s in range(4)}
+    assert len(targets) == 4
+    # 同一扇区不同 index 目标也不同（扫掠推进）
+    t0 = spiral_target(core, 0, 4, 5, 0)
+    t1 = spiral_target(core, 0, 4, 5, 1)
+    assert t0 != t1

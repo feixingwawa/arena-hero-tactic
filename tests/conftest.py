@@ -15,6 +15,25 @@ from tests.stubs import StubUnit as StubUnit  # noqa: F401
 from tests.stubs import StubState as StubState  # noqa: F401
 
 
+@pytest.fixture(autouse=True)
+def _clean_global_state() -> None:
+    """每个测试前清空模块级状态（探索记忆 / WORLD_MEMORY 单例）。
+
+    设计约定：decide/command_workers 默认使用模块级单例与进程内 dict，
+    测试必须清理，避免跨测试污染。
+    """
+    from bot.economy import _last_move_dir, _spiral_state
+    from bot.memory import WORLD_MEMORY
+
+    _spiral_state.clear()
+    _last_move_dir.clear()
+    WORLD_MEMORY.resource_points.clear()
+    WORLD_MEMORY.obstacles.clear()
+    WORLD_MEMORY.dropped_cargo.clear()
+    WORLD_MEMORY._chunk_quota_cache.clear()
+    yield
+
+
 @pytest.fixture
 def config() -> TacticConfig:
     return TacticConfig(
