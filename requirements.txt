@@ -1,0 +1,11 @@
+# Arena Hero 战术框架依赖
+# Python >= 3.11
+
+# 官方 SDK（运行时连接游戏服务器）
+arena-hero>=0.2.6,<0.3
+
+# 可选：从 .env 加载 API Key
+python-dotenv>=1.0.0
+
+# 测试
+pytest>=8.0.0

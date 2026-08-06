@@ -1,0 +1,25 @@
+# 密钥与本地状态（切勿提交）
+.env
+.arena_hero_state.json
+*.jsonl
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 运行日志与临时 venv
+logs/
+.venv_broken/
+.venv311/
