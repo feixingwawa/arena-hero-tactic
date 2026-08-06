@@ -303,3 +303,121 @@ def test_worker_explore_respects_max_radius(config: TacticConfig) -> None:
     assert manhattan(new_pos, (10, 10)) >= 20, (
         f"explore shrank toward core: dir={direction} new_pos={new_pos} logs={logs}"
     )
+
+
+def test_worker_return_deposit_avoids_oscillation(config: TacticConfig) -> None:
+    """Worker 在 Core 正下方 3 格、中间 (10,11) 有障碍：连续 6 tick 不得横跳。
+
+    旧 clamp_step_toward 会 return_deposit:DOWN↔UP 无限对抖（线上症状），
+    带方向记忆的去抖寻路应绕行靠近 Core。
+    """
+    from bot.economy import _last_move_dir
+    from bot.pathing import manhattan
+
+    _last_move_dir.clear()  # 清空模块级方向记忆，保证从干净状态开始
+
+    core_pos = (10, 10)
+    obstacles = {(10, 11)}
+    start = (10, 12)
+    worker = StubUnit(position=start, cargo=1, unit_type="WORKER")
+    turn = StubTurn(
+        resources=5,
+        core=StubCore(position=core_pos),
+        workers=[worker],
+        resource_cells=set(),
+        obstacle_cells=obstacles,
+    )
+    plan = assign_roles(turn, config=config)
+
+    dirs: list[str] = []
+    pos = start
+    for _ in range(6):
+        worker.clear_action()
+        command_workers(turn, plan, config=config)
+        if worker.action != "move":
+            break  # 到达 Core 后 deposit，模拟结束
+        direction = str(worker.action_args)
+        dirs.append(direction)
+        dx, dy = _DIR_DELTA[direction]
+        pos = (pos[0] + dx, pos[1] + dy)
+        worker.position = pos  # 推进 worker 位置，模拟真实 tick 移动
+
+    # 不出现 UP/DOWN 或 LEFT/RIGHT 严格交替超过 2 次
+    max_run = 0
+    run = 0
+    for prev, cur in zip(dirs, dirs[1:]):
+        if _DIR_DELTA[cur] == tuple(-v for v in _DIR_DELTA[prev]):
+            run += 1
+            max_run = max(max_run, run)
+        else:
+            run = 0
+    assert max_run <= 2, f"return_deposit oscillation dirs={dirs} pos={pos}"
+
+    # 绕行靠近 Core：6 tick 后距 Core 严格小于起点距 Core（=2）
+    assert manhattan(pos, core_pos) < manhattan(start, core_pos), (
+        f"did not approach core: pos={pos} dirs={dirs}"
+    )
+
+
+def test_worker_recall_boundary_no_oscillation(config: TacticConfig) -> None:
+    """recall 边界（d=37/36 对抖，线上 35d30567 现象）不再回到旧位置。
+
+    worker 在 Core 右侧 d=37（recall_dist=explore_max_radius+4=36），
+    连续 10 tick：任何位置不得被重复访问（无 A↔B 纯对抖），
+    且 recall 步必须朝 Core 方向推进（x 递减）。
+    """
+    from bot.economy import (
+        _explore_axis,
+        _explore_phase,
+        _explore_ticks,
+        _last_explore_dir,
+        _last_explore_pos,
+        _last_move_dir,
+        _prev_explore_pos,
+    )
+    from bot.pathing import manhattan
+
+    for d in (
+        _last_move_dir,
+        _last_explore_dir,
+        _last_explore_pos,
+        _prev_explore_pos,
+        _explore_phase,
+        _explore_ticks,
+        _explore_axis,
+    ):
+        d.clear()
+
+    core_pos = (10, 10)
+    worker = StubUnit(position=(47, 10), cargo=0, unit_type="WORKER")  # d=37
+    turn = StubTurn(
+        resources=5,
+        core=StubCore(position=core_pos),
+        workers=[worker],
+        resource_cells=set(),
+        visible_enemies=[],
+    )
+    plan = assign_roles(turn, config=config)
+
+    seen: set[tuple[int, int]] = set()
+    pos = worker.position
+    recall_steps = 0
+    for _ in range(10):
+        assert pos not in seen, f"position revisited (A↔B 对抖): {pos}"
+        seen.add(pos)
+        worker.clear_action()
+        command_workers(turn, plan, config=config)
+        if worker.action != "move":
+            break
+        direction = str(worker.action_args)
+        dx, dy = _DIR_DELTA[direction]
+        pos = (pos[0] + dx, pos[1] + dy)
+        worker.position = pos
+        if dx < 0:
+            # 回撤步（worker 在 Core 右侧，朝 Core 方向 = x 递减）
+            recall_steps += 1
+
+    assert recall_steps >= 1, "recall 步应至少出现一次并朝 Core 推进"
+    assert manhattan(worker.position, core_pos) <= manhattan((47, 10), core_pos), (
+        f"recall should not move away from core: pos={worker.position}"
+    )

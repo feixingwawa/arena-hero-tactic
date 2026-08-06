@@ -15,6 +15,7 @@ from bot.pathing import (
     Position,
     add_pos,
     clamp_step_toward,
+    clamp_step_toward_memo,
     explore_radius,
     explore_target,
     manhattan,
@@ -109,6 +110,8 @@ _explore_ticks: dict[str, int] = {}
 # 粘性探索主轴（RIGHT/LEFT/UP/DOWN），防止远敌避让造成横跳
 _explore_axis: dict[str, str] = {}
 _last_explore_dir: dict[str, str] = {}
+# 非探索移动（return_deposit / to_resource / retreat / recall）的方向记忆，防 A↔B 对抖
+_last_move_dir: dict[str, str] = {}
 
 
 def _worker_key(uid: Any) -> str:
@@ -375,8 +378,15 @@ def command_workers(
                         w.wait()
                     logs.append(f"worker:{uid}:wait_at_core")
             else:
-                direction = clamp_step_toward(pos, core_position, obstacles)
+                wkey = _worker_key(uid)
+                direction, _ = clamp_step_toward_memo(
+                    pos,
+                    core_position,
+                    obstacles,
+                    last_dir=_last_move_dir.get(wkey),
+                )
                 if direction and hasattr(w, "move"):
+                    _last_move_dir[wkey] = direction
                     w.move(_resolve_direction(w, direction))
                     logs.append(f"worker:{uid}:retreat:{direction}")
                 elif hasattr(w, "wait"):
@@ -393,8 +403,15 @@ def command_workers(
 
         # 有货物 → 回 Core 交付（优先于继续采集）
         if cargo > 0:
-            direction = clamp_step_toward(pos, core_position, obstacles)
+            wkey = _worker_key(uid)
+            direction, _ = clamp_step_toward_memo(
+                pos,
+                core_position,
+                obstacles,
+                last_dir=_last_move_dir.get(wkey),
+            )
             if direction and hasattr(w, "move"):
+                _last_move_dir[wkey] = direction
                 w.move(_resolve_direction(w, direction))
                 logs.append(f"worker:{uid}:return_deposit:{direction}")
             continue
@@ -416,8 +433,15 @@ def command_workers(
                     w.harvest()
                     logs.append(f"worker:{uid}:harvest")
             else:
-                direction = clamp_step_toward(pos, target, obstacles)
+                wkey = _worker_key(uid)
+                direction, _ = clamp_step_toward_memo(
+                    pos,
+                    target,
+                    obstacles,
+                    last_dir=_last_move_dir.get(wkey),
+                )
                 if direction and hasattr(w, "move"):
+                    _last_move_dir[wkey] = direction
                     w.move(_resolve_direction(w, direction))
                     logs.append(f"worker:{uid}:to_resource:{direction}")
                 elif hasattr(w, "wait"):
@@ -474,14 +498,25 @@ def command_workers(
             # 跑飞回撤：Worker 距 Core 已超出探索上限 + 环带余量 → 回撤一步靠近 Core。
             recall_dist = config.explore_max_radius + 4
             if dist_core > recall_dist:
-                direction = clamp_step_toward(pos, core_position, obstacles)
+                direction, _ = clamp_step_toward_memo(
+                    pos,
+                    core_position,
+                    obstacles,
+                    last_dir=_last_move_dir.get(wkey) or _last_explore_dir.get(wkey),
+                )
                 if direction is None:
                     direction = outward_step(
-                        pos, core_position, preferred=None, obstacles=obstacles
+                        pos,
+                        core_position,
+                        preferred=None,
+                        obstacles=obstacles,
+                        last_dir=_last_explore_dir.get(wkey),
                     )
                 if direction and hasattr(w, "move"):
+                    _last_move_dir[wkey] = direction
+                    # 回撤方向也写回 explore 记忆，阻止下一 tick explore 立刻反向（d=36/37 对抖）
+                    _last_explore_dir[wkey] = direction
                     w.move(_resolve_direction(w, direction))
-                    _last_explore_dir[wkey] = None
                     logs.append(
                         f"worker:{uid}:explore:{direction}:recall:r={r_now}:d={dist_core}"
                         f":ph={phase % 8}:ax={axis}"
@@ -510,7 +545,11 @@ def command_workers(
 
             # 默认：沿主轴外扩一步（不依赖可能落在身后的目标点）
             direction = outward_step(
-                pos, core_position, preferred=axis, obstacles=obstacles
+                pos,
+                core_position,
+                preferred=axis,
+                obstacles=obstacles,
+                last_dir=_last_explore_dir.get(wkey),
             )
             # 若目标确实在更外侧，允许朝目标走，但仍禁止靠近 Core
             step_to = clamp_step_toward(pos, explore, obstacles)
@@ -558,7 +597,11 @@ def command_workers(
                 nxt = add_pos(pos, NAME_TO_DELTA[direction])
                 if manhattan(nxt, core_position) < dist_core:
                     direction = outward_step(
-                        pos, core_position, preferred=axis, obstacles=obstacles
+                        pos,
+                        core_position,
+                        preferred=axis,
+                        obstacles=obstacles,
+                        last_dir=_last_explore_dir.get(wkey),
                     )
                     avoided = True
 

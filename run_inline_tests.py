@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from typing import Optional
 
 sys.path.insert(0, ".")
 
@@ -11,10 +12,12 @@ from bot.pathing import (
     manhattan,
     is_in_range_cardinal_or_diag,
     clamp_step_toward,
+    clamp_step_toward_memo,
     nearest,
     defense_ring_slots,
     explore_target,
     explore_targets,
+    add_pos,
 )
 from bot.economy import can_afford, choose_spawn, command_workers, effective_reserve
 from bot.combat import (
@@ -70,6 +73,42 @@ def main() -> int:
     check("range_bad", not is_in_range_cardinal_or_diag((10, 10), (12, 11)))
     check("step_right", clamp_step_toward((0, 0), (3, 0)) == "RIGHT")
     check("nearest", nearest((0, 0), [(5, 0), (1, 1)]) == (1, 1))
+
+    # 同列 + 朝 Core 方向被挡：带 memo 的寻路不得对抖且能绕行靠近 target
+    _dir_delta = {"UP": (0, -1), "DOWN": (0, 1), "LEFT": (-1, 0), "RIGHT": (1, 0)}
+    _memo_pos = (10, 12)
+    _memo_target = (10, 10)
+    _memo_obs = {(10, 11)}
+    _memo_last: Optional[str] = None
+    _memo_dirs: list[str] = []
+    for _ in range(6):
+        _d, _memo_last = clamp_step_toward_memo(
+            _memo_pos, _memo_target, _memo_obs, last_dir=_memo_last
+        )
+        if _d is None:
+            break
+        _memo_dirs.append(_d)
+        _dx, _dy = _dir_delta[_d]
+        _memo_pos = (_memo_pos[0] + _dx, _memo_pos[1] + _dy)
+    _alt_run = 0
+    _alt_max = 0
+    for _pa, _pb in zip(_memo_dirs, _memo_dirs[1:]):
+        if _dir_delta[_pb] == tuple(-v for v in _dir_delta[_pa]):
+            _alt_run += 1
+            _alt_max = max(_alt_max, _alt_run)
+        else:
+            _alt_run = 0
+    check(
+        "clamp_step_toward_no_oscillation",
+        manhattan(_memo_pos, _memo_target) < manhattan((10, 12), _memo_target)
+        and _alt_max <= 2,
+        f"dirs={_memo_dirs} pos={_memo_pos} alt_max={_alt_max}",
+    )
+    check(
+        "clamp_step_toward_memo_reaches_target",
+        manhattan(_memo_pos, _memo_target) <= 1,
+        f"pos={_memo_pos}",
+    )
     slots = defense_ring_slots((10, 10), 2, 4)
     check(
         "ring",
@@ -325,6 +364,100 @@ def main() -> int:
         and manhattan(nxt_expl, (10, 10)) >= 20
         and not any(":recall" in line for line in logs_expl),
         f"dir={dir_expl} nxt={nxt_expl} logs={logs_expl}",
+    )
+
+    # 满货 worker 在 Core 正下方 3 格、中间 (10,11) 有障碍：连续 6 tick 不得横跳
+    from bot.economy import _last_move_dir
+
+    _last_move_dir.clear()
+    _w_ret = StubUnit(position=(10, 12), cargo=1, unit_type="WORKER")
+    _t_ret = StubTurn(
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[_w_ret],
+        resource_cells=set(),
+        obstacle_cells={(10, 11)},
+    )
+    _plan_ret = assign_roles(_t_ret, config=config)
+    _ret_dirs: list[str] = []
+    _ret_pos = (10, 12)
+    for _ in range(6):
+        _w_ret.clear_action()
+        command_workers(_t_ret, _plan_ret, config=config)
+        if _w_ret.action != "move":
+            break  # 到达 Core 后 deposit，模拟结束
+        _rd = str(_w_ret.action_args)
+        _ret_dirs.append(_rd)
+        _rdx, _rdy = _dir_delta[_rd]
+        _ret_pos = (_ret_pos[0] + _rdx, _ret_pos[1] + _rdy)
+        _w_ret.position = _ret_pos
+    _r_alt_run = 0
+    _r_alt_max = 0
+    for _pa, _pb in zip(_ret_dirs, _ret_dirs[1:]):
+        if _dir_delta[_pb] == tuple(-v for v in _dir_delta[_pa]):
+            _r_alt_run += 1
+            _r_alt_max = max(_r_alt_max, _r_alt_run)
+        else:
+            _r_alt_run = 0
+    check(
+        "worker_return_deposit_avoids_oscillation",
+        _w_ret.action in ("move", "deposit")
+        and _r_alt_max <= 2
+        and manhattan(_ret_pos, (10, 10)) < 2,
+        f"dirs={_ret_dirs} pos={_ret_pos} alt_max={_r_alt_max}",
+    )
+
+    # recall 边界（d=37/36 对抖，线上 35d30567 现象）：10 tick 不回到旧位置
+    from bot.economy import (
+        _explore_axis,
+        _explore_phase,
+        _explore_ticks,
+        _last_explore_pos,
+        _prev_explore_pos,
+    )
+
+    for _d in (
+        _last_move_dir,
+        _last_explore_dir,
+        _last_explore_pos,
+        _prev_explore_pos,
+        _explore_phase,
+        _explore_ticks,
+        _explore_axis,
+    ):
+        _d.clear()
+    _w_rec = StubUnit(position=(47, 10), cargo=0, unit_type="WORKER")  # d=37
+    _t_rec = StubTurn(
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[_w_rec],
+        resource_cells=set(),
+        visible_enemies=[],
+    )
+    _plan_rec = assign_roles(_t_rec, config=config)
+    _rec_seen: set = set()
+    _rec_pos = _w_rec.position
+    _rec_left_steps = 0
+    _rec_ok = True
+    for _ in range(10):
+        if _rec_pos in _rec_seen:
+            _rec_ok = False
+            break
+        _rec_seen.add(_rec_pos)
+        _w_rec.clear_action()
+        command_workers(_t_rec, _plan_rec, config=config)
+        if _w_rec.action != "move":
+            break
+        _rrd = str(_w_rec.action_args)
+        _rrx, _rry = _dir_delta[_rrd]
+        _rec_pos = (_rec_pos[0] + _rrx, _rec_pos[1] + _rry)
+        _w_rec.position = _rec_pos
+        if _rrx < 0:
+            _rec_left_steps += 1
+    check(
+        "worker_recall_boundary_no_oscillation",
+        _rec_ok and _rec_left_steps >= 1,
+        f"revisit={not _rec_ok} left_steps={_rec_left_steps} pos={_rec_pos}",
     )
 
     print("=== combat ===")
