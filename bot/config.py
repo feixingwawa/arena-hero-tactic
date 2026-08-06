@@ -27,9 +27,9 @@ class TacticConfig:
         core_shield_threshold: Core 盾低于此值时优先修盾。
         unit_heal_hp_threshold: 单位 HP 低于此值且在 Core 上时治疗。
         reserve_resources: 预留资源，用于治疗/应急（spawn 前检查）。
-        worker_cost: Worker 生产成本（官方规则）。
-        vanguard_cost: Vanguard 生产成本。
-        ranger_cost: Ranger 生产成本。
+        worker_cost: Worker 生产成本（官方规则，SDK 0.2.9 UNIT_BASE_COSTS）。
+        vanguard_cost: Vanguard 生产成本（官方规则，SDK 0.2.9 UNIT_BASE_COSTS）。
+        ranger_cost: Ranger 生产成本（官方规则，SDK 0.2.9 UNIT_BASE_COSTS）。
         upkeep_soft_cap: 人口达到此值后停止常规扩军。
         upkeep_hard_cap: 人口达到此值后除非严重缺防否则不 spawn。
         patrol_offset: 防守巡逻环上的相位偏移基数。
@@ -55,9 +55,9 @@ class TacticConfig:
     unit_heal_hp_threshold: int = 1
 
     reserve_resources: int = 2
-    worker_cost: int = 3
-    vanguard_cost: int = 10
-    ranger_cost: int = 12
+    worker_cost: int = 5  # 官方 UNIT_BASE_COSTS：WORKER=5（SDK 0.2.9）
+    vanguard_cost: int = 10  # 官方 UNIT_BASE_COSTS：VANGUARD=10
+    ranger_cost: int = 12  # 官方 UNIT_BASE_COSTS：RANGER=12
 
     upkeep_soft_cap: int = 18
     upkeep_hard_cap: int = 19

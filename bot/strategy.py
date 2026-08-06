@@ -77,6 +77,16 @@ def decide(
         counts=counts,
     )
 
+    # 重生状态：RESPAWNING 时不做任何行动，等待 respawn_at_tick
+    state = getattr(turn, "state", None)
+    status = getattr(state, "status", None) if state is not None else None
+    if status is not None and str(status).upper() == "RESPAWNING":
+        respawn_at = getattr(state, "respawn_at_tick", None)
+        respawn_at = int(respawn_at) if respawn_at is not None else tick
+        result.logs.append(f"strategy:respawn_at={respawn_at}")
+        result.core_action = "respawn"
+        return result
+
     # Core 不存在（重生中）→ 无法行动
     if core_pos is None:
         result.logs.append("strategy:no_core")

@@ -35,7 +35,7 @@ def test_decide_worker_moves_to_resource(config: TacticConfig) -> None:
         workers=[worker],
         resource_cells={(10, 14)},
     )
-    # 资源不足 spawn（reserve），但 worker 应走向资源
+    # 早期 reserve=0、cost=5 → 恰好够 spawn 1 WORKER；worker 仍应走向资源
     decide(turn, config=config)
     assert worker.action in ("move", "harvest")
 
@@ -92,6 +92,26 @@ def test_decide_no_core() -> None:
     turn.core = None
     result = decide(turn)
     assert result.core_action == "absent"
+
+
+def test_decide_respawning_skips_actions(config: TacticConfig) -> None:
+    """RESPAWNING 状态：decide 直接返回，不排队任何动作。"""
+    from tests.stubs import StubState
+
+    turn = StubTurn(
+        tick=7,
+        resources=0,
+        core=StubCore(position=(10, 10)),
+        workers=[StubUnit(position=(11, 10), unit_type="WORKER")],
+        resource_cells={(12, 10)},
+        state=StubState(status="RESPAWNING", respawn_at_tick=120),
+    )
+    result = decide(turn, config=config)
+    assert result.core_action == "respawn"
+    assert turn.core is not None and turn.core.action is None
+    assert turn.workers[0].action is None
+    assert any("respawn_at=120" in line for line in result.logs)
+    assert result.population == 1
 
 
 def test_decide_and_describe(basic_turn: StubTurn, config: TacticConfig) -> None:

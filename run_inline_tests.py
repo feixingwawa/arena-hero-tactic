@@ -26,7 +26,7 @@ from bot.combat import (
 )
 from bot.roles import assign_roles, count_by_type, total_population
 from bot.strategy import decide, decide_and_describe
-from tests.stubs import StubCore, StubEnemy, StubTurn, StubUnit
+from tests.stubs import StubCore, StubEnemy, StubState, StubTurn, StubUnit
 
 config = TacticConfig(
     max_population=18,
@@ -60,7 +60,7 @@ def main() -> int:
     check("upkeep0", population_upkeep(19) == 0)
     check("upkeep1", population_upkeep(20) == 1)
     check("upkeep3", population_upkeep(40) == 3)
-    check("afford", can_afford(5, 3, 2) is True and can_afford(4, 3, 2) is False)
+    check("afford", can_afford(7, 5, 2) is True and can_afford(6, 5, 2) is False)
     check("manhattan", manhattan((0, 0), (3, 4)) == 7)
     check(
         "range_ok",
@@ -246,20 +246,20 @@ def main() -> int:
     t_b = explore_target((10, 10), 1, tick=0, base_radius=4)
     check("explore_index_dirs", t_a != t_b, f"a={t_a} b={t_b}")
 
-    # 早期 spawn：pop < early_game_pop 时 reserve=0，resources=3 可出 WORKER
+    # 早期 spawn：pop < early_game_pop 时 reserve=0，resources>=5 可出 WORKER（官方 cost=5）
     check(
         "early_reserve_zero",
         effective_reserve(0, config) == 0
         and effective_reserve(3, config) == 0
         and effective_reserve(4, config) == config.reserve_resources,
     )
-    turn_early = StubTurn(resources=3, core=StubCore(), workers=[])
+    turn_early = StubTurn(resources=5, core=StubCore(), workers=[])
     check(
         "early_spawn_worker",
         choose_spawn(turn_early, config=config) == "WORKER",
         f"got={choose_spawn(turn_early, config=config)}",
     )
-    # 非早期：pop>=early_game_pop 且仍缺 worker；resources=3, reserve=2, cost=3 → 不可
+    # 非早期：pop>=early_game_pop 且仍缺 worker；resources=5, reserve=2, cost=5 → 不可
     cfg_mid = TacticConfig(
         max_population=18,
         target_workers=12,
@@ -269,7 +269,7 @@ def main() -> int:
         early_game_pop=4,
     )
     workers_mid = [StubUnit(unit_type="WORKER") for _ in range(4)]
-    turn_mid = StubTurn(resources=3, core=StubCore(), workers=workers_mid)
+    turn_mid = StubTurn(resources=5, core=StubCore(), workers=workers_mid)
     check(
         "mid_spawn_blocked_by_reserve",
         choose_spawn(turn_mid, config=cfg_mid) is None,
@@ -431,6 +431,26 @@ def main() -> int:
     tn.core = None
     rn = decide(tn)
     check("no_core", rn.core_action == "absent")
+
+    # 重生状态：RESPAWNING 时跳过全部行动，仅记录 respawn_at
+    trs = StubTurn(
+        tick=7,
+        resources=0,
+        core=StubCore(position=(10, 10)),
+        workers=[StubUnit(position=(11, 10), unit_type="WORKER")],
+        resource_cells={(12, 10)},
+        state=StubState(status="RESPAWNING", respawn_at_tick=120),
+    )
+    rrs = decide(trs, config=config)
+    check(
+        "respawn_skip",
+        rrs.core_action == "respawn"
+        and trs.core is not None
+        and trs.core.action is None
+        and trs.workers[0].action is None
+        and any("respawn_at=120" in line for line in rrs.logs),
+        f"core_action={rrs.core_action} logs={rrs.logs}",
+    )
 
     tb = StubTurn(
         tick=1,

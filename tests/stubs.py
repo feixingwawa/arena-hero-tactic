@@ -104,6 +104,7 @@ class StubState:
     population_tier: int = 0
     upkeep_next_tick: int = 0
     status: str = "ACTIVE"
+    respawn_at_tick: Optional[int] = None
 
 
 @dataclass

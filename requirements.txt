@@ -2,7 +2,9 @@
 # Python >= 3.11
 
 # 官方 SDK（运行时连接游戏服务器）
-arena-hero>=0.2.6,<0.3
+# >=0.2.9：服务端协议升级后 state 消息不再含 population_tier/upkeep_next_tick，
+# 0.2.8 因 required+extra=forbid 解析失败（ProtocolError），0.2.9 已移除这两个字段。
+arena-hero>=0.2.9,<0.3
 
 # 可选：从 .env 加载 API Key
 python-dotenv>=1.0.0

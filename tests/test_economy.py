@@ -20,11 +20,11 @@ def test_population_upkeep_tiers() -> None:
 
 
 def test_can_afford_respects_reserve() -> None:
-    assert can_afford(10, 3, 2) is True
-    # 5-3=2 >= 2 → True（reserve 恰好满足）
-    assert can_afford(5, 3, 2) is True
-    assert can_afford(4, 3, 2) is False
-    assert can_afford(5, 3, 2) is True
+    assert can_afford(10, 5, 2) is True
+    # 7-5=2 >= 2 → True（reserve 恰好满足）
+    assert can_afford(7, 5, 2) is True
+    assert can_afford(6, 5, 2) is False
+    assert can_afford(7, 5, 2) is True
 
 
 def test_spawn_prefers_worker_when_short(config: TacticConfig) -> None:
@@ -41,11 +41,11 @@ def test_spawn_prefers_worker_when_short(config: TacticConfig) -> None:
 
 def test_spawn_skips_when_resources_low(config: TacticConfig) -> None:
     turn = StubTurn(
-        resources=2,  # reserve=2, worker cost 3 → 不够
+        resources=2,  # reserve=2, worker cost 5 → 不够
         core=StubCore(),
         workers=[],
     )
-    # resources 2, cost 3, reserve 2 → 2-3=-1 < 2
+    # resources 2, cost 5, reserve 2 → 2-5=-3 < 2
     choice = choose_spawn(turn, config=config)
     assert choice is None
 
@@ -218,17 +218,17 @@ def test_two_workers_explore_different_directions(config: TacticConfig) -> None:
 
 
 def test_early_spawn_ignores_reserve(config: TacticConfig) -> None:
-    """pop < early_game_pop 时 reserve 视为 0，resources>=3 可出 WORKER。"""
+    """pop < early_game_pop 时 reserve 视为 0，resources>=5 可出 WORKER。"""
     from bot.economy import effective_reserve
 
     assert effective_reserve(0, config) == 0
     assert effective_reserve(config.early_game_pop - 1, config) == 0
     assert effective_reserve(config.early_game_pop, config) == config.reserve_resources
 
-    turn = StubTurn(resources=3, core=StubCore(), workers=[])
+    turn = StubTurn(resources=5, core=StubCore(), workers=[])
     assert choose_spawn(turn, config=config) == "WORKER"
 
-    # 非早期：pop>=early 且仍缺 worker，reserve 生效，3 资源不够
+    # 非早期：pop>=early 且仍缺 worker，reserve 生效，5 资源不够
     cfg_mid = TacticConfig(
         max_population=18,
         target_workers=12,
@@ -238,7 +238,7 @@ def test_early_spawn_ignores_reserve(config: TacticConfig) -> None:
         early_game_pop=4,
     )
     mid = StubTurn(
-        resources=3,
+        resources=5,
         core=StubCore(),
         workers=[StubUnit(unit_type="WORKER") for _ in range(4)],
     )
