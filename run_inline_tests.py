@@ -412,6 +412,7 @@ def main() -> int:
         _explore_axis,
         _explore_phase,
         _explore_ticks,
+        _last_explore_dir,
         _last_explore_pos,
         _prev_explore_pos,
     )
