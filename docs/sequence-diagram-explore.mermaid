@@ -1,0 +1,39 @@
+sequenceDiagram
+    autonumber
+    participant D as decide (strategy.py)
+    participant C as TacticConfig
+    participant W as command_workers (economy.py)
+    participant M as MemoryMap
+    participant E as _explore_spiral_step
+    participant P as pathing.py
+    participant U as Worker unit
+
+    D->>C: set_beacon_position(config, pos/None)  %% GROUND→写；CARRIED/消失→None
+    D->>W: command_workers(turn, role_plan, config, core_position, memory)
+    W->>W: 提取 beacon_ground_pos / beacon_carrier_ids（拾取/持有者逻辑不变）
+
+    loop 每个 WORKER（无资源/无 cargo 才进入探索）
+        W->>E: _explore_spiral_step(w, workers, wkey, uid, pos, core, obstacles, enemies, config, memory, tick)
+        E->>M: mark_explored(pos, tick)  %% 到达新 chunk → 日志 new_chunk
+        alt phase == local
+            E->>P: _next_spiral_target(...) = spiral_target(core, sector, ring, index)  %% 跳过已探 chunk（Core chunk 除外）
+            E->>P: clamp_step_toward_memo(pos, target, obstacles, last_dir)
+            alt stalled >= recall_stall_ticks 且 config.beacon_position 有值
+                E->>E: st.phase = "beacon"; st.target = beacon_progress_target(...)  %% 日志 recall_soft:beacon
+            else stalled >= recall_stall_ticks 且无 Beacon
+                E->>E: 维持 local：index+1 / ring-1 收缩（原逻辑）
+            end
+        else phase == beacon
+            alt config.beacon_position 为 None（消失/被拾取）
+                E->>E: st.phase = "local"（回退本地扫掠）
+            else
+                E->>P: beacon_progress_target(pos, beacon, step_radius, offset=st.index%3-1, avoid=obstacles)
+                E->>P: clamp_step_toward_memo(pos, target, obstacles, last_dir)
+                alt 阻塞（direction None / 无进展）
+                    E->>M: record_obstacle_block(nxt, tick)  %% 日志 beacon_obstacle
+                    E->>E: st.index += 1（换 offset 绕障，不因同一障碍反复卡）
+                end
+            end
+        end
+        E->>U: move(direction) 或 wait()
+    end

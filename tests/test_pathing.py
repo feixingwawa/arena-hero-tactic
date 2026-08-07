@@ -6,6 +6,7 @@ from bot.pathing import (
     NAME_TO_DELTA,
     Position,
     add_pos,
+    beacon_progress_target,
     clamp_step_toward,
     clamp_step_toward_memo,
     manhattan,
@@ -189,3 +190,34 @@ def test_spiral_target_sectors_differ() -> None:
     t0 = spiral_target(core, 0, 4, 5, 0)
     t1 = spiral_target(core, 0, 4, 5, 1)
     assert t0 != t1
+
+
+def test_beacon_progress_target_straight_line() -> None:
+    """直线推进：beacon_progress_target((0,0),(10,0),4) ≈ (4,0)，仍在推进方向。"""
+    t = beacon_progress_target((0, 0), (10, 0), step_radius=4)
+    assert t == (4, 0)
+    assert manhattan(t, (10, 0)) < manhattan((0, 0), (10, 0))
+
+
+def test_beacon_progress_target_short_finish() -> None:
+    """短距收官：manhattan ≤ step_radius → 直接返回 beacon。"""
+    assert beacon_progress_target((0, 0), (3, 4), step_radius=8) == (3, 4)
+    assert beacon_progress_target((5, 5), (5, 5), step_radius=8) == (5, 5)
+
+
+def test_beacon_progress_target_avoids_obstacle() -> None:
+    """避障：直线点在障碍内 → 横向偏一档，不再返回该障碍格。"""
+    t = beacon_progress_target(
+        (0, 0), (10, 0), step_radius=4, offset=0, avoid={(4, 0)}
+    )
+    assert t != (4, 0)
+    # 仍向 Beacon 方向推进（比当前位置更近）
+    assert manhattan(t, (10, 0)) < 10
+
+
+def test_beacon_progress_target_offset_deterministic() -> None:
+    """offset 档位：确定性 + 横向错开路径。"""
+    t1 = beacon_progress_target((0, 0), (10, 0), step_radius=4, offset=1)
+    assert t1 == beacon_progress_target((0, 0), (10, 0), step_radius=4, offset=1)
+    t_plain = beacon_progress_target((0, 0), (10, 0), step_radius=4, offset=0)
+    assert t1 != t_plain

@@ -22,6 +22,7 @@ def _clean_global_state() -> None:
     设计约定：decide/command_workers 默认使用模块级单例与进程内 dict，
     测试必须清理，避免跨测试污染。
     """
+    from bot.config import DEFAULT_CONFIG
     from bot.economy import _last_move_dir, _spiral_state
     from bot.memory import WORLD_MEMORY
 
@@ -29,8 +30,13 @@ def _clean_global_state() -> None:
     _last_move_dir.clear()
     WORLD_MEMORY.resource_points.clear()
     WORLD_MEMORY.obstacles.clear()
+    WORLD_MEMORY.obstacle_cache.clear()
     WORLD_MEMORY.dropped_cargo.clear()
+    WORLD_MEMORY.explored_chunks.clear()
+    WORLD_MEMORY.explored_chunk_ticks.clear()
     WORLD_MEMORY._chunk_quota_cache.clear()
+    # 防 default-config 的 beacon_position 跨测试污染（frozen 用 object.__setattr__）
+    object.__setattr__(DEFAULT_CONFIG, "beacon_position", None)
     yield
 
 

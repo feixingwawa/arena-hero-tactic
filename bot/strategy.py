@@ -16,7 +16,7 @@ from bot.combat import (
     command_vanguards,
     should_core_heal_first,
 )
-from bot.config import TacticConfig, DEFAULT_CONFIG
+from bot.config import TacticConfig, DEFAULT_CONFIG, set_beacon_position
 from bot.economy import command_core_economy, command_workers
 from bot.memory import MemoryMap, WORLD_MEMORY
 from bot.pathing import manhattan
@@ -101,10 +101,33 @@ def decide(
     # tick 早期：更新地图记忆（资源可见性 / 障碍 / 掉落 cargo）
     mem.observe(turn, tick)
 
-    # Beacon 提取（P2-1 预留：decide 负责读取，economy 消费 turn.beacon）
+    # Beacon 位置实时追踪（P2-1）：每 tick 同步 config.beacon_position。
+    # GROUND → 写位置；CARRIED（己方/敌方拾取）或消失 → 清 None
+    # （Worker 自动停止向旧位置推进）。SDK status 可能是枚举，
+    # 统一 getattr(status, "value", status) 规范化。
     beacon = getattr(turn, "beacon", None)
     if beacon is not None:
-        result.logs.append(f"strategy:beacon:pos={_as_position(beacon.position)}")
+        status = getattr(
+            getattr(beacon, "status", None), "value", getattr(beacon, "status", None)
+        )
+        if status == "GROUND":
+            bpos = getattr(beacon, "position", None)
+            if bpos is not None:
+                set_beacon_position(config, _as_position(bpos))
+                result.logs.append(
+                    f"strategy:beacon:pos={_as_position(bpos)}"
+                )
+            else:
+                set_beacon_position(config, None)
+                result.logs.append("strategy:beacon:absent")
+        else:  # CARRIED 等
+            set_beacon_position(config, None)
+            result.logs.append(
+                f"strategy:beacon:cleared:carrier={getattr(beacon, 'carrier_id', None)}"
+            )
+    else:
+        set_beacon_position(config, None)
+        result.logs.append("strategy:beacon:absent")
 
     # 1) 角色分配 + 威胁评估
     role_plan = assign_roles(turn, config=config, core_position=core_pos)

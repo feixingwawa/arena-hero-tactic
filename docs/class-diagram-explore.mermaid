@@ -1,0 +1,93 @@
+classDiagram
+    direction LR
+
+    class SpiralState {
+        +str phase  %% 'local' | 'beacon'
+        +int ring
+        +int sector_id
+        +int index  %% local: 扇区点下标；beacon: 绕障 offset 计数
+        +Position target
+        +int stalled_ticks
+        +bool ring_done
+        +bool dedicated  %% P1-1: widx==0 的 Beacon 专属 Worker
+    }
+
+    class TacticConfig {
+        +int sector_count
+        +int spiral_base_ring
+        +int spiral_max_ring
+        +int recall_stall_ticks
+        +int refresh_interval_ticks
+        +int beacon_step_radius  %% 新增，默认 8
+        +Position|None beacon_position  %% 新增，运行期由 decide() 写入
+    }
+
+    class MemoryMap {
+        +dict resource_points
+        +set obstacles
+        +dict obstacle_cache  %% Position -> ObstacleState
+        +dict dropped_cargo
+        +set explored_chunks  %% 新增：全局已探 chunk
+        +dict explored_chunk_ticks  %% 新增：chunk -> 首次到达 tick
+        +observe(turn, tick) None
+        +mark_harvested(pos, tick) None
+        +mark_explored(pos, tick) bool  %% 新增：新 chunk 返回 True
+        +is_explored(chunk) bool  %% 新增
+        +record_obstacle_block(pos, tick) None  %% 新增
+        +revisit_candidates(core, tick, worker_pos, max_dist, sector_id) list
+        +is_obstacle(pos) bool
+    }
+
+    class ObstacleState {
+        +Position pos
+        +int first_seen_tick
+        +int last_seen_tick
+        +int block_count  %% beacon 推进被该障碍卡住的累计次数
+    }
+
+    class ResourcePointState {
+        +Position pos
+        +str state
+        +int seen_tick
+        +int depleted_tick
+        +int refresh_due_tick
+        +int chunk_ring
+    }
+
+    class DroppedCargoState {
+        +Position pos
+        +int amount
+        +int drop_tick
+        +bool collected
+    }
+
+    class Economy {
+        +command_workers(turn, role_plan, config, core_position, memory) list[str]
+        +_explore_spiral_step(w, workers, wkey, uid, pos, core_position, obstacles, enemy_positions, config, memory, tick) list[str]
+        +_next_spiral_target(core_position, st, sector_count, config, memory) Position
+        +_is_chunk_skippable(memory, core_position, cand) bool
+    }
+
+    class Strategy {
+        +decide(turn, config, memory) DecisionResult
+    }
+
+    class PathingUtils {
+        +spiral_target(core, sector_id, sector_count, ring, index) Position
+        +sector_points(center, radius, sector_id, sector_count) list
+        +beacon_progress_target(current, beacon, step_radius, offset, avoid) Position
+        +clamp_step_toward_memo(origin, target, obstacles, last_dir) (str|None, str|None)
+        +chunk_of(pos) tuple
+    }
+
+    Economy --> SpiralState : manages
+    Economy --> MemoryMap : reads/writes
+    Economy --> TacticConfig : reads beacon_position
+    Economy --> PathingUtils : uses
+    Strategy --> TacticConfig : writes beacon_position
+    Strategy --> MemoryMap : observe
+    Strategy --> Economy : calls
+    MemoryMap --> PathingUtils : uses
+    MemoryMap --> ObstacleState : contains
+    MemoryMap --> ResourcePointState : contains
+    MemoryMap --> DroppedCargoState : contains

@@ -196,3 +196,48 @@ def test_point_sector_matches_pathing() -> None:
     for r in (5, 8):
         for p in sector_points(core, r, 2, 4):
             assert mem.point_sector(core, p) == 2, f"{p} should be sector 2"
+
+
+def test_mark_explored_new_chunk_once() -> None:
+    """mark_explored：新 chunk 返回 True 并记录首次 tick；重复返回 False。"""
+    mem = MemoryMap()
+    assert mem.mark_explored((10, 10), 1) is True   # chunk (0,0)
+    assert mem.mark_explored((15, 12), 2) is False  # 同 chunk (0,0)
+    assert mem.mark_explored((40, 40), 3) is True   # chunk (1,1)
+    assert mem.explored_chunk_ticks[(0, 0)] == 1
+    assert mem.explored_chunk_ticks[(1, 1)] == 3
+    assert mem.is_explored((0, 0)) is True
+    assert mem.is_explored((2, 2)) is False
+    assert mem.explored_chunks == {(0, 0), (1, 1)}
+
+
+def test_record_obstacle_block_accumulates() -> None:
+    """record_obstacle_block：累计 block_count，记录首次/最近时间戳。"""
+    mem = MemoryMap()
+    mem.record_obstacle_block((30, 30), 5)
+    ost = mem.obstacle_cache[(30, 30)]
+    assert ost.first_seen_tick == 5
+    assert ost.last_seen_tick == 5
+    assert ost.block_count == 1
+    mem.record_obstacle_block((30, 30), 8)
+    ost = mem.obstacle_cache[(30, 30)]
+    assert ost.last_seen_tick == 8
+    assert ost.block_count == 2
+
+
+def test_observe_updates_obstacle_cache_timestamps() -> None:
+    """observe：可见障碍更新时间戳（保留 block_count），obstacles set API 不变。"""
+    mem = MemoryMap()
+    mem.observe(_turn(1, set(), obstacles={(30, 30)}), 1)
+    assert (30, 30) in mem.obstacles
+    ost = mem.obstacle_cache[(30, 30)]
+    assert ost.first_seen_tick == 1
+    assert ost.last_seen_tick == 1
+    assert ost.block_count == 0
+
+    mem.observe(_turn(2, set(), obstacles={(30, 30), (40, 40)}), 2)
+    assert mem.obstacle_cache[(30, 30)].last_seen_tick == 2
+    assert mem.obstacle_cache[(30, 30)].block_count == 0
+    assert mem.obstacle_cache[(40, 40)].first_seen_tick == 2
+    assert mem.obstacle_cache[(40, 40)].last_seen_tick == 2
+    assert mem.obstacles == {(30, 30), (40, 40)}

@@ -802,3 +802,281 @@ def test_cargo_reclaim_ignored_when_full(config: TacticConfig) -> None:
     assert worker.action == "move"
     assert any(":return_deposit:" in line for line in logs), logs
     assert not any(":to_cargo:" in line for line in logs), logs
+
+
+def _beacon_cfg(**overrides) -> TacticConfig:
+    """构造带 Beacon 配置的经济测试 config（不污染 fixture）。"""
+    base = dict(
+        max_population=18,
+        target_workers=4,
+        target_vanguards=2,
+        target_rangers=1,
+        defense_radius=3,
+        ranger_radius=4,
+        threat_radius=8,
+        retreat_adjacent=1,
+        retreat_radius=3,
+        reserve_resources=2,
+    )
+    base.update(overrides)
+    return TacticConfig(**base)
+
+
+def test_beacon_dedicated_assignment(config: TacticConfig) -> None:
+    """P1-1：Beacon 存在时 widx==0 Worker 专职 beacon（dedicated + phase=beacon）。"""
+    from bot.config import set_beacon_position
+    from bot.economy import _spiral_state
+    from tests.stubs import StubBeacon
+
+    cfg = _beacon_cfg()
+    set_beacon_position(cfg, (50, 10))
+    _spiral_state.clear()
+    wa = StubUnit(position=(10, 10), cargo=0, unit_type="WORKER")
+    wb = StubUnit(position=(10, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        tick=1,
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[wa, wb],
+        resource_cells=set(),
+        visible_enemies=[],
+        beacon=StubBeacon(position=(50, 10), status="GROUND", carrier_id=None),
+    )
+    plan = assign_roles(turn, config=cfg)
+    logs = command_workers(turn, plan, config=cfg)
+    assert any(":dedicated_beacon" in line for line in logs), logs
+    assert any(":phase=beacon" in line for line in logs), logs
+    st0 = _spiral_state[str(wa.id)]
+    assert st0.dedicated is True
+    assert st0.phase == "beacon"
+    st1 = _spiral_state[str(wb.id)]
+    assert st1.dedicated is False
+    assert st1.phase == "local"
+
+
+def test_beacon_soft_recall_switches_non_dedicated(config: TacticConfig) -> None:
+    """P0-1/P1-2：非 dedicated Worker local 阶段 stall 触发软回撤且 Beacon 存在 → 切 beacon。
+
+    验收标记：日志含 `recall_soft:beacon`；st.phase 变 'beacon'。
+    """
+    from bot.config import set_beacon_position
+    from bot.economy import _last_move_dir, _spiral_state
+    from tests.stubs import StubBeacon
+
+    cfg = _beacon_cfg(recall_stall_ticks=2)
+    set_beacon_position(cfg, (50, 10))
+    _spiral_state.clear()
+    _last_move_dir.clear()
+    # widx==0 → dedicated beacon；widx==1（被测试）→ local，四向被围 → 持续 stall
+    wa = StubUnit(position=(10, 10), cargo=0, unit_type="WORKER")
+    wb = StubUnit(position=(20, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        tick=1,
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[wa, wb],
+        resource_cells=set(),
+        obstacle_cells={(19, 10), (20, 9), (20, 11), (21, 10)},
+        visible_enemies=[],
+        beacon=StubBeacon(position=(50, 10), status="GROUND", carrier_id=None),
+    )
+    plan = assign_roles(turn, config=cfg)
+    saw_recall = False
+    for _ in range(cfg.recall_stall_ticks + 4):
+        wa.clear_action()
+        wb.clear_action()
+        logs = command_workers(turn, plan, config=cfg)
+        if any(":recall_soft:beacon" in line for line in logs):
+            saw_recall = True
+            break
+    assert saw_recall, f"expected recall_soft:beacon, logs={logs}"
+    st = _spiral_state[str(wb.id)]
+    assert st.phase == "beacon"
+
+
+def test_is_chunk_skippable_rule(config: TacticConfig) -> None:
+    """_is_chunk_skippable：已探 chunk 且非 Core chunk → True；Core chunk 永不跳过。"""
+    from bot.economy import _is_chunk_skippable
+
+    mem = MemoryMap()
+    mem.mark_explored((40, 10), 5)  # chunk (1,0)
+    core_pos = (10, 10)  # chunk (0,0)
+    assert _is_chunk_skippable(mem, core_pos, (40, 10)) is True
+    assert _is_chunk_skippable(mem, core_pos, (10, 10)) is False  # Core chunk
+    assert _is_chunk_skippable(None, core_pos, (40, 10)) is False  # memory None
+    assert _is_chunk_skippable(mem, core_pos, (5, 5)) is False  # 未探 chunk
+
+
+def test_next_spiral_target_skips_explored_chunk(config: TacticConfig) -> None:
+    """_next_spiral_target：候选在已探非 Core chunk → index+1 跳过，返回未探点。"""
+    from bot.economy import SpiralState, _next_spiral_target
+    from bot.pathing import chunk_of, sector_points
+
+    mem = MemoryMap()
+    core_pos = (10, 10)
+    mem.mark_explored((40, 10), 5)  # chunk (1,0) 已探
+
+    found = False
+    for ring in range(3, 40):
+        pts = sector_points(core_pos, ring, 0, 2)
+        for idx, p in enumerate(pts):
+            if chunk_of(p) == (1, 0):
+                st = SpiralState(ring=ring, sector_id=0, index=idx)
+                target = _next_spiral_target(core_pos, st, 2, config, mem)
+                assert chunk_of(target) != (1, 0), (
+                    f"target in explored chunk: {target}"
+                )
+                assert st.index != idx, "index should advance when skipping"
+                found = True
+                break
+        if found:
+            break
+    assert found, "no ring-32 candidate in chunk (1,0) found"
+
+
+def test_explore_logs_new_chunk(config: TacticConfig) -> None:
+    """P0-2：探索到达新 chunk → 日志含 new_chunk=(0,0)，记忆 is_explored。"""
+    from bot.economy import _spiral_state
+
+    _spiral_state.clear()
+    mem = MemoryMap()
+    worker = StubUnit(position=(10, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        tick=1,
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[worker],
+        resource_cells=set(),
+        visible_enemies=[],
+    )
+    plan = assign_roles(turn, config=config)
+    logs = command_workers(turn, plan, config=config, memory=mem)
+    assert any("new_chunk=(0,0)" in line for line in logs), logs
+    assert mem.is_explored((0, 0))
+    assert mem.explored_chunk_ticks[(0, 0)] == 1
+
+
+def test_beacon_obstacle_recorded(config: TacticConfig) -> None:
+    """P2-2：beacon 阶段卡 stall → 四邻障碍 record_obstacle_block + beacon_obstacle 日志。"""
+    from bot.config import set_beacon_position
+    from bot.economy import _last_move_dir, _spiral_state
+    from tests.stubs import StubBeacon
+
+    cfg = _beacon_cfg(recall_stall_ticks=2)
+    set_beacon_position(cfg, (50, 10))
+    _spiral_state.clear()
+    _last_move_dir.clear()
+    mem = MemoryMap()
+    worker = StubUnit(position=(20, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        tick=1,
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[worker],
+        resource_cells=set(),
+        obstacle_cells={(19, 10), (20, 9), (20, 11), (21, 10)},
+        visible_enemies=[],
+        beacon=StubBeacon(position=(50, 10), status="GROUND", carrier_id=None),
+    )
+    plan = assign_roles(turn, config=cfg)
+    logs = command_workers(turn, plan, config=cfg, memory=mem)
+    # widx==0 → dedicated beacon → 四向被挡 → beacon_obstacle
+    assert any(":beacon_obstacle:" in line for line in logs), logs
+    assert mem.obstacle_cache[(19, 10)].block_count >= 1
+    assert mem.obstacle_cache[(21, 10)].block_count >= 1
+
+
+def test_e2e_two_workers_beacon_division(config: TacticConfig) -> None:
+    """T05 端到端：2 Worker + 远点 GROUND Beacon → 1 dedicated_beacon + 1 local。
+
+    - beacon Worker（widx==0）phase=beacon 且 d_beacon 单调下降；
+    - local Worker（widx==1）留守 Core 周边；
+    - new_chunk 日志不重复；
+    - Beacon 消失 → 全部回 local。
+    """
+    from bot.config import set_beacon_position
+    from bot.economy import _last_move_dir, _spiral_state
+    from bot.pathing import manhattan
+    from tests.stubs import StubBeacon
+
+    cfg = _beacon_cfg(
+        recall_stall_ticks=6,
+        spiral_base_ring=3,
+        spiral_max_ring=32,
+        sector_count=2,
+    )
+    set_beacon_position(cfg, (50, 10))
+    _spiral_state.clear()
+    _last_move_dir.clear()
+    mem = MemoryMap()
+
+    wa = StubUnit(position=(10, 10), cargo=0, unit_type="WORKER")
+    wb = StubUnit(position=(10, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        tick=1,
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[wa, wb],
+        resource_cells=set(),
+        visible_enemies=[],
+        beacon=StubBeacon(position=(50, 10), status="GROUND", carrier_id=None),
+    )
+    plan = assign_roles(turn, config=cfg)
+
+    def _tick(status: str = "GROUND") -> list[str]:
+        wa.clear_action()
+        wb.clear_action()
+        turn.beacon = StubBeacon(position=(50, 10), status=status, carrier_id=None)
+        out = command_workers(turn, plan, config=cfg, memory=mem)
+        for w in (wa, wb):
+            if w.action == "move":
+                dx, dy = _DIR_DELTA[str(w.action_args)]
+                w.position = (w.position[0] + dx, w.position[1] + dy)
+        return out
+
+    all_logs: list[str] = []
+    d_prev = manhattan(wa.position, (50, 10))
+    decreasing = True
+    for _ in range(25):
+        all_logs.extend(_tick())
+        d = manhattan(wa.position, (50, 10))
+        if d > d_prev:
+            decreasing = False
+            break
+        d_prev = d
+
+    # 分工：dedicated_beacon 标记 + 1 个 beacon + 1 个 local
+    assert any(":dedicated_beacon" in line for line in all_logs), all_logs
+    st_a = _spiral_state[str(wa.id)]
+    st_b = _spiral_state[str(wb.id)]
+    assert st_a.dedicated is True and st_a.phase == "beacon"
+    assert st_b.dedicated is False and st_b.phase == "local"
+
+    # beacon Worker d_beacon 单调下降 + 朝 Beacon 推进
+    assert decreasing, f"d_beacon not monotonic: d_prev={d_prev}"
+    assert wa.position[0] > 10, f"beacon worker should advance +x: {wa.position}"
+
+    # local Worker 留守 Core 周边
+    assert manhattan(wb.position, (10, 10)) <= 20, (
+        f"local worker drifted from core: {wb.position}"
+    )
+
+    # new_chunk 日志不重复（mark_explored 语义保证；此处断言日志层面）
+    new_chunks = [
+        line.split("new_chunk=")[1]
+        for line in all_logs
+        if "new_chunk=" in line
+    ]
+    assert new_chunks, "expected new_chunk logs"
+    assert len(new_chunks) == len(set(new_chunks)), (
+        f"duplicate chunk logs: {new_chunks}"
+    )
+
+    # Beacon 消失 → 全回 local（P2-1）
+    set_beacon_position(cfg, None)
+    for _ in range(3):
+        all_logs.extend(_tick())
+    st_a = _spiral_state[str(wa.id)]
+    st_b = _spiral_state[str(wb.id)]
+    assert st_a.phase == "local", f"beacon worker phase={st_a.phase}"
+    assert st_b.phase == "local"

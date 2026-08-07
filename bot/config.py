@@ -7,6 +7,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Optional
+
+from bot.pathing import Position
 
 
 @dataclass(frozen=True)
@@ -74,6 +77,13 @@ class TacticConfig:
     refresh_interval_ticks: int = 4
     revisit_max_distance: int = 40
 
+    # ---- Beacon 导向探索（探索优化 P0-1 / P1-1 / P2-1）----
+    # 朝 Beacon 推进的步距：每 tick 生成目标点距当前 Worker 的曼哈顿距离。
+    beacon_step_radius: int = 8
+    # 运行期 Beacon 位置：**仅 decide() 每 tick 写入**，economy 只读。
+    # GROUND → 写位置；CARRIED / 消失 → 清 None（Worker 自动停止向旧位推进）。
+    beacon_position: Optional[Position] = None
+
     # 单位最大 HP（官方 v0.13，用于治疗判断）
     worker_max_hp: int = 2
     vanguard_max_hp: int = 4
@@ -83,6 +93,17 @@ class TacticConfig:
 
 
 DEFAULT_CONFIG: TacticConfig = TacticConfig()
+
+
+def set_beacon_position(config: TacticConfig, pos: Optional[Position]) -> None:
+    """运行期写入 `beacon_position`（frozen dataclass 用 `object.__setattr__`）。
+
+    共享知识约定：**仅 `decide()` 可调用**（每 tick 从 `turn.beacon` 同步）；
+    economy 只读该字段。语义：
+    - `"GROUND"` → 写 Beacon 位置；
+    - `"CARRIED"`（己方/敌方拾取）或缺失 → 清 `None`（Worker 自动停止向旧位推进）。
+    """
+    object.__setattr__(config, "beacon_position", pos)
 
 
 def population_upkeep(population: int) -> int:

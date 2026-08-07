@@ -187,6 +187,102 @@ def test_decide_memory_observe_updates_on_tick(config: TacticConfig) -> None:
     assert mem.resource_points[(14, 10)].state == DEPLETED
 
 
+def test_decide_syncs_beacon_ground(config: TacticConfig) -> None:
+    """P2-1：turn.beacon GROUND → config.beacon_position 写入位置。"""
+    from tests.stubs import StubBeacon
+
+    worker = StubUnit(position=(11, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        tick=1,
+        resources=5,
+        core=StubCore(position=(10, 10), hp=5, shield=5),
+        workers=[worker],
+        resource_cells={(14, 10)},
+        beacon=StubBeacon(position=(50, 10), status="GROUND", carrier_id=None),
+    )
+    result = decide(turn, config=config)
+    assert config.beacon_position == (50, 10)
+    assert any(
+        "strategy:beacon:pos=(50, 10)" in line for line in result.logs
+    ), result.logs
+
+
+def test_decide_clears_beacon_when_carried(config: TacticConfig) -> None:
+    """P2-1：CARRIED → beacon_position 清 None（停止向旧位置推进）。"""
+    from bot.config import set_beacon_position
+    from tests.stubs import StubBeacon
+
+    set_beacon_position(config, (50, 10))  # 先模拟上一 tick 有 beacon
+    worker = StubUnit(position=(11, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        tick=1,
+        resources=5,
+        core=StubCore(position=(10, 10), hp=5, shield=5),
+        workers=[worker],
+        resource_cells={(14, 10)},
+        beacon=StubBeacon(
+            position=(50, 10), status="CARRIED", carrier_id=worker.id
+        ),
+    )
+    result = decide(turn, config=config)
+    assert config.beacon_position is None
+    assert any("strategy:beacon:cleared" in line for line in result.logs)
+
+
+def test_decide_clears_beacon_when_absent(config: TacticConfig) -> None:
+    """P2-1：turn 无 beacon → beacon_position 清 None。"""
+    from bot.config import set_beacon_position
+
+    set_beacon_position(config, (50, 10))
+    worker = StubUnit(position=(11, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        tick=1,
+        resources=5,
+        core=StubCore(position=(10, 10), hp=5, shield=5),
+        workers=[worker],
+        resource_cells={(14, 10)},
+        beacon=None,
+    )
+    result = decide(turn, config=config)
+    assert config.beacon_position is None
+    assert any("strategy:beacon:absent" in line for line in result.logs)
+
+
+def test_decide_beacon_multi_tick_sync(config: TacticConfig) -> None:
+    """P2-1：多 tick 连续同步——GROUND 写、CARRIED 清、再 GROUND 写。"""
+    from bot.config import set_beacon_position
+    from tests.stubs import StubBeacon
+
+    worker = StubUnit(position=(11, 10), cargo=0, unit_type="WORKER")
+    core = StubCore(position=(10, 10), hp=5, shield=5)
+
+    t1 = StubTurn(
+        tick=1, resources=5, core=core, workers=[worker],
+        resource_cells={(14, 10)},
+        beacon=StubBeacon(position=(50, 10), status="GROUND", carrier_id=None),
+    )
+    decide(t1, config=config)
+    assert config.beacon_position == (50, 10)
+
+    t2 = StubTurn(
+        tick=2, resources=5, core=core, workers=[worker],
+        resource_cells={(14, 10)},
+        beacon=StubBeacon(
+            position=(50, 10), status="CARRIED", carrier_id=worker.id
+        ),
+    )
+    decide(t2, config=config)
+    assert config.beacon_position is None
+
+    t3 = StubTurn(
+        tick=3, resources=5, core=core, workers=[worker],
+        resource_cells={(14, 10)},
+        beacon=StubBeacon(position=(60, 12), status="GROUND", carrier_id=None),
+    )
+    decide(t3, config=config)
+    assert config.beacon_position == (60, 12)
+
+
 def test_default_config_new_defaults() -> None:
     """v0.14 优化默认值：编制 ≤ 人口上限；新增螺旋/记忆参数；无 upkeep 字段。"""
     cfg = DEFAULT_CONFIG
@@ -200,6 +296,9 @@ def test_default_config_new_defaults() -> None:
     assert cfg.recall_stall_ticks == 6
     assert cfg.refresh_interval_ticks == 4
     assert cfg.revisit_max_distance == 40
+    # Beacon 导向探索新增字段（探索优化 T01）
+    assert cfg.beacon_step_radius == 8
+    assert cfg.beacon_position is None
     # v0.14 已移除维护费与固定成本字段
     assert not hasattr(cfg, "upkeep_soft_cap")
     assert not hasattr(cfg, "upkeep_hard_cap")

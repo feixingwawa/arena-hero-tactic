@@ -76,6 +76,23 @@ class DroppedCargoState:
     collected: bool = False
 
 
+@dataclass
+class ObstacleState:
+    """单个障碍的记忆状态（探索优化 P2-2）。
+
+    Attributes:
+        pos: 障碍坐标。
+        first_seen_tick: 首次可见 tick。
+        last_seen_tick: 最近一次可见 tick（observe 每 tick 更新）。
+        block_count: Beacon 推进被该障碍卡住的累计次数（record_obstacle_block 累计）。
+    """
+
+    pos: Position
+    first_seen_tick: int = 0
+    last_seen_tick: int = 0
+    block_count: int = 0
+
+
 class MemoryMap:
     """进程内单局地图记忆。
 
@@ -85,7 +102,10 @@ class MemoryMap:
         sector_count: 扇区数（回访候选按 worker 扇区过滤时使用）。
         resource_points: pos -> ResourcePointState。
         obstacles: 永久障碍集合（地形）。
+        obstacle_cache: pos -> ObstacleState（含时间戳与 block_count）。
         dropped_cargo: pos -> DroppedCargoState。
+        explored_chunks: 全局已探 chunk 集合（多 Worker 共同贡献）。
+        explored_chunk_ticks: chunk -> 首次到达 tick（供日志 / 未来过期策略）。
     """
 
     def __init__(
@@ -99,7 +119,10 @@ class MemoryMap:
         self.sector_count = max(1, int(sector_count))
         self.resource_points: dict[Position, ResourcePointState] = {}
         self.obstacles: set[Position] = set()
+        self.obstacle_cache: dict[Position, ObstacleState] = {}
         self.dropped_cargo: dict[Position, DroppedCargoState] = {}
+        self.explored_chunks: set[tuple[int, int]] = set()
+        self.explored_chunk_ticks: dict[tuple[int, int], int] = {}
         self._chunk_quota_cache: dict[int, int] = {}
         self.center_chunk: tuple[int, int] = (0, 0)
 
@@ -124,14 +147,25 @@ class MemoryMap:
                 except Exception:
                     pass
 
-        # 障碍永久累积
+        # 障碍永久累积 + obstacle_cache 时间戳更新（P2-2；保持 obstacles set API）
         obs = getattr(turn, "obstacle_cells", None)
         if obs is not None:
             for o in obs:
                 try:
-                    self.obstacles.add(_as_position(o))
+                    p = _as_position(o)
                 except Exception:
-                    pass
+                    continue
+                self.obstacles.add(p)
+                ost = self.obstacle_cache.get(p)
+                if ost is None:
+                    self.obstacle_cache[p] = ObstacleState(
+                        pos=p,
+                        first_seen_tick=int(tick),
+                        last_seen_tick=int(tick),
+                        block_count=0,
+                    )
+                else:
+                    ost.last_seen_tick = int(tick)
 
         # 状态迁移：VISIBLE 且当前不可见 → DEPLETED；DEPLETED 到期 → REVISIT_DUE
         for pos, rp in list(self.resource_points.items()):
@@ -211,6 +245,43 @@ class MemoryMap:
         cargo = self.dropped_cargo.get(p)
         if cargo is not None:
             cargo.collected = True
+
+    def mark_explored(self, pos: Position, tick: int) -> bool:
+        """记录 Worker 到达过 `pos` 所在 chunk（P0-2 已探区域记忆）。
+
+        新 chunk 返回 True（调用方据此打 `new_chunk` 日志）；重复到达返回 False。
+        全局共享：多 Worker 共同贡献 `explored_chunks`，整局永久记录
+        （`explored_chunk_ticks` 记录首次到达 tick，为未来过期策略预留数据）。
+        """
+        c = chunk_of(_as_position(pos))
+        if c in self.explored_chunks:
+            return False
+        self.explored_chunks.add(c)
+        self.explored_chunk_ticks[c] = int(tick)
+        return True
+
+    def is_explored(self, chunk: tuple[int, int]) -> bool:
+        """该 chunk 是否已被（任意 Worker）探索过。"""
+        return chunk in self.explored_chunks
+
+    def record_obstacle_block(self, pos: Position, tick: int) -> None:
+        """记录 Beacon 推进被该障碍卡住的累计次数（P2-2）。
+
+        首次记录创建 ObstacleState；重复记录累计 `block_count` 并刷新
+        `last_seen_tick`。不依赖 `obstacles` 集合（调用方已确认该格是障碍）。
+        """
+        p = _as_position(pos)
+        ost = self.obstacle_cache.get(p)
+        if ost is None:
+            self.obstacle_cache[p] = ObstacleState(
+                pos=p,
+                first_seen_tick=int(tick),
+                last_seen_tick=int(tick),
+                block_count=1,
+            )
+        else:
+            ost.last_seen_tick = int(tick)
+            ost.block_count += 1
 
     # ---- Read ----
 

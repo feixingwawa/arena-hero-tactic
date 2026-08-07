@@ -697,6 +697,120 @@ def main() -> int:
         f"logs={_logs_c}",
     )
 
+    print("=== explore optimization (T01-T05) ===")
+    from bot.pathing import beacon_progress_target as _bpt, chunk_of as _chunk_of
+    from bot.config import set_beacon_position as _set_beacon
+    from bot.memory import MemoryMap as _MM
+
+    # T01: beacon_progress_target 纯函数
+    check(
+        "beacon_progress_straight",
+        _bpt((0, 0), (10, 0), 4) == (4, 0),
+        f"t={_bpt((0, 0), (10, 0), 4)}",
+    )
+    check(
+        "beacon_progress_finish",
+        _bpt((0, 0), (3, 4), 8) == (3, 4),
+    )
+    _bpt_avoid = _bpt((0, 0), (10, 0), 4, offset=0, avoid={(4, 0)})
+    check(
+        "beacon_progress_avoid",
+        _bpt_avoid != (4, 0) and manhattan(_bpt_avoid, (10, 0)) < 10,
+        f"avoid={_bpt_avoid}",
+    )
+    check(
+        "beacon_progress_offset_det",
+        _bpt((0, 0), (10, 0), 4, offset=1)
+        == _bpt((0, 0), (10, 0), 4, offset=1)
+        and _bpt((0, 0), (10, 0), 4, offset=1)
+        != _bpt((0, 0), (10, 0), 4, offset=0),
+    )
+
+    # T01: config.set_beacon_position（frozen dataclass 写入）
+    _cfg_beacon = TacticConfig()
+    _set_beacon(_cfg_beacon, (50, 10))
+    check("set_beacon_position", _cfg_beacon.beacon_position == (50, 10))
+    _set_beacon(_cfg_beacon, None)
+    check("set_beacon_position_clear", _cfg_beacon.beacon_position is None)
+
+    # T01: chunk 记忆
+    _m_chunk = _MM()
+    check(
+        "mark_explored",
+        _m_chunk.mark_explored((10, 10), 1) is True
+        and _m_chunk.mark_explored((15, 12), 2) is False
+        and _m_chunk.is_explored((0, 0))
+        and _m_chunk.explored_chunk_ticks[(0, 0)] == 1,
+    )
+    # T01: 障碍缓存
+    _m_obs = _MM()
+    _m_obs.record_obstacle_block((30, 30), 5)
+    _m_obs.record_obstacle_block((30, 30), 8)
+    check(
+        "obstacle_cache",
+        _m_obs.obstacle_cache[(30, 30)].block_count == 2
+        and _m_obs.obstacle_cache[(30, 30)].last_seen_tick == 8
+        and _m_obs.obstacle_cache[(30, 30)].first_seen_tick == 5,
+    )
+
+    # T03: dedicated + phase=beacon 日志（widx==0）
+    from bot.config import set_beacon_position as _sb2
+    from bot.economy import _spiral_state as _sp2, _last_move_dir as _lmd2
+    from tests.stubs import StubBeacon as _SB
+
+    _sp2.clear()
+    _lmd2.clear()
+    _cfg_b = TacticConfig(recall_stall_ticks=2, sector_count=2)
+    _sb2(_cfg_b, (50, 10))
+    # widx==0（专职 Beacon）置于四向障碍陷阱 → 首 tick 即 beacon_obstacle
+    _w_a = StubUnit(position=(20, 10), cargo=0, unit_type="WORKER")
+    _w_b = StubUnit(position=(10, 10), cargo=0, unit_type="WORKER")
+    _t_b = StubTurn(
+        tick=1,
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[_w_a, _w_b],
+        resource_cells=set(),
+        obstacle_cells={(19, 10), (20, 9), (20, 11), (21, 10)},
+        visible_enemies=[],
+        beacon=_SB(position=(50, 10), status="GROUND", carrier_id=None),
+    )
+    _p_b = assign_roles(_t_b, config=_cfg_b)
+    _logs_b = command_workers(_t_b, _p_b, config=_cfg_b, memory=_MM())
+    check(
+        "dedicated_beacon_log",
+        any(":dedicated_beacon" in line for line in _logs_b)
+        and any(":phase=beacon" in line for line in _logs_b)
+        and any(":beacon_obstacle:" in line for line in _logs_b),
+        f"logs={_logs_b}",
+    )
+    check(
+        "dedicated_phase",
+        _sp2[str(_w_a.id)].dedicated is True
+        and _sp2[str(_w_a.id)].phase == "beacon"
+        and _sp2[str(_w_b.id)].phase == "local",
+        f"wa={_sp2[str(_w_a.id)]} wb={_sp2[str(_w_b.id)]}",
+    )
+
+    # T04: decide 每 tick 同步 beacon_position
+    _cfg_sync = TacticConfig()
+    _sw = StubUnit(position=(11, 10), cargo=0, unit_type="WORKER")
+    _sc = StubCore(position=(10, 10), hp=5, shield=5)
+    _t_g = StubTurn(
+        tick=1, resources=5, core=_sc, workers=[_sw],
+        resource_cells={(14, 10)},
+        beacon=_SB(position=(50, 10), status="GROUND", carrier_id=None),
+    )
+    decide(_t_g, config=_cfg_sync)
+    check("decide_beacon_ground", _cfg_sync.beacon_position == (50, 10))
+    _t_c = StubTurn(
+        tick=2, resources=5, core=_sc, workers=[_sw],
+        resource_cells={(14, 10)},
+        beacon=_SB(position=(50, 10), status="CARRIED", carrier_id=_sw.id),
+    )
+    decide(_t_c, config=_cfg_sync)
+    check("decide_beacon_carried_clears", _cfg_sync.beacon_position is None)
+
     print(f"\n=== RESULT: {passed} passed, {failed} failed ===")
     return 1 if failed else 0
 

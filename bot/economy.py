@@ -13,9 +13,12 @@ from bot.config import TacticConfig, DEFAULT_CONFIG
 from bot.memory import MemoryMap
 from bot.rules import unit_cost_for
 from bot.pathing import (
+    CARDINAL_DELTAS,
     NAME_TO_DELTA,
     Position,
     add_pos,
+    beacon_progress_target,
+    chunk_of,
     clamp_step_toward_memo,
     manhattan,
     nearest,
@@ -93,20 +96,24 @@ class SpiralState:
     """单个 Worker 的螺旋扫掠探索状态。
 
     Attributes:
-        ring: 当前曼哈顿环半径。
+        phase: 探索阶段。'local'=基于 Core 螺旋扫掠；'beacon'=朝 Beacon 方向推进。
+        ring: 当前曼哈顿环半径（local 阶段有效）。
         sector_id: 扇区（worker_index % sector_count）。
-        index: 当前环扇区点列表中的下标。
+        index: 当前环扇区点列表中的下标（local）/ Beacon 绕障横向 offset 计数（beacon）。
         target: 当前目标点（None 表示待生成）。
         stalled_ticks: 连续无进展 tick 数（软回撤阈值 recall_stall_ticks）。
         ring_done: 当前环已扫完标记。
+        dedicated: P1-1 专职 Beacon Worker（widx==0 指派；beacon 存在时恒为 beacon）。
     """
 
-    ring: int = 5
+    phase: str = "local"  # 'local' | 'beacon'
+    ring: int = 3
     sector_id: int = 0
     index: int = 0
     target: Optional[Position] = None
     stalled_ticks: int = 0
     ring_done: bool = False
+    dedicated: bool = False
 
 
 # 非探索移动（return_deposit / to_resource / retreat / recall）的方向记忆，防 A↔B 对抖
@@ -547,6 +554,8 @@ def command_workers(
                     obstacles=obstacles,
                     enemy_positions=enemy_positions,
                     config=config,
+                    memory=memory,
+                    tick=tick,
                 )
             )
         else:
@@ -562,9 +571,175 @@ def command_workers(
                     obstacles=obstacles,
                     enemy_positions=enemy_positions,
                     config=config,
+                    memory=memory,
+                    tick=tick,
                 )
             )
 
+    return logs
+
+
+def _is_chunk_skippable(
+    memory: Optional[MemoryMap],
+    core_position: Position,
+    cand: Position,
+) -> bool:
+    """目标点是否应被跳过：已探 chunk 且**非 Core 所在 chunk**。
+
+    共享知识约定（决策 4）：chunk=32×32，Core 在 (10,10) 时 d≤20 本地扫掠
+    几乎全在 chunk (0,0)；若字面「跳过已探 chunk 内所有点」，首次到达 Core
+    即标记 (0,0) 已探 → 本地扫掠被整体吞掉。故「**Core chunk 永不跳过**」
+    （枢纽允许重复扫掠）。`memory is None → False`（不跳过）。
+    """
+    if memory is None:
+        return False
+    cand_chunk = chunk_of(cand)
+    if cand_chunk == chunk_of(core_position):
+        return False
+    return memory.is_explored(cand_chunk)
+
+
+def _next_spiral_target(
+    core_position: Position,
+    st: SpiralState,
+    sector_count: int,
+    config: TacticConfig,
+    memory: Optional[MemoryMap],
+) -> Position:
+    """生成螺旋扫掠下一目标点（P0-2），替换现有 3 处 `spiral_target` 直调。
+
+    规则：候选点所在 chunk 已探且非 Core chunk → `st.index += 1` 跳过
+    （环扫完则 ring+1 / 回绕，沿用现有推进语义）；未探或 Core chunk 直接返回。
+    """
+    max_iter = 64  # 防死循环（Core chunk 永不跳过，理论上总能返回）
+    for _ in range(max_iter):
+        cand = spiral_target(
+            core_position, st.sector_id, sector_count, st.ring, st.index
+        )
+        if not _is_chunk_skippable(memory, core_position, cand):
+            return cand
+        # 跳过：推进 index；本环扫完 → ring+1 / 回 base ring
+        st.index += 1
+        pts = sector_points(core_position, st.ring, st.sector_id, sector_count)
+        if st.index >= len(pts):
+            st.index = 0
+            st.ring += 1
+            if st.ring > config.spiral_max_ring:
+                st.ring = config.spiral_base_ring
+    return spiral_target(
+        core_position, st.sector_id, sector_count, st.ring, st.index
+    )
+
+
+def _beacon_explore_step(
+    w: Any,
+    wkey: str,
+    uid: Any,
+    pos: Position,
+    core_position: Position,
+    obstacles: set[Position],
+    enemy_positions: Sequence[Position],
+    config: TacticConfig,
+    st: SpiralState,
+    memory: Optional[MemoryMap],
+    tick: int,
+    dist_core: int,
+    soft_recall: bool = False,
+) -> list[str]:
+    """beacon 阶段一步（决策 1/3/6）：每 tick 从当前 pos 朝 Beacon 生成推进目标。
+
+    - 目标 = `beacon_progress_target(pos, beacon, step_radius, offset=st.index%3-1,
+      avoid=obstacles)`，每 tick 重新生成 → 天然随 Worker 推进而推进
+      （`d_beacon` 单调下降，日志 `:phase=beacon:d_beacon=...`）。
+    - 卡 stall（direction None / 无进展）→ 扫描四邻障碍 `record_obstacle_block`
+      + 日志 `:beacon_obstacle:pos=...:count=...`（P2-2）。
+    - stall ≥ `recall_stall_ticks` → `st.index += 1` 换横向 offset 绕障（不回 Core）。
+    - 软回撤切入时日志带 `:recall_soft:beacon`（P1-2）。
+    """
+    beacon = config.beacon_position
+    if beacon is None:
+        # 防御：beacon 消失（调用方已处理，此处兜底回 local）
+        st.phase = "local"
+        st.target = None
+        st.stalled_ticks = 0
+        return []
+
+    step_radius = max(1, int(getattr(config, "beacon_step_radius", 8) or 8))
+    d_beacon = manhattan(pos, beacon)
+    logs: list[str] = []
+
+    def _regenerate_target() -> Position:
+        offset = (st.index % 3) - 1
+        target = beacon_progress_target(
+            pos, beacon, step_radius=step_radius, offset=offset, avoid=obstacles
+        )
+        st.target = target
+        return target
+
+    target = _regenerate_target()
+    dist_to_target = manhattan(pos, target)
+    direction, _ = clamp_step_toward_memo(
+        pos, target, obstacles, last_dir=_last_move_dir.get(wkey)
+    )
+
+    # 进度追踪：方向为空（卡住）或未缩短与目标距离 → stall+1 + 障碍记录
+    progressed = False
+    if direction is not None:
+        nxt = add_pos(pos, NAME_TO_DELTA[direction])
+        if manhattan(nxt, target) < dist_to_target:
+            progressed = True
+    if progressed:
+        st.stalled_ticks = 0
+    else:
+        st.stalled_ticks += 1
+        if memory is not None:
+            for dpos in CARDINAL_DELTAS:
+                nb = add_pos(pos, dpos)
+                if nb in obstacles:
+                    memory.record_obstacle_block(nb, tick)
+                    count = memory.obstacle_cache[nb].block_count
+                    logs.append(
+                        f"worker:{uid}:beacon_obstacle:pos={nb}:count={count}"
+                    )
+
+    # beacon 阶段卡 stall ≥ 阈值 → 换横向 offset（绕障，不回 Core）
+    if st.stalled_ticks >= config.recall_stall_ticks:
+        st.stalled_ticks = 0
+        st.index += 1
+        target = _regenerate_target()
+        direction, _ = clamp_step_toward_memo(
+            pos, target, obstacles, last_dir=_last_move_dir.get(wkey)
+        )
+
+    # 避敌改道（不强制外扩）
+    avoided = False
+    if enemy_positions and direction:
+        direction, avoided = _pick_explore_direction_avoiding_enemies(
+            pos,
+            preferred=direction,
+            enemies=enemy_positions,
+            core_position=core_position,
+            obstacles=obstacles,
+        )
+
+    suffix = ":avoid" if avoided else ""
+    rl = ":recall_soft:beacon" if soft_recall else ""
+    ded = ":dedicated_beacon" if st.dedicated else ""
+    if direction and hasattr(w, "move"):
+        _last_move_dir[wkey] = direction
+        w.move(_resolve_direction(w, direction))
+        logs.append(
+            f"worker:{uid}:explore:{direction}:phase=beacon:ring={st.ring}"
+            f":sec={st.sector_id}:stall={st.stalled_ticks}:d={dist_core}"
+            f":d_beacon={d_beacon}{rl}{ded}{suffix}"
+        )
+    elif hasattr(w, "wait"):
+        w.wait()
+        logs.append(
+            f"worker:{uid}:explore:None:phase=beacon:ring={st.ring}"
+            f":sec={st.sector_id}:stall={st.stalled_ticks}:d={dist_core}"
+            f":d_beacon={d_beacon}{rl}{ded}"
+        )
     return logs
 
 
@@ -578,20 +753,28 @@ def _explore_spiral_step(
     obstacles: set[Position],
     enemy_positions: Sequence[Position],
     config: TacticConfig,
+    memory: Optional[MemoryMap] = None,
+    tick: int = 0,
 ) -> list[str]:
-    """无可见资源时的螺旋扫掠一步（目标点导航 + 软回撤）。
+    """无可见资源时的螺旋扫掠一步（两阶段状态机 + 目标点导航 + 软回撤）。
 
     设计要点（决策 1）：
-    - 删除 recall_dist 硬边界与「绝不朝 Core 收缩」守卫——目标点导航沿环切向
-      移动允许曼哈顿距离暂时持平/微降，不再制造 d=36/37 单维势阱。
-    - 到达目标 → index+1；本环扫完 → ring+1；ring 超 spiral_max_ring → 回
-      base ring 重新开始。
-    - 连续 recall_stall_ticks 无进展 → 软回撤：推进环内下一目标点；环到尽头
-      则 ring-1（向内收缩一环）；绝对安全网（d > spiral_max_ring + 8）直接
-      朝 Core 一步。
+    - **local**：删除 recall_dist 硬边界与「绝不朝 Core 收缩」守卫——目标点
+      导航沿环切向移动允许曼哈顿距离暂时持平/微降；到达目标 → index+1；
+      本环扫完 → ring+1；ring 超 spiral_max_ring → 回 base ring。
+      连续 recall_stall_ticks 无进展 → 软回撤：**若 Beacon 存在则切 beacon**
+      （P0-1/P1-2，日志 `:recall_soft:beacon`）；否则推进环内下一目标点 /
+      ring-1 收缩。
+    - **beacon**：每 tick 朝 Beacon 生成推进目标（决策 3），stall 换 offset
+      绕障（决策 6）；Beacon 消失 → 回 local；非 dedicated 到达近旁 → 回 local。
+    - **dedicated**（P1-1）：`widx==0` 且 Beacon 存在 → 专职 Beacon，恒为 beacon。
+    - **绝对安全网**（极少触发）：**仅 local 阶段生效**——距 Core 过远直接朝
+      Core 一步；beacon 阶段以 Beacon 方向为准，不受 Core 距离限制。
+    - **到达标记**（P0-2）：`mark_explored(pos, tick)`，新 chunk → `new_chunk` 日志。
     - 避敌仅改道（_pick_explore_direction_avoiding_enemies），不强制外扩。
 
-    返回本 worker 的日志行列表（含 :ring=..:sec=..:stall=.. 字段）。
+    返回本 worker 的日志行列表（local 含 :ring=..:sec=..:stall=..；
+    beacon 追加 :phase=beacon:d_beacon=.. / :dedicated_beacon）。
     """
     logs: list[str] = []
     sector_count = max(1, config.sector_count)
@@ -610,8 +793,28 @@ def _explore_spiral_step(
 
     dist_core = manhattan(pos, core_position)
 
-    # 绝对安全网（极少触发）：距 Core 过远直接朝 Core 一步
-    if dist_core > config.spiral_max_ring + 8:
+    # 到达标记：记录已探 chunk（新 chunk → new_chunk 日志）
+    if memory is not None and memory.mark_explored(pos, tick):
+        cx, cy = memory.chunk_of(pos)
+        logs.append(f"worker:{uid}:new_chunk=({cx},{cy})")
+
+    # P1-1 dedicated 指派：widx==0 且 Beacon 存在 → 专职 Beacon
+    if config.beacon_position is not None and widx == 0 and not st.dedicated:
+        st.dedicated = True
+        st.phase = "beacon"
+        logs.append(f"worker:{uid}:dedicated_beacon")
+    # dedicated 强制 beacon（Beacon 存在时）
+    if st.dedicated and config.beacon_position is not None:
+        st.phase = "beacon"
+
+    # beacon 阶段且 Beacon 消失 / 被拾取 → 回 local（P2-1）
+    if st.phase == "beacon" and config.beacon_position is None:
+        st.phase = "local"
+        st.target = None
+        st.stalled_ticks = 0
+
+    # 绝对安全网（**仅 local 阶段生效**）：距 Core 过远直接朝 Core 一步
+    if st.phase == "local" and dist_core > config.spiral_max_ring + 8:
         direction, _ = clamp_step_toward_memo(
             pos, core_position, obstacles, last_dir=_last_move_dir.get(wkey)
         )
@@ -628,10 +831,43 @@ def _explore_spiral_step(
             logs.append(f"worker:{uid}:wait_idle")
         return logs
 
-    # 目标点导航
+    # ---- beacon 阶段 ----
+    if st.phase == "beacon":
+        beacon = config.beacon_position
+        step_radius = max(1, int(getattr(config, "beacon_step_radius", 8) or 8))
+        # 非 dedicated 到达 Beacon 近旁 → 回 local（决策 1）
+        if (
+            not st.dedicated
+            and beacon is not None
+            and manhattan(pos, beacon) <= step_radius
+        ):
+            st.phase = "local"
+            st.target = None
+            st.stalled_ticks = 0
+        else:
+            logs.extend(
+                _beacon_explore_step(
+                    w=w,
+                    wkey=wkey,
+                    uid=uid,
+                    pos=pos,
+                    core_position=core_position,
+                    obstacles=obstacles,
+                    enemy_positions=enemy_positions,
+                    config=config,
+                    st=st,
+                    memory=memory,
+                    tick=tick,
+                    dist_core=dist_core,
+                    soft_recall=False,
+                )
+            )
+            return logs
+
+    # ---- local 阶段（目标点导航）----
     if st.target is None:
-        st.target = spiral_target(
-            core_position, st.sector_id, sector_count, st.ring, st.index
+        st.target = _next_spiral_target(
+            core_position, st, sector_count, config, memory
         )
     dist_to_target = manhattan(pos, st.target)
 
@@ -646,8 +882,8 @@ def _explore_spiral_step(
             if st.ring > config.spiral_max_ring:
                 st.ring = config.spiral_base_ring  # 回 base ring 重新开始
         st.stalled_ticks = 0
-        st.target = spiral_target(
-            core_position, st.sector_id, sector_count, st.ring, st.index
+        st.target = _next_spiral_target(
+            core_position, st, sector_count, config, memory
         )
         dist_to_target = manhattan(pos, st.target)
 
@@ -670,15 +906,36 @@ def _explore_spiral_step(
     if st.stalled_ticks >= config.recall_stall_ticks:
         st.stalled_ticks = 0
         soft_recall = True
-        # 优先推进环内下一目标点；若当前环已到 sector 尽头则 ring-1（向内收缩一环）
+        if config.beacon_position is not None:
+            # P0-1 / P1-2：软回撤优先切向 Beacon（而非 ring-1 向 Core 收缩）
+            st.phase = "beacon"
+            logs.extend(
+                _beacon_explore_step(
+                    w=w,
+                    wkey=wkey,
+                    uid=uid,
+                    pos=pos,
+                    core_position=core_position,
+                    obstacles=obstacles,
+                    enemy_positions=enemy_positions,
+                    config=config,
+                    st=st,
+                    memory=memory,
+                    tick=tick,
+                    dist_core=dist_core,
+                    soft_recall=True,
+                )
+            )
+            return logs
+        # 无 Beacon：推进环内下一目标点；若当前环已到 sector 尽头则 ring-1
         st.index += 1
         pts = sector_points(core_position, st.ring, st.sector_id, sector_count)
         if st.index >= len(pts):
             st.index = 0
             if st.ring > config.spiral_base_ring:
                 st.ring -= 1
-        st.target = spiral_target(
-            core_position, st.sector_id, sector_count, st.ring, st.index
+        st.target = _next_spiral_target(
+            core_position, st, sector_count, config, memory
         )
         direction, _ = clamp_step_toward_memo(
             pos, st.target, obstacles, last_dir=_last_move_dir.get(wkey)

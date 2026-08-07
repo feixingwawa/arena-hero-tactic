@@ -418,6 +418,67 @@ def spiral_target(
     return pts[index % len(pts)]
 
 
+def beacon_progress_target(
+    current: Position,
+    beacon: Position,
+    step_radius: int = 8,
+    offset: int = 0,
+    avoid: Optional[Iterable[Position]] = None,
+) -> Position:
+    """返回当前 Worker 朝 Beacon 推进的阶段性目标点（探索优化决策 3）。
+
+    纯函数、确定性，不依赖 SpiralState，单测可直测。规则：
+    - `manhattan(current, beacon) <= step_radius` → 直接返回 beacon（收官）。
+    - 否则在 current→beacon 方向线上按轴向比例取「距 current 约 step_radius
+      曼哈顿距离」的点（曼哈顿测地线中点）。
+    - `offset` 决定横向偏移档位（-1/0/+1）：沿垂直主推进轴偏移，用于绕障与
+      多 Worker 错开路径；直线点在 `avoid` 障碍内时横向偏一档重试。
+    - 每 tick 从当前 pos 重新生成 → 天然随 Worker 推进而推进（d_beacon 单调下降）。
+    """
+    if manhattan(current, beacon) <= step_radius:
+        return beacon
+
+    dx = beacon[0] - current[0]
+    dy = beacon[1] - current[1]
+    total = abs(dx) + abs(dy)
+    if total == 0:
+        return beacon
+
+    nx = round(step_radius * abs(dx) / total)
+    ny = step_radius - nx
+    sx = 1 if dx > 0 else -1
+    sy = 1 if dy > 0 else -1
+    base = (current[0] + sx * nx, current[1] + sy * ny)
+
+    blocked: set[Position] = set(avoid) if avoid is not None else set()
+    # 横向偏移沿垂直主推进轴的轴（|dx|>=|dy| → 沿 y；否则沿 x）
+    lateral_on_y = abs(dx) >= abs(dy)
+
+    def _offset_point(off: int) -> Position:
+        if lateral_on_y:
+            return (base[0], base[1] + off)
+        return (base[0] + off, base[1])
+
+    # 候选顺序：先当前 offset 档，再直线点，再向两侧扩展（绕障 / 错开路径）
+    candidates: list[Position] = []
+    seen: set[Position] = set()
+    for off in (offset, 0, 1, -1, 2, -2):
+        cand = _offset_point(off)
+        if cand in seen:
+            continue
+        seen.add(cand)
+        candidates.append(cand)
+
+    for cand in candidates:
+        if cand in blocked:
+            continue
+        if manhattan(cand, beacon) < manhattan(current, beacon):
+            return cand
+
+    # 兜底：全部被挡/反向时返回直线点（由 clamp_step_toward_memo 绕行）
+    return base
+
+
 def point_sector(
     center: Position,
     pos: Position,
