@@ -22,6 +22,7 @@ from bot.pathing import (
     clamp_step_toward_memo,
     manhattan,
     nearest,
+    outward_step,
     sector_points,
     spiral_target,
 )
@@ -350,7 +351,10 @@ def command_workers(
     # 资源目标去重：多个 worker 尽量分配不同资源点
     claimed: set[Position] = set()
 
-    # Beacon 提取（P2-1）：持有者优先采集；GROUND 同格可拾取
+    # Beacon 提取（P2-1）：持有者优先采集；GROUND 同格可拾取。
+    # SDK 0.2.9：beacon.status 为 BeaconStatus(StrEnum) | None：
+    #   "CARRIED" 必有 carrier_id；status=None 表示「位置公开、未被拾取」
+    #   （模型约束：非 CARRIED 时 carrier_id 必为 None）→ 与 GROUND 同语义。
     beacon = getattr(turn, "beacon", None)
     beacon_carrier_ids: set[str] = set()
     beacon_ground_pos: Optional[Position] = None
@@ -361,7 +365,7 @@ def command_workers(
             cid = getattr(beacon, "carrier_id", None)
             if cid is not None:
                 beacon_carrier_ids.add(str(cid))
-        elif status_str == "GROUND":
+        elif status_str in ("GROUND", None):
             bpos = getattr(beacon, "position", None)
             if bpos is not None:
                 try:
@@ -605,18 +609,25 @@ def _next_spiral_target(
     sector_count: int,
     config: TacticConfig,
     memory: Optional[MemoryMap],
+    obstacles: Optional[set[Position]] = None,
 ) -> Position:
     """生成螺旋扫掠下一目标点（P0-2），替换现有 3 处 `spiral_target` 直调。
 
     规则：候选点所在 chunk 已探且非 Core chunk → `st.index += 1` 跳过
     （环扫完则 ring+1 / 回绕，沿用现有推进语义）；未探或 Core chunk 直接返回。
+    `obstacles` 非空时，候选点本身是障碍 → 同样跳过，避免 Worker 反复朝
+    不可达格振荡（bugfix：目标点绝不落在障碍上）。
     """
     max_iter = 64  # 防死循环（Core chunk 永不跳过，理论上总能返回）
+    blocked = obstacles if obstacles is not None else set()
     for _ in range(max_iter):
         cand = spiral_target(
             core_position, st.sector_id, sector_count, st.ring, st.index
         )
-        if not _is_chunk_skippable(memory, core_position, cand):
+        if (
+            not _is_chunk_skippable(memory, core_position, cand)
+            and cand not in blocked
+        ):
             return cand
         # 跳过：推进 index；本环扫完 → ring+1 / 回 base ring
         st.index += 1
@@ -682,12 +693,21 @@ def _beacon_explore_step(
         pos, target, obstacles, last_dir=_last_move_dir.get(wkey)
     )
 
-    # 进度追踪：方向为空（卡住）或未缩短与目标距离 → stall+1 + 障碍记录
+    # 进度追踪：方向为空（卡住）或未缩短与目标距离 → stall+1 + 障碍记录。
+    # 紧接反向对抖（A↔B 贴墙振荡）即使缩短距离也不算进展，保证 stall
+    # 能累积 → 换横向 offset 绕障。
     progressed = False
     if direction is not None:
         nxt = add_pos(pos, NAME_TO_DELTA[direction])
         if manhattan(nxt, target) < dist_to_target:
             progressed = True
+    last_dir = _last_move_dir.get(wkey)
+    if (
+        direction is not None
+        and last_dir is not None
+        and direction == _opposite_dir(last_dir)
+    ):
+        progressed = False
     if progressed:
         st.stalled_ticks = 0
     else:
@@ -763,8 +783,9 @@ def _explore_spiral_step(
       导航沿环切向移动允许曼哈顿距离暂时持平/微降；到达目标 → index+1；
       本环扫完 → ring+1；ring 超 spiral_max_ring → 回 base ring。
       连续 recall_stall_ticks 无进展 → 软回撤：**若 Beacon 存在则切 beacon**
-      （P0-1/P1-2，日志 `:recall_soft:beacon`）；否则推进环内下一目标点 /
-      ring-1 收缩。
+      （P0-1/P1-2，日志 `:recall_soft:beacon`）；否则**向外扩一层（ring+1）
+      并把 index 跳到环对面（+len(pts)//2）**——探索只向外扩散，绝不因
+      stall 收缩回 Core（bugfix：软回撤不再 ring-1）。
     - **beacon**：每 tick 朝 Beacon 生成推进目标（决策 3），stall 换 offset
       绕障（决策 6）；Beacon 消失 → 回 local；非 dedicated 到达近旁 → 回 local。
     - **dedicated**（P1-1）：`widx==0` 且 Beacon 存在 → 专职 Beacon，恒为 beacon。
@@ -867,7 +888,7 @@ def _explore_spiral_step(
     # ---- local 阶段（目标点导航）----
     if st.target is None:
         st.target = _next_spiral_target(
-            core_position, st, sector_count, config, memory
+            core_position, st, sector_count, config, memory, obstacles
         )
     dist_to_target = manhattan(pos, st.target)
 
@@ -883,7 +904,7 @@ def _explore_spiral_step(
                 st.ring = config.spiral_base_ring  # 回 base ring 重新开始
         st.stalled_ticks = 0
         st.target = _next_spiral_target(
-            core_position, st, sector_count, config, memory
+            core_position, st, sector_count, config, memory, obstacles
         )
         dist_to_target = manhattan(pos, st.target)
 
@@ -891,8 +912,16 @@ def _explore_spiral_step(
         pos, st.target, obstacles, last_dir=_last_move_dir.get(wkey)
     )
 
-    # 进度追踪：方向为空（卡住）或未缩短与目标距离 → stall+1
-    if direction is None:
+    # 进度追踪：方向为空（卡住）、目标本身是障碍（不可达）、紧接反向对抖
+    # （A↔B 贴墙振荡）或未缩短与目标距离 → stall+1。
+    # 反向对抖即使 manhattan 缩短也不算进展（如贴墙横跳），保证 stall
+    # 能累积 → 软回撤外扩（bugfix：不再因振荡永远卡在同一环）。
+    last_dir = _last_move_dir.get(wkey)
+    if st.target in obstacles:
+        st.stalled_ticks += 1
+    elif direction is None:
+        st.stalled_ticks += 1
+    elif last_dir is not None and direction == _opposite_dir(last_dir):
         st.stalled_ticks += 1
     else:
         nxt = add_pos(pos, NAME_TO_DELTA[direction])
@@ -927,23 +956,30 @@ def _explore_spiral_step(
                 )
             )
             return logs
-        # 无 Beacon：推进环内下一目标点；若当前环已到 sector 尽头则 ring-1
-        st.index += 1
+        # 无 Beacon：软回撤 **向外扩** —— 绝不因 stall 收缩回 Core。
+        # 1) ring+1（向外扩一层；达到上限后保持 max ring，不收缩）
+        # 2) index 跳到环对面（+len(pts)//2），避免反复卡同一障碍
+        st.ring += 1
+        if st.ring > config.spiral_max_ring:
+            st.ring = config.spiral_max_ring
         pts = sector_points(core_position, st.ring, st.sector_id, sector_count)
-        if st.index >= len(pts):
+        if pts:
+            st.index = (st.index + len(pts) // 2) % len(pts)
+        else:
             st.index = 0
-            if st.ring > config.spiral_base_ring:
-                st.ring -= 1
         st.target = _next_spiral_target(
-            core_position, st, sector_count, config, memory
+            core_position, st, sector_count, config, memory, obstacles
         )
         direction, _ = clamp_step_toward_memo(
             pos, st.target, obstacles, last_dir=_last_move_dir.get(wkey)
         )
         if direction is None:
-            # 兜底：朝 Core 一步
-            direction, _ = clamp_step_toward_memo(
-                pos, core_position, obstacles, last_dir=_last_move_dir.get(wkey)
+            # 兜底：优先远离 Core（绝不因 stall 收缩）；仅四向皆挡时为 None
+            direction = outward_step(
+                pos,
+                core_position,
+                obstacles=obstacles,
+                last_dir=_last_move_dir.get(wkey),
             )
 
     # 避敌改道（不强制外扩）
