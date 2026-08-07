@@ -1009,9 +1009,10 @@ def test_beacon_dedicated_assignment(config: TacticConfig) -> None:
 
 
 def test_beacon_soft_recall_switches_non_dedicated(config: TacticConfig) -> None:
-    """P0-1/P1-2：非 dedicated Worker local 阶段 stall 触发软回撤且 Beacon 存在 → 切 beacon。
+    """非 dedicated Worker：Beacon 存在时 stall 软回撤 **不** 切 beacon，保持 local 外扩。
 
-    验收标记：日志含 `recall_soft:beacon`；st.phase 变 'beacon'。
+    回归：全员 soft-recall 追远点 Beacon → 无 harvest、res 卡 1。
+    修复后仅 dedicated 可 soft-recall:beacon；非 dedicated 走 ring+1。
     """
     from bot.config import set_beacon_position
     from bot.economy import _last_move_dir, _spiral_state
@@ -1035,17 +1036,122 @@ def test_beacon_soft_recall_switches_non_dedicated(config: TacticConfig) -> None
         beacon=StubBeacon(position=(50, 10), status="GROUND", carrier_id=None),
     )
     plan = assign_roles(turn, config=cfg)
-    saw_recall = False
-    for _ in range(cfg.recall_stall_ticks + 4):
+    saw_soft = False
+    last_logs: list[str] = []
+    for _ in range(cfg.recall_stall_ticks + 6):
         wa.clear_action()
         wb.clear_action()
-        logs = command_workers(turn, plan, config=cfg)
-        if any(":recall_soft:beacon" in line for line in logs):
-            saw_recall = True
+        last_logs = command_workers(turn, plan, config=cfg)
+        # 非 dedicated 不得出现 recall_soft:beacon
+        assert not any(
+            str(wb.id) in line and ":recall_soft:beacon" in line for line in last_logs
+        ), last_logs
+        wb_lines = [line for line in last_logs if f"worker:{wb.id}:" in line]
+        if any(":recall_soft" in line for line in wb_lines):
+            saw_soft = True
             break
-    assert saw_recall, f"expected recall_soft:beacon, logs={logs}"
+    assert saw_soft, f"expected non-dedicated soft recall (ring expand), logs={last_logs}"
     st = _spiral_state[str(wb.id)]
+    assert st.dedicated is False
+    assert st.phase == "local", f"non-dedicated must stay local, got phase={st.phase}"
+
+
+def test_beacon_soft_recall_dedicated_can_switch(config: TacticConfig) -> None:
+    """dedicated Worker：Beacon 存在时保持/进入 beacon；软回撤路径允许 recall_soft:beacon。
+
+    通过预置 dedicated + local + 高 stall，验证 soft-recall 条件 `st.dedicated`
+    仍可切入 beacon（force-beacon 也会保证 phase=beacon）。
+    """
+    from bot.config import set_beacon_position
+    from bot.economy import SpiralState, _last_move_dir, _spiral_state
+    from tests.stubs import StubBeacon
+
+    cfg = _beacon_cfg(recall_stall_ticks=2)
+    set_beacon_position(cfg, (50, 10))
+    _spiral_state.clear()
+    _last_move_dir.clear()
+    # 单 worker → widx==0 dedicated
+    worker = StubUnit(position=(20, 10), cargo=0, unit_type="WORKER")
+    # 预置：dedicated 但 phase=local + 即将软回撤；下一 tick force-beacon / soft-recall 应进 beacon
+    _spiral_state[str(worker.id)] = SpiralState(
+        ring=5,
+        sector_id=0,
+        index=0,
+        target=(25, 10),
+        stalled_ticks=cfg.recall_stall_ticks,
+        dedicated=True,
+        phase="local",
+    )
+    turn = StubTurn(
+        tick=1,
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[worker],
+        resource_cells=set(),
+        obstacle_cells={(19, 10), (20, 9), (20, 11), (21, 10)},
+        visible_enemies=[],
+        beacon=StubBeacon(position=(50, 10), status="GROUND", carrier_id=None),
+    )
+    plan = assign_roles(turn, config=cfg)
+    logs = command_workers(turn, plan, config=cfg)
+    st = _spiral_state[str(worker.id)]
+    assert st.dedicated is True
     assert st.phase == "beacon"
+    # dedicated 在 beacon 路径；若走 soft-recall 切入则带 recall_soft:beacon
+    assert any(":phase=beacon" in line for line in logs) or any(
+        ":recall_soft:beacon" in line for line in logs
+    ), logs
+
+
+def test_soft_recall_non_dedicated_stays_local(config: TacticConfig) -> None:
+    """Beacon 存在时非 dedicated stall 软回撤：phase 保持 local，ring 外扩（不追 beacon）。"""
+    from bot.config import set_beacon_position
+    from bot.economy import _last_move_dir, _spiral_state
+    from tests.stubs import StubBeacon
+
+    cfg = _beacon_cfg(recall_stall_ticks=2, spiral_base_ring=3)
+    set_beacon_position(cfg, (80, 10))  # 远点 beacon，全员追会饿死经济
+    _spiral_state.clear()
+    _last_move_dir.clear()
+    wa = StubUnit(position=(10, 10), cargo=0, unit_type="WORKER")  # dedicated
+    wb = StubUnit(position=(20, 10), cargo=0, unit_type="WORKER")  # non-dedicated
+    turn = StubTurn(
+        tick=1,
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[wa, wb],
+        resource_cells=set(),
+        obstacle_cells={(19, 10), (20, 9), (20, 11), (21, 10)},
+        visible_enemies=[],
+        beacon=StubBeacon(position=(80, 10), status="GROUND", carrier_id=None),
+    )
+    plan = assign_roles(turn, config=cfg)
+    # 先跑 1 tick 建立 dedicated 指派
+    command_workers(turn, plan, config=cfg)
+    st_b = _spiral_state[str(wb.id)]
+    assert st_b.dedicated is False
+    ring_before = st_b.ring
+    saw_soft = False
+    last_logs: list[str] = []
+    for _ in range(cfg.recall_stall_ticks + 8):
+        wa.clear_action()
+        wb.clear_action()
+        last_logs = command_workers(turn, plan, config=cfg)
+        st_b = _spiral_state[str(wb.id)]
+        assert st_b.phase == "local"
+        assert st_b.dedicated is False
+        assert not any(
+            f"worker:{wb.id}:" in line and ":recall_soft:beacon" in line
+            for line in last_logs
+        ), last_logs
+        wb_lines = [line for line in last_logs if f"worker:{wb.id}:" in line]
+        if any(":recall_soft" in line for line in wb_lines):
+            saw_soft = True
+            break
+    assert saw_soft, f"expected soft recall expand for non-dedicated, logs={last_logs}"
+    st_b = _spiral_state[str(wb.id)]
+    assert st_b.phase == "local"
+    assert st_b.ring >= ring_before  # 外扩或保持，绝不因 beacon soft-recall 丢 phase
 
 
 def test_is_chunk_skippable_rule(config: TacticConfig) -> None:

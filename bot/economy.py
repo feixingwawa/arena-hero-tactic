@@ -782,10 +782,11 @@ def _explore_spiral_step(
     - **local**：删除 recall_dist 硬边界与「绝不朝 Core 收缩」守卫——目标点
       导航沿环切向移动允许曼哈顿距离暂时持平/微降；到达目标 → index+1；
       本环扫完 → ring+1；ring 超 spiral_max_ring → 回 base ring。
-      连续 recall_stall_ticks 无进展 → 软回撤：**若 Beacon 存在则切 beacon**
-      （P0-1/P1-2，日志 `:recall_soft:beacon`）；否则**向外扩一层（ring+1）
-      并把 index 跳到环对面（+len(pts)//2）**——探索只向外扩散，绝不因
-      stall 收缩回 Core（bugfix：软回撤不再 ring-1）。
+      连续 recall_stall_ticks 无进展 → 软回撤：**仅 dedicated 且 Beacon 存在
+      时切 beacon**（日志 `:recall_soft:beacon`）；非 dedicated / 无 Beacon
+      则**向外扩一层（ring+1）并把 index 跳到环对面（+len(pts)//2）**——
+      探索只向外扩散，绝不因 stall 收缩回 Core；非 dedicated 不追远点 Beacon
+      （bugfix：避免全员 soft-recall 追 beacon 饿死经济）。
     - **beacon**：每 tick 朝 Beacon 生成推进目标（决策 3），stall 换 offset
       绕障（决策 6）；Beacon 消失 → 回 local；非 dedicated 到达近旁 → 回 local。
     - **dedicated**（P1-1）：`widx==0` 且 Beacon 存在 → 专职 Beacon，恒为 beacon。
@@ -827,6 +828,11 @@ def _explore_spiral_step(
     # dedicated 强制 beacon（Beacon 存在时）
     if st.dedicated and config.beacon_position is not None:
         st.phase = "beacon"
+    # 非 dedicated 残留 beacon 相位清理：只允许 dedicated 追 Beacon
+    if not st.dedicated and st.phase == "beacon":
+        st.phase = "local"
+        st.target = None
+        st.stalled_ticks = 0
 
     # beacon 阶段且 Beacon 消失 / 被拾取 → 回 local（P2-1）
     if st.phase == "beacon" and config.beacon_position is None:
@@ -935,8 +941,8 @@ def _explore_spiral_step(
     if st.stalled_ticks >= config.recall_stall_ticks:
         st.stalled_ticks = 0
         soft_recall = True
-        if config.beacon_position is not None:
-            # P0-1 / P1-2：软回撤优先切向 Beacon（而非 ring-1 向 Core 收缩）
+        # 仅 dedicated 软回撤切 beacon；非 dedicated 走 ring+1 外扩，避免全员追远点 Beacon
+        if config.beacon_position is not None and st.dedicated:
             st.phase = "beacon"
             logs.extend(
                 _beacon_explore_step(
@@ -956,7 +962,7 @@ def _explore_spiral_step(
                 )
             )
             return logs
-        # 无 Beacon：软回撤 **向外扩** —— 绝不因 stall 收缩回 Core。
+        # 非 dedicated / 无 Beacon：软回撤 **向外扩** —— 绝不因 stall 收缩回 Core。
         # 1) ring+1（向外扩一层；达到上限后保持 max ring，不收缩）
         # 2) index 跳到环对面（+len(pts)//2），避免反复卡同一障碍
         st.ring += 1
