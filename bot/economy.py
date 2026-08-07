@@ -476,11 +476,16 @@ def command_workers(
         if target is not None:
             claimed.add(target)
             if pos == target:
-                if hasattr(w, "harvest"):
+                if pos in set(resources_cells) and hasattr(w, "harvest"):
                     w.harvest()
                     logs.append(f"worker:{uid}:harvest")
                     if memory is not None:
                         memory.mark_harvested(pos, tick)
+                else:
+                    # 目标格无实际资源（记忆脏数据），回退到探索
+                    if hasattr(w, "wait"):
+                        w.wait()
+                    logs.append(f"worker:{uid}:wait:bad_target")
             else:
                 wkey = _worker_key(uid)
                 direction, _ = clamp_step_toward_memo(
