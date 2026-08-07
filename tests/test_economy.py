@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 from bot.config import TacticConfig
 from bot.economy import can_afford, choose_spawn, command_workers
 from bot.memory import MemoryMap
@@ -520,6 +522,158 @@ def test_explore_soft_retreat_after_stall(config: TacticConfig) -> None:
             saw_soft_recall = True
             break
     assert saw_soft_recall, f"expected soft recall after stall, logs={logs}"
+
+
+def test_soft_recall_expands_ring_not_contracts(config: TacticConfig) -> None:
+    """软回撤不再向 Core 收缩：stall 触发软回撤后 ring 保持或 +1（绝不 -1）。
+
+    回归：线上 monitor-100core 段 Worker 的 ring 卡在 3/4（软回撤 ring-1
+    收缩 + 目标不可达导致 ring 永远无法递增到 5+）。修复后软回撤 ring+1。
+    """
+    from bot.economy import _last_move_dir, _spiral_state
+
+    _spiral_state.clear()
+    _last_move_dir.clear()
+    core_pos = (10, 10)
+    # worker 四向被围死 → 目标不可达 → 持续 stall → 软回撤
+    worker = StubUnit(position=(20, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        resources=5,
+        core=StubCore(position=core_pos),
+        workers=[worker],
+        resource_cells=set(),
+        obstacle_cells={(19, 10), (20, 9), (20, 11), (21, 10)},
+        visible_enemies=[],
+    )
+    plan = assign_roles(turn, config=config)
+    ring_before: Optional[int] = None
+    ring_after: Optional[int] = None
+    saw_soft_recall = False
+    for _ in range(config.recall_stall_ticks + 5):
+        worker.clear_action()
+        logs = command_workers(turn, plan, config=config)
+        st = _spiral_state[str(worker.id)]
+        if not saw_soft_recall:
+            ring_before = st.ring
+        if any(":recall_soft" in line for line in logs):
+            saw_soft_recall = True
+            ring_after = st.ring
+            break
+    assert saw_soft_recall, f"expected soft recall after stall, logs={logs}"
+    assert ring_before is not None and ring_after is not None
+    # 核心断言：软回撤后 ring 不减少（保持或 +1），绝不向 Core 收缩
+    assert ring_after >= ring_before, (
+        f"soft recall contracted ring toward core: {ring_before} -> {ring_after}"
+    )
+    # 且至少达到 base ring（绝不收缩到 base 以下）
+    assert ring_after >= config.spiral_base_ring
+
+
+def test_worker_escapes_base_ring_when_blocked(config: TacticConfig) -> None:
+    """目标被障碍挡住时 Worker 通过软回撤外扩：20 tick 后 ring >= base+1。
+
+    回归：修复前被围死的 Worker ring 永远 = base（软回撤 ring-1 收缩 +
+    到达不了目标无法 ring+1）；修复后软回撤向外扩 ring+1。
+    """
+    from bot.economy import _last_move_dir, _spiral_state
+
+    _spiral_state.clear()
+    _last_move_dir.clear()
+    core_pos = (10, 10)
+    worker = StubUnit(position=(13, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        resources=5,
+        core=StubCore(position=core_pos),
+        workers=[worker],
+        resource_cells=set(),
+        obstacle_cells={(12, 10), (14, 10), (13, 9), (13, 11)},  # 四向围死
+        visible_enemies=[],
+    )
+    plan = assign_roles(turn, config=config)
+    max_ring = 0
+    for _ in range(20):
+        worker.clear_action()
+        command_workers(turn, plan, config=config)
+        st = _spiral_state[str(worker.id)]
+        max_ring = max(max_ring, st.ring)
+    assert max_ring >= config.spiral_base_ring + 1, (
+        f"blocked worker stuck at base ring: max_ring={max_ring}"
+    )
+
+
+def test_worker_escapes_wall_oscillation() -> None:
+    """贴墙 A↔B 振荡修复：目标被墙挡在另一侧时 stall 能累积 → 软回撤外扩。
+
+    旧逻辑：worker 沿墙面 UP↔DOWN 横跳，manhattan 距离交替增减，stall
+    永远到不了阈值 → 卡死在同一环（ring 5 卡 150+ tick 的回归场景）。
+    修复后紧接反向对抖（A↔B）也计 stall，软回撤 ring+1 + index 跳到环对面。
+    """
+    from bot.economy import _last_move_dir, _spiral_state
+
+    cfg = TacticConfig(
+        max_population=18,
+        target_workers=4,
+        target_vanguards=2,
+        target_rangers=1,
+        defense_radius=3,
+        ranger_radius=4,
+        threat_radius=8,
+        retreat_adjacent=1,
+        retreat_radius=3,
+        reserve_resources=2,
+        recall_stall_ticks=2,
+        spiral_base_ring=3,
+        spiral_max_ring=32,
+        sector_count=2,
+    )
+    _spiral_state.clear()
+    _last_move_dir.clear()
+    core_pos = (10, 10)
+    # 竖直墙 x=14（y=5..15）：把东侧目标点（如 (15,9)）挡在墙后
+    obstacles = {(14, y) for y in range(5, 16)}
+    worker = StubUnit(position=(13, 8), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        resources=5,
+        core=StubCore(position=core_pos),
+        workers=[worker],
+        resource_cells=set(),
+        obstacle_cells=obstacles,
+        visible_enemies=[],
+    )
+    plan = assign_roles(turn, config=cfg)
+    max_ring = 0
+    positions: set[tuple[int, int]] = set()
+    pos = worker.position
+    for _ in range(30):
+        positions.add(pos)
+        worker.clear_action()
+        command_workers(turn, plan, config=cfg)
+        st = _spiral_state[str(worker.id)]
+        max_ring = max(max_ring, st.ring)
+        if worker.action == "move":
+            dx, dy = _DIR_DELTA[str(worker.action_args)]
+            pos = (pos[0] + dx, pos[1] + dy)
+            worker.position = pos
+    # 不应贴墙横跳卡死：访问位置足够多、ring 至少推进 1 层
+    assert len(positions) >= 8, (
+        f"wall oscillation: only {len(positions)} unique positions"
+    )
+    assert max_ring >= cfg.spiral_base_ring + 1, (
+        f"wall worker stuck at ring {max_ring}"
+    )
+
+
+def test_next_spiral_target_skips_obstacle_cells(config: TacticConfig) -> None:
+    """目标点绝不落在障碍上：_next_spiral_target 跳过 obstacle 候选。"""
+    from bot.economy import SpiralState, _next_spiral_target
+
+    core_pos = (10, 10)
+    # ring-3 sector-0 首个候选是 (8,9)；把它设为障碍 → 应跳到下一个
+    obstacles = {(8, 9)}
+    st = SpiralState(ring=3, sector_id=0, index=0)
+    target = _next_spiral_target(core_pos, st, 2, config, None, obstacles)
+    assert target not in obstacles, f"target landed on obstacle: {target}"
+    assert st.index != 0, "index should advance when skipping obstacle"
 
 
 def test_explore_absolute_safety_net(config: TacticConfig) -> None:

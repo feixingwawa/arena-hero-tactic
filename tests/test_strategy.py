@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from bot.config import TacticConfig, DEFAULT_CONFIG
 from bot.pathing import clamp_step_toward, defense_ring_slots, nearest
 from bot.roles import Role, assign_roles, count_by_type, total_population
@@ -246,6 +248,73 @@ def test_decide_clears_beacon_when_absent(config: TacticConfig) -> None:
     result = decide(turn, config=config)
     assert config.beacon_position is None
     assert any("strategy:beacon:absent" in line for line in result.logs)
+
+
+def test_beacon_status_parsing(config: TacticConfig) -> None:
+    """SDK 0.2.9 BeaconStatus 解析：GROUND/None → 写位置；CARRIED → 清。
+
+    真实 SDK 的 `ChampionBeacon.status` 是 `BeaconStatus`(StrEnum) | None
+    （`BeaconStatus.GROUND.value == "GROUND"`、`CARRIED` 必有 carrier_id、
+    `status=None` 表示位置公开且未被拾取）。stub 用字符串、真实 SDK 用枚举，
+    两者都必须正确写/清 `config.beacon_position`。
+    """
+    from bot.config import set_beacon_position
+    from tests.stubs import StubBeacon
+
+    try:
+        from arena_hero import BeaconStatus  # type: ignore
+    except Exception:
+        BeaconStatus = None  # type: ignore[assignment]
+
+    ground_values: list[Any] = ["GROUND"]
+    if BeaconStatus is not None:
+        ground_values.append(BeaconStatus.GROUND)
+    carried_values: list[Any] = ["CARRIED"]
+    if BeaconStatus is not None:
+        carried_values.append(BeaconStatus.CARRIED)
+
+    worker = StubUnit(position=(11, 10), cargo=0, unit_type="WORKER")
+    core = StubCore(position=(10, 10), hp=5, shield=5)
+
+    # GROUND 与 status=None → 写位置（status=None：位置公开、非 CARRIED）
+    for status_val in ground_values + [None]:
+        set_beacon_position(config, None)
+        turn = StubTurn(
+            tick=1,
+            resources=5,
+            core=core,
+            workers=[worker],
+            resource_cells={(14, 10)},
+            beacon=StubBeacon(
+                position=(50, 10), status=status_val, carrier_id=None
+            ),
+        )
+        result = decide(turn, config=config)
+        assert config.beacon_position == (50, 10), (
+            f"status={status_val!r} should write beacon position"
+        )
+        assert any(
+            "strategy:beacon:pos=(50, 10)" in line for line in result.logs
+        ), f"status={status_val!r} logs={result.logs}"
+
+    # CARRIED（字符串或真实枚举）→ 清 None
+    for status_val in carried_values:
+        set_beacon_position(config, (50, 10))
+        turn = StubTurn(
+            tick=1,
+            resources=5,
+            core=core,
+            workers=[worker],
+            resource_cells={(14, 10)},
+            beacon=StubBeacon(
+                position=(50, 10), status=status_val, carrier_id=worker.id
+            ),
+        )
+        result = decide(turn, config=config)
+        assert config.beacon_position is None, (
+            f"status={status_val!r} should clear beacon position"
+        )
+        assert any("strategy:beacon:cleared" in line for line in result.logs)
 
 
 def test_decide_beacon_multi_tick_sync(config: TacticConfig) -> None:
