@@ -635,7 +635,7 @@ def main() -> int:
         and chunk_ring(chunk_of((74, 10)), chunk_of((10, 10))) == 2,
     )
 
-    from bot.memory import MemoryMap, DEPLETED, REVISIT_DUE
+    from bot.memory import MemoryMap, VISIBLE
 
     _mem = MemoryMap(refresh_interval_ticks=4)
     _m1 = StubTurn(tick=1, core=StubCore(position=(10, 10)), resource_cells={(14, 10)})
@@ -644,10 +644,12 @@ def main() -> int:
     _mem.observe(_m2, 2)
     _m3 = StubTurn(tick=6, core=StubCore(position=(10, 10)), resource_cells=set())
     _mem.observe(_m3, 6)
+    _m4 = StubTurn(tick=7, core=StubCore(position=(10, 10)), resource_cells={(14, 10)})
+    _mem.observe(_m4, 7)
     check(
         "memory_state_machine",
-        _mem.resource_points[(14, 10)].state == REVISIT_DUE
-        and (14, 10) in _mem.revisit_candidates((10, 10), 6, (10, 10), 40),
+        _mem.resource_points[(14, 10)].state == VISIBLE
+        and (14, 10) in _mem.revisit_candidates((10, 10), 7, (10, 10), 40),
     )
 
     from tests.stubs import StubBeacon, StubEvent

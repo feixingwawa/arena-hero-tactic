@@ -6,6 +6,9 @@
 - SDK 每 tick 的 `resource_cells` 只含**当前可见** RESOURCE 格；某格从可见集合
   消失且记忆为 VISIBLE → 判定已消耗（depleted_tick = tick）。
 - 回补节拍：`refresh_interval_ticks`（默认 4，近似「每 4 resolved tick」）。
+- **REVISIT_DUE 仅是「该 chunk 可能已刷新」的信息提示，不是可采集目标**：
+  官方规则回补可能发生在**新位置**（确定性随机选槽），旧格位置在重新可见之前
+  不能作为 harvest 目标。`revisit_candidates` 只返回 VISIBLE（当前确认存在）点。
 - 障碍永久累积（地形）；掉落 cargo 来自 `WORKER_CARGO_DROPPED` 事件。
 - 模块级 `WORLD_MEMORY` 单例供线上 `decide()` 默认使用；测试注入新实例。
 
@@ -212,7 +215,11 @@ class MemoryMap:
     # ---- Read ----
 
     def refresh_due(self, pos: Position, tick: int) -> bool:
-        """资源点是否可回访：VISIBLE（当前可见）或 REVISIT_DUE（刷新到期）。"""
+        """该资源点是否「值得回访检查」：VISIBLE（当前可见）或 REVISIT_DUE（刷新到期）。
+
+        注意：返回 True 不代表可采集——REVISIT_DUE 只是「chunk 可能已刷新」的提示，
+        旧格位置在重新可见前不可 harvest；采集目标以 `revisit_candidates`（仅 VISIBLE）为准。
+        """
         rp = self.resource_points.get(_as_position(pos))
         if rp is None:
             return False
@@ -228,7 +235,11 @@ class MemoryMap:
         max_dist: Optional[int] = None,
         sector_id: Optional[int] = None,
     ) -> list[Position]:
-        """返回可回访的资源点候选（VISIBLE ∪ REVISIT_DUE）。
+        """返回**可采集**的资源点候选（仅 VISIBLE = 当前确认存在的资源格）。
+
+        REVISIT_DUE（DEPLETED 到期）点**不返回**：官方规则下资源回补可能落在
+        新位置，旧格位置在重新可见之前不能当 harvest 目标；发现刷新资源靠螺旋
+        扫掠重新进入视野后由 `observe` 恢复 VISIBLE。
 
         Args:
             core: Core 位置（扇区/环基准）。
@@ -243,9 +254,7 @@ class MemoryMap:
         limit = self.revisit_max_distance if max_dist is None else int(max_dist)
         result: list[Position] = []
         for pos, rp in self.resource_points.items():
-            if rp.state == DEPLETED:
-                continue
-            if not self.refresh_due(pos, tick):
+            if rp.state != VISIBLE:
                 continue
             if manhattan(worker_pos, pos) > limit:
                 continue

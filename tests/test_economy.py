@@ -572,8 +572,8 @@ def test_worker_harvest_marks_memory(config: TacticConfig) -> None:
 
 
 def test_worker_goes_to_revisit_candidate_from_memory(config: TacticConfig) -> None:
-    """无可见资源时，记忆 REVISIT_DUE 候选优先于螺旋探索。"""
-    from bot.memory import DEPLETED, REVISIT_DUE
+    """无可见资源时，记忆候选（重新可见点）优先于螺旋探索。"""
+    from bot.memory import VISIBLE
 
     mem = MemoryMap(refresh_interval_ticks=4)
     core_pos = (10, 10)
@@ -583,18 +583,20 @@ def test_worker_goes_to_revisit_candidate_from_memory(config: TacticConfig) -> N
     mem.observe(t1, 1)
     t2 = StubTurn(tick=2, core=StubCore(position=core_pos), resource_cells=set())
     mem.observe(t2, 2)
-    assert mem.resource_points[rp].state == DEPLETED
     t6 = StubTurn(tick=6, core=StubCore(position=core_pos), resource_cells=set())
     mem.observe(t6, 6)
-    assert mem.resource_points[rp].state == REVISIT_DUE
+    # tick7 重新可见 → VISIBLE（应被返回为采集候选）
+    t7 = StubTurn(tick=7, core=StubCore(position=core_pos), resource_cells={rp})
+    mem.observe(t7, 7)
+    assert mem.resource_points[rp].state == VISIBLE
 
     worker = StubUnit(position=(11, 10), cargo=0, unit_type="WORKER")
     turn = StubTurn(
-        tick=6,
+        tick=7,
         resources=5,
         core=StubCore(position=core_pos),
         workers=[worker],
-        resource_cells=set(),
+        resource_cells=set(),  # 当前 tick 不暴露资源（仅记忆中有 VISIBLE）
         visible_enemies=[],
     )
     plan = assign_roles(turn, config=config)
@@ -605,8 +607,8 @@ def test_worker_goes_to_revisit_candidate_from_memory(config: TacticConfig) -> N
 
 
 def test_worker_revisit_sector_preference(config: TacticConfig) -> None:
-    """多 Worker 分工：回访候选按各自扇区优先，不扎堆同一资源点。"""
-    from bot.memory import REVISIT_DUE
+    """多 Worker 分工：回访候选按各自扇区优先，不扎堆同一资源点（VISIBLE 点）。"""
+    from bot.memory import VISIBLE
 
     mem = MemoryMap(refresh_interval_ticks=4, sector_count=4)
     core_pos = (10, 10)
@@ -620,12 +622,16 @@ def test_worker_revisit_sector_preference(config: TacticConfig) -> None:
         mem.observe(t2, 2)
         t6 = StubTurn(tick=6, core=StubCore(position=core_pos), resource_cells=set())
         mem.observe(t6, 6)
-        assert mem.resource_points[p].state == REVISIT_DUE
+    # tick7 重新可见 → VISIBLE
+    t7 = StubTurn(tick=7, core=StubCore(position=core_pos), resource_cells={s0_point, s1_point})
+    mem.observe(t7, 7)
+    assert mem.resource_points[s0_point].state == VISIBLE
+    assert mem.resource_points[s1_point].state == VISIBLE
 
     wa = StubUnit(position=(11, 10), cargo=0, unit_type="WORKER")  # 下标 0 → sector 0
     wb = StubUnit(position=(11, 10), cargo=0, unit_type="WORKER")  # 下标 1 → sector 1
     turn = StubTurn(
-        tick=6,
+        tick=7,
         resources=5,
         core=StubCore(position=core_pos),
         workers=[wa, wb],
@@ -637,8 +643,8 @@ def test_worker_revisit_sector_preference(config: TacticConfig) -> None:
     assert plan.get(wb.id).sector_id == 1
 
     # 扇区过滤：各自只看到本扇区候选（防扎堆的机制来源）
-    assert mem.revisit_candidates(core_pos, 6, (11, 10), 40, sector_id=0) == [s0_point]
-    assert mem.revisit_candidates(core_pos, 6, (11, 10), 40, sector_id=1) == [s1_point]
+    assert mem.revisit_candidates(core_pos, 7, (11, 10), 40, sector_id=0) == [s0_point]
+    assert mem.revisit_candidates(core_pos, 7, (11, 10), 40, sector_id=1) == [s1_point]
 
     logs = command_workers(turn, plan, config=config, memory=mem)
     to_res = [line for line in logs if ":to_resource:" in line]
@@ -667,8 +673,8 @@ def test_beacon_pickup_ground(config: TacticConfig) -> None:
 
 
 def test_beacon_carrier_prefers_harvest_over_explore(config: TacticConfig) -> None:
-    """Beacon 持有者（1 点 → 2 资源）：跳过扇区限制优先采集记忆回访点。"""
-    from bot.memory import REVISIT_DUE
+    """Beacon 持有者（1 点 → 2 资源）：跳过扇区限制优先采集记忆回访点（VISIBLE 点）。"""
+    from bot.memory import VISIBLE
     from tests.stubs import StubBeacon
 
     mem = MemoryMap(refresh_interval_ticks=4, sector_count=4)
@@ -681,11 +687,14 @@ def test_beacon_carrier_prefers_harvest_over_explore(config: TacticConfig) -> No
     mem.observe(t2, 2)
     t6 = StubTurn(tick=6, core=StubCore(position=core_pos), resource_cells=set())
     mem.observe(t6, 6)
-    assert mem.resource_points[s1_point].state == REVISIT_DUE
+    # tick7 重新可见 → VISIBLE
+    t7 = StubTurn(tick=7, core=StubCore(position=core_pos), resource_cells={s1_point})
+    mem.observe(t7, 7)
+    assert mem.resource_points[s1_point].state == VISIBLE
 
     worker = StubUnit(position=(11, 10), cargo=0, unit_type="WORKER")  # sector 0
     turn = StubTurn(
-        tick=6,
+        tick=7,
         resources=5,
         core=StubCore(position=core_pos),
         workers=[worker],

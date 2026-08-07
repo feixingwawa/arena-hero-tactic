@@ -47,14 +47,15 @@ def test_resource_state_machine_visible_depleted_revisit() -> None:
     assert mem.resource_points[rp_pos].state == DEPLETED
     assert mem.refresh_due(rp_pos, 5) is False
 
-    # tick 6: 到期 → REVISIT_DUE，可作为回访候选
+    # tick 6: 到期 → REVISIT_DUE，「刷新提示」语义
     mem.observe(_turn(6, set(), core=core), 6)
     rp = mem.resource_points[rp_pos]
     assert rp.state == REVISIT_DUE
     assert rp.is_revisit_due(6) is True
     assert mem.refresh_due(rp_pos, 6) is True
+    # REVISIT_DUE 点不被 revisit_candidates 返回（不可作为采集目标）
     cands = mem.revisit_candidates(core, 6, (10, 10), max_dist=40)
-    assert rp_pos in cands
+    assert rp_pos not in cands, "REVISIT_DUE point should not be returned as harvest target"
 
     # tick 7: 再次可见 → VISIBLE
     mem.observe(_turn(7, {rp_pos}, core=core), 7)
@@ -87,29 +88,37 @@ def test_obstacles_accumulate_permanently() -> None:
 
 
 def test_revisit_candidates_max_dist_and_sector_filter() -> None:
-    """回访候选：距离截断 + 扇区过滤。"""
+    """回访候选：仅 VISIBLE 点被返回；距离截断 + 扇区过滤。"""
     mem = MemoryMap(refresh_interval_ticks=4, sector_count=4)
     core = (10, 10)
     far = (60, 10)  # 距 worker (10,10) = 50 > 40
     near_sector0 = (6, 9)  # ring 5 扇区 0（与 pathing.sector_points 一致）
     near_sector1 = (7, 8)  # ring 5 扇区 1
+    # 先 visible → 消耗 → REVISIT_DUE 到期
     mem.observe(_turn(1, {far, near_sector0, near_sector1}, core=core), 1)
     mem.observe(_turn(2, set(), core=core), 2)  # 全部消失 → DEPLETED
     mem.observe(_turn(6, set(), core=core), 6)  # 到期 → REVISIT_DUE
 
+    # REVISIT_DUE 点不被返回（非 VISIBLE）
     all_c = mem.revisit_candidates(core, 6, (10, 10), max_dist=40)
+    assert near_sector0 not in all_c
+    assert near_sector1 not in all_c
+    assert far not in all_c
+
+    # VISIBLE 点应被返回
+    mem.observe(_turn(7, {near_sector0, near_sector1}, core=core), 7)  # 恢复 VISIBLE
+    all_c = mem.revisit_candidates(core, 7, (10, 10), max_dist=40)
     assert near_sector0 in all_c
     assert near_sector1 in all_c
-    assert far not in all_c  # 距离截断
 
-    s0 = mem.revisit_candidates(core, 6, (10, 10), max_dist=40, sector_id=0)
-    s1 = mem.revisit_candidates(core, 6, (10, 10), max_dist=40, sector_id=1)
+    s0 = mem.revisit_candidates(core, 7, (10, 10), max_dist=40, sector_id=0)
+    s1 = mem.revisit_candidates(core, 7, (10, 10), max_dist=40, sector_id=1)
     assert near_sector0 in s0 and near_sector0 not in s1
     assert near_sector1 in s1 and near_sector1 not in s0
 
 
 def test_revisit_candidates_sorted_by_distance() -> None:
-    """回访候选按距离排序（确定性）。"""
+    """回访候选按距离排序（仅 VISIBLE 点）。"""
     mem = MemoryMap(refresh_interval_ticks=4)
     core = (10, 10)
     a = (20, 10)  # dist 10
@@ -117,7 +126,12 @@ def test_revisit_candidates_sorted_by_distance() -> None:
     mem.observe(_turn(1, {a, b}, core=core), 1)
     mem.observe(_turn(2, set(), core=core), 2)
     mem.observe(_turn(6, set(), core=core), 6)
+    # tick 6 时都是 REVISIT_DUE（不返回）
     cands = mem.revisit_candidates(core, 6, (10, 10), max_dist=40)
+    assert cands == []
+    # tick 7 重新可见后返回 VISIBLE 点，按距离排序
+    mem.observe(_turn(7, {a, b}, core=core), 7)
+    cands = mem.revisit_candidates(core, 7, (10, 10), max_dist=40)
     assert cands == [b, a], f"expected sorted by distance: {cands}"
 
 

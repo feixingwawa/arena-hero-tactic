@@ -113,6 +113,11 @@ class SpiralState:
 _last_move_dir: dict[str, str] = {}
 # 螺旋扫掠探索状态（按 worker id 字符串键）
 _spiral_state: dict[str, SpiralState] = {}
+# 跨 tick 资源目标去重：{pos: (claim_tick, worker_key)}。同一目标被其他 Worker
+# 在 claim_ttl_ticks 内占用时，本 Worker 不再选择（防多 Worker 汇聚同点导致
+# same-point tie 多数失败）。自己的 claim 不排除（保持对目标的持续推进）。
+_claimed_targets: dict[Position, tuple[int, str]] = {}
+_CLAIM_TTL_TICKS: int = 8
 
 
 def _worker_key(uid: Any) -> str:
