@@ -194,8 +194,8 @@ def test_default_config_new_defaults() -> None:
     assert total <= cfg.max_population
     assert cfg.max_population == 30
     assert cfg.target_workers == 14
-    assert cfg.sector_count == 4
-    assert cfg.spiral_base_ring == 5
+    assert cfg.sector_count == 2
+    assert cfg.spiral_base_ring == 3
     assert cfg.spiral_max_ring == 32
     assert cfg.recall_stall_ticks == 6
     assert cfg.refresh_interval_ticks == 4

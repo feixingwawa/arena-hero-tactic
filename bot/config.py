@@ -67,8 +67,8 @@ class TacticConfig:
     early_game_pop: int = 4
 
     # ---- 螺旋扫掠 + 地图记忆（v0.14 优化新增）----
-    sector_count: int = 4
-    spiral_base_ring: int = 5
+    sector_count: int = 2  # 仅 2 个 Worker 时分 2 扇区，每个 Worker 覆盖更广
+    spiral_base_ring: int = 3  # 近 Core 优先扫掠
     spiral_max_ring: int = 32
     recall_stall_ticks: int = 6
     refresh_interval_ticks: int = 4
