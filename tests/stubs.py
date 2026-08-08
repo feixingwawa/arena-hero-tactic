@@ -73,6 +73,7 @@ class StubCore:
     position: Position = (10, 10)
     hp: int = 5
     shield: int = 5
+    resources: int = 0
     action: Optional[str] = None
     action_args: Any = None
 
@@ -166,10 +167,15 @@ class StubTurn:
     def __post_init__(self) -> None:
         if self.core is None:
             self.core = StubCore()
+        # 同步 core.resources 与 turn.resources（Task 3 choose_spawn 使用 turn.core.resources）
+        if self.core.resources == 0 and self.resources != 0:
+            self.core.resources = self.resources
+        elif self.core.resources != 0 and self.resources == 5:  # default value
+            self.resources = self.core.resources
         if self.state is None:
             pop = len(self.workers) + len(self.vanguards) + len(self.rangers)
             self.state = StubState(
-                resources=self.resources,
+                resources=max(self.resources, self.core.resources),
                 population=pop,
             )
 

@@ -15,11 +15,15 @@ from bot.rules import unit_cost_for
 from bot.pathing import (
     CARDINAL_DELTAS,
     NAME_TO_DELTA,
+    LoopTracker,
     Position,
     add_pos,
+    beacon_oriented_spiral_target,
     beacon_progress_target,
     chunk_of,
     clamp_step_toward_memo,
+    estimate_path_steps,
+    guided_step_toward,
     manhattan,
     nearest,
     outward_step,
@@ -117,10 +121,36 @@ class SpiralState:
     dedicated: bool = False
 
 
+@dataclass
+class WorkerIntent:
+    """Dashboard / 调试用：本 tick Worker 意图（目标点 + 阶段）。
+
+    与 SpiralState 解耦：探索走 spiral，harvest/deposit/retreat 等走 intent。
+    get_worker_states() 合并两者供 main → build_snapshot 导出。
+    """
+
+    target: Optional[Position] = None
+    ring: Optional[int] = None
+    sector: Optional[int] = None
+    phase: Optional[str] = None  # harvest|deposit|retreat|to_resource|to_cargo|explore|local|beacon|...
+    role: Optional[str] = None
+    dedicated: Optional[bool] = None
+
+
 # 非探索移动（return_deposit / to_resource / retreat / recall）的方向记忆，防 A↔B 对抖
 _last_move_dir: dict[str, str] = {}
 # 螺旋扫掠探索状态（按 worker id 字符串键）
 _spiral_state: dict[str, SpiralState] = {}
+# 本 tick 显式意图（command_workers 开头清空，分支写入）
+_worker_intents: dict[str, WorkerIntent] = {}
+# 范围循环检测：return_deposit / to_resource / retreat 足迹（小范围重复 → 强制重寻路）
+_loop_trackers: dict[str, LoopTracker] = {}
+# return 路径资源目标 claim TTL（tick）
+_PENDING_RETURN_CLAIM_TTL: int = 16
+# return 路径资源目标占用：{worker_key: (mine_pos, claim_tick)}
+_pending_return_mines: dict[str, tuple[tuple[int, int], int]] = {}
+# 经济健康追踪：上次交付 tick 与停滞计数
+health_tracker: dict = {"last_deposit_tick": 0, "stall_ticks": 0}
 # 跨 tick 资源目标去重：{pos: (claim_tick, worker_key)}。同一目标被其他 Worker
 # 在 claim_ttl_ticks 内占用时，本 Worker 不再选择（防多 Worker 汇聚同点导致
 # same-point tie 多数失败）。自己的 claim 不排除（保持对目标的持续推进）。
@@ -128,8 +158,115 @@ _claimed_targets: dict[Position, tuple[int, str]] = {}
 _CLAIM_TTL_TICKS: int = 8
 
 
+def _get_loop_tracker(wkey: str) -> LoopTracker:
+    st = _loop_trackers.get(wkey)
+    if st is None:
+        st = LoopTracker()
+        _loop_trackers[wkey] = st
+    return st
+
+
+def _guided_move(
+    pos: Position,
+    target: Position,
+    obstacles: set[Position],
+    wkey: str,
+    config: TacticConfig,
+    tick: int = 0,
+    memory: Optional[Any] = None,
+) -> tuple[Optional[str], bool]:
+    """带循环检测的朝目标一步；返回 (direction, did_repath)。"""
+    tracker = _get_loop_tracker(wkey)
+    # 合并 memory 永久障碍，避免只看见本 tick 可见障碍导致贴墙空转
+    blocked: set[Position] = set(obstacles)
+    if memory is not None:
+        mem_obs = getattr(memory, "obstacles", None)
+        if mem_obs is not None:
+            try:
+                blocked |= set(mem_obs)
+            except Exception:
+                pass
+    direction, new_last, did_repath = guided_step_toward(
+        pos,
+        target,
+        blocked,
+        last_dir=_last_move_dir.get(wkey),
+        tracker=tracker,
+        memory=memory,
+        window=int(getattr(config, "loop_window_ticks", 12) or 12),
+        min_unique=int(getattr(config, "loop_min_unique", 4) or 4),
+        bbox_diameter_max=int(getattr(config, "loop_bbox_diameter", 3) or 3),
+        static_ticks=int(getattr(config, "loop_static_ticks", 4) or 4),
+        repath_cooldown=int(getattr(config, "loop_repath_cooldown", 5) or 5),
+        tick=tick,
+    )
+    if direction:
+        _last_move_dir[wkey] = direction
+    elif new_last is None and did_repath:
+        _last_move_dir.pop(wkey, None)
+    return direction, did_repath
+
+
 def _worker_key(uid: Any) -> str:
     return str(uid)
+
+
+def _set_intent(
+    wkey: str,
+    *,
+    target: Optional[Position] = None,
+    phase: Optional[str] = None,
+    role: Optional[str] = None,
+    ring: Optional[int] = None,
+    sector: Optional[int] = None,
+    dedicated: Optional[bool] = None,
+) -> None:
+    """写入/覆盖本 tick Worker 意图（Dashboard 路径可视化）。"""
+    cur = _worker_intents.get(wkey)
+    if cur is None:
+        cur = WorkerIntent()
+        _worker_intents[wkey] = cur
+    if target is not None:
+        cur.target = target
+    if phase is not None:
+        cur.phase = phase
+    if role is not None:
+        cur.role = role
+    if ring is not None:
+        cur.ring = ring
+    if sector is not None:
+        cur.sector = sector
+    if dedicated is not None:
+        cur.dedicated = dedicated
+
+
+def get_worker_states() -> dict[str, WorkerIntent]:
+    """导出 Worker 状态供 Dashboard：合并 spiral + 本 tick intent。
+
+    键为 str(worker.id)。intent 字段优先覆盖 spiral 同名字段。
+    main.run_session 通过 getattr(bot.economy, "get_worker_states") 调用。
+    """
+    out: dict[str, WorkerIntent] = {}
+    for k, st in _spiral_state.items():
+        out[k] = WorkerIntent(
+            target=st.target,
+            ring=int(st.ring) if st.ring is not None else None,
+            sector=int(st.sector_id) if st.sector_id is not None else None,
+            phase=str(st.phase) if st.phase is not None else None,
+            role="SCOUT",
+            dedicated=bool(st.dedicated),
+        )
+    for k, wi in _worker_intents.items():
+        base = out.get(k, WorkerIntent())
+        out[k] = WorkerIntent(
+            target=wi.target if wi.target is not None else base.target,
+            ring=wi.ring if wi.ring is not None else base.ring,
+            sector=wi.sector if wi.sector is not None else base.sector,
+            phase=wi.phase if wi.phase is not None else base.phase,
+            role=wi.role if wi.role is not None else base.role,
+            dedicated=wi.dedicated if wi.dedicated is not None else base.dedicated,
+        )
+    return out
 
 
 def _worker_index(uid: Any, workers: Sequence[Any], fallback: int) -> int:
@@ -241,79 +378,107 @@ def _pick_explore_direction_avoiding_enemies(
 def choose_spawn(
     turn: Any,
     config: TacticConfig = DEFAULT_CONFIG,
+    visible_threats: Any = None,
     has_near_threat: bool = False,
     has_far_threat: bool = False,
+    resources: Optional[int] = None,
 ) -> Optional[str]:
     """Core 空闲时的生产决策，返回 "WORKER"|"VANGUARD"|"RANGER"|None。
 
-    优先级：
-    1. workers 不足目标 → WORKER
-    2. 有威胁且战斗单位不足 → Vanguard（近）/ Ranger（远）
-    3. 补齐目标编制的 Vanguard / Ranger
-    4. 人口/资源不足 → None
+    阈值触发型生产调度（Task 3）：
+    - Worker 阈值 3/6/9/12 触发对应 V/R 编制要求
+    - 紧急 override：近威胁 + V==0 → 优先 VANGUARD（可消耗 reserve）
+    - 阶段：补 V/R 达标 → 补 W 到下一阈值 → W=12 后补 V/R 到 4/4
+    - 欠编战斗单位时禁止再扩工人，优先攒钱出 V/R（修复 7W0V0R）
+    - 兼容：阈值后仍按 config.target 补齐超编（max_population 允许时）
 
-    成本一律走 `rules.unit_cost_for(name, pop + 1)`（spawn 后人口估算，
-    v0.14 动态价格，无维护费）。早期（pop < early_game_pop）reserve 视为 0。
+    成本一律走 `rules.unit_cost_for(name, pop + 1)`（spawn 后人口估算）。
     """
+    if resources is None:
+        core = getattr(turn, 'core', None)
+        if core is not None and getattr(core, 'resources', None) is not None:
+            resources = int(core.resources)
+        elif getattr(turn, 'resources', None) is not None:
+            resources = int(turn.resources)
+        else:
+            state = getattr(turn, 'state', None)
+            if state is not None and getattr(state, 'resources', None) is not None:
+                resources = int(state.resources)
+            else:
+                resources = 0
     counts = count_by_type(turn)
-    pop = total_population(turn)
-    resources = _get_resources(turn)
+    pop = sum(counts.values())
     reserve = effective_reserve(pop, config)
 
     if pop >= config.max_population:
         return None
 
-    def try_type(name: str) -> Optional[str]:
+    def _try_type(name: str, *, ignore_reserve: bool = False) -> bool:
         cost = unit_cost_for(name, pop + 1)
-        if not can_afford(resources, cost, reserve):
-            return None
+        # 战斗单位补编 / 紧急出兵允许吃 reserve，避免「永远只有工人」
+        need_reserve = 0 if ignore_reserve else reserve
+        if resources - cost < need_reserve:
+            return False
         if pop + 1 > config.max_population:
-            return None
-        return name
+            return False
+        return True
 
-    # 1) Worker 优先（早期经济）
-    if counts["WORKER"] < config.target_workers:
-        chosen = try_type("WORKER")
-        if chosen:
-            return chosen
+    V_reqs = {3: 1, 6: 2, 9: 3, 12: 4}
+    R_reqs = {6: 1, 9: 2, 12: 4}
+    w = counts.get("WORKER", 0)
+    v = counts.get("VANGUARD", 0)
+    r = counts.get("RANGER", 0)
 
-    # 2) 威胁驱动战斗单位
-    combat_total = counts["VANGUARD"] + counts["RANGER"]
-    combat_target = config.target_vanguards + config.target_rangers
-    if has_near_threat or has_far_threat:
-        if counts["VANGUARD"] < config.target_vanguards or (
-            has_near_threat and counts["VANGUARD"] == 0
-        ):
-            chosen = try_type("VANGUARD")
-            if chosen:
-                return chosen
-        if has_far_threat and counts["RANGER"] < max(1, config.target_rangers):
-            chosen = try_type("RANGER")
-            if chosen:
-                return chosen
-        if combat_total < combat_target:
-            # 更便宜的 Vanguard 优先
-            if counts["VANGUARD"] < config.target_vanguards:
-                chosen = try_type("VANGUARD")
-                if chosen:
-                    return chosen
-            chosen = try_type("RANGER")
-            if chosen:
-                return chosen
+    # --- 紧急 override：近威胁 + V==0（可吃光 reserve）---
+    if has_near_threat and v == 0:
+        if _try_type("VANGUARD", ignore_reserve=True):
+            return "VANGUARD"
 
-    # 3) 和平补齐编制
-    if counts["WORKER"] < config.target_workers:
-        chosen = try_type("WORKER")
-        if chosen:
-            return chosen
-    if counts["VANGUARD"] < config.target_vanguards:
-        chosen = try_type("VANGUARD")
-        if chosen:
-            return chosen
-    if counts["RANGER"] < config.target_rangers:
-        chosen = try_type("RANGER")
-        if chosen:
-            return chosen
+    # --- 阈值阶段逻辑 ---
+    current_v_req = 0
+    for threshold in sorted(V_reqs.keys()):
+        if w >= threshold:
+            current_v_req = min(V_reqs[threshold], config.target_vanguards)
+    current_r_req = 0
+    for threshold in sorted(R_reqs.keys()):
+        if w >= threshold:
+            current_r_req = min(R_reqs[threshold], config.target_rangers)
+
+    # 欠编战斗单位：允许 ignore_reserve
+    combat_behind = (v < current_v_req) or (r < current_r_req)
+    if v < current_v_req:
+        if _try_type("VANGUARD", ignore_reserve=True):
+            return "VANGUARD"
+    if r < current_r_req:
+        if _try_type("RANGER", ignore_reserve=True):
+            return "RANGER"
+
+    # 已欠 V/R 编制时：禁止再扩工人，优先攒钱出战斗单位
+    w_soft_cap = min(12, config.target_workers)
+    if w < w_soft_cap and not combat_behind:
+        if _try_type("WORKER"):
+            return "WORKER"
+
+    final_v_cap = min(4, config.target_vanguards)
+    final_r_cap = min(4, config.target_rangers)
+    if v < final_v_cap:
+        if _try_type("VANGUARD", ignore_reserve=True):
+            return "VANGUARD"
+    if r < final_r_cap:
+        if _try_type("RANGER", ignore_reserve=True):
+            return "RANGER"
+
+    # --- 兼容 config.target：阈值完成后补超编（target_workers>12 等场景）---
+    still_need_combat = (v < config.target_vanguards) or (r < config.target_rangers)
+    if w < config.target_workers and not still_need_combat:
+        if _try_type("WORKER"):
+            return "WORKER"
+    if v < config.target_vanguards:
+        if _try_type("VANGUARD", ignore_reserve=True):
+            return "VANGUARD"
+    if r < config.target_rangers:
+        if _try_type("RANGER", ignore_reserve=True):
+            return "RANGER"
 
     return None
 
@@ -334,6 +499,8 @@ def command_workers(
     返回日志字符串列表（便于调试与测试断言）。
     """
     logs: list[str] = []
+    # 每 tick 清空意图表，由各分支 _set_intent 重新写入
+    _worker_intents.clear()
     core = getattr(turn, "core", None)
     if core_position is None:
         if core is None:
@@ -373,6 +540,179 @@ def command_workers(
                 except Exception:
                     beacon_ground_pos = None
 
+    # ===== Task 6: 阶段 A — 清理过期或角色异常的 _pending_return_mines 预约 =====
+    for w in workers:
+        wkey = _worker_key(w.id)
+        if wkey in _pending_return_mines:
+            mine_pos, claim_tick = _pending_return_mines[wkey]
+            if tick - claim_tick > _PENDING_RETURN_CLAIM_TTL:
+                del _pending_return_mines[wkey]
+                continue
+            assignment = role_plan.get(w.id)
+            wrole = assignment.role if assignment else Role.HARVESTER
+            if wrole in (Role.RETREAT, Role.HEAL):
+                del _pending_return_mines[wkey]
+
+    # --- P3-2 经济健康诊断 ---
+    # 1) 本 tick 是否有 deposit 将在下面每次 worker 做 deposit 时更新 last_deposit_tick
+    # 先累加 stall_ticks（本 tick 末尾若检测到 deposit 再清零）
+    health_tracker["stall_ticks"] = health_tracker.get("stall_ticks", 0) + 1
+
+    # 达到 stall 阈值 → 打日志，并抖动（设为 40 防刷屏）
+    if health_tracker["stall_ticks"] >= 50:
+        logs.append(f"economy:stall:no_deposit_for_50_ticks:pos={tuple(turn.core.position)}:workers={len(workers)}")
+        health_tracker["stall_ticks"] = 40
+
+    # Worker 预指派目标：dispatch_mine 阶段 C 的 "other" 选项预指派（wkey -> P）
+    pre_assigned_targets: dict[str, Position] = {}
+
+    # 性能优化 0：command_workers 级 estimate_path_steps 缓存（避免同 tick 同端点重复估算）
+    _estimate_cache: dict[tuple[Position, Position], int] = {}
+
+    def _cached_estimate(A: Position, B: Position, est_obs: set[Position]) -> int:
+        key = (A, B)
+        cached = _estimate_cache.get(key)
+        if cached is not None:
+            return cached
+        steps, _ = estimate_path_steps(
+            A, B, est_obs, memory=memory, max_steps=12,  # dispatch 只需相对比较，12 步足够
+        )
+        _estimate_cache[key] = steps
+        # 反向路径近似对称（估算目的），反向也写入缓存省一半调用
+        _estimate_cache[(B, A)] = steps
+        return steps
+
+    # ===== Task 6: 阶段 C — 矿点发现者调度（self vs other 决策）=====
+    # 先遍历所有 Worker 作为"发现者"（wd: cargo>0 且 HARVESTER），
+    # 发现附近矿点并决策 self（送完再回）或 other（指派空闲 Worker 立即去）
+    for wd in workers:
+        wd_uid = wd.id
+        wd_wkey = _worker_key(wd_uid)
+        wd_assignment = role_plan.get(wd_uid)
+        wd_role = wd_assignment.role if wd_assignment else Role.HARVESTER
+        wd_cargo = int(getattr(wd, "cargo", 0) or 0)
+        wd_pos = _as_position(wd.position)
+
+        if wd_cargo <= 0 or wd_role != Role.HARVESTER:
+            continue
+
+        # 收集可见资源 + 记忆资源点（视野半径=5）
+        all_resource_points: set[Position] = set(resources_cells)
+        if memory is not None:
+            all_resource_points |= set(memory.resource_points.keys())
+
+        nearby_mines = [
+            P for P in all_resource_points
+            if manhattan(wd_pos, P) <= 5
+        ]
+        # 复杂度限制：只取最近 3 个
+        if len(nearby_mines) > 3:
+            nearby_mines.sort(key=lambda P: manhattan(wd_pos, P))
+            nearby_mines = nearby_mines[:3]
+
+        for P in nearby_mines:
+            if P in claimed:
+                continue
+
+            # 空闲 Worker：cargo=0 且非 wd 自身，且角色为 HARVESTER 或未指派
+            idlers = [
+                wx for wx in workers
+                if int(getattr(wx, "cargo", 0) or 0) == 0
+                and wx.id != wd.id
+                and (
+                    (lambda a: a is None or a.role == Role.HARVESTER)(role_plan.get(wx.id))
+                )
+            ]
+            if len(idlers) > 4:
+                idlers.sort(key=lambda wx: manhattan(_as_position(wx.position), P))
+                idlers = idlers[:4]
+
+            if not idlers:
+                # 无空闲 Worker → self 预约
+                _pending_return_mines[wd_wkey] = (P, tick)
+                logs.append(f"worker:{wd_wkey}:dispatch:no_idlers:self")
+                continue
+
+            # ===== 性能优化 1：Manhattan 启发式预筛（决策明确时跳过 estimate_path_steps）=====
+            mh_wd_to_core = manhattan(wd_pos, core_position)
+            mh_core_to_P = manhattan(core_position, P)
+            mh_self = mh_wd_to_core + mh_core_to_P
+
+            idler_mh_list: list[tuple[int, int, Any]] = []
+            for wx in idlers:
+                wx_pos = _as_position(wx.position)
+                mh_wx_P = manhattan(wx_pos, P)
+                mh_other_wx = mh_wx_P + mh_core_to_P
+                idler_mh_list.append((mh_other_wx, mh_wx_P, wx))
+            idler_mh_list.sort(key=lambda t: (t[0], t[1]))
+            mh_other_min, mh_wx_P_argmin, mh_argmin_wx = idler_mh_list[0]
+
+            # 决策差距 >= 40% 时，用曼哈顿距离直接决定，不调用 estimate_path_steps
+            AMBIGUOUS_RATIO = 1.4
+            if mh_self * AMBIGUOUS_RATIO < mh_other_min:
+                # self 明显更优 → 直接 self 预约
+                _pending_return_mines[wd_wkey] = (P, tick)
+                logs.append(
+                    f"worker:{wd_wkey}:dispatch:option=self"
+                    f":T_self=mh{mh_self}:T_other=mh{mh_other_min}:heuristic"
+                )
+                continue
+            if mh_other_min * AMBIGUOUS_RATIO < mh_self:
+                # other 明显更优 → 直接指派曼哈顿最优 idle Worker
+                akey = _worker_key(mh_argmin_wx.id)
+                claimed.add(P)
+                pre_assigned_targets[akey] = P
+                logs.append(
+                    f"worker:{wd_wkey}:dispatch:option=other:to={akey}"
+                    f":T_self=mh{mh_self}:T_other=mh{mh_other_min}:heuristic"
+                )
+                continue
+
+            # ===== 决策模糊 → 调用 _cached_estimate 精确计算（含性能优化 0~4）=====
+            estimate_obstacles = set(obstacles)
+            if memory is not None:
+                estimate_obstacles |= memory.obstacles
+
+            # T_self: Wd → Core → P（缓存命中时零成本）
+            T_self_a = _cached_estimate(wd_pos, core_position, estimate_obstacles)
+            T_core_to_P = _cached_estimate(core_position, P, estimate_obstacles)
+            T_P_to_core = _cached_estimate(P, core_position, estimate_obstacles)
+            T_self = T_self_a + T_core_to_P
+
+            # T_other_min：只对 manhattan 前 2 idle Worker 精确 estimate
+            idlers_sorted = sorted(
+                idlers, key=lambda wx: (
+                    manhattan(_as_position(wx.position), P),
+                    _worker_key(wx.id),
+                )
+            )
+            estimate_idlers = idlers_sorted[:2]
+            T_other_list: list[tuple[int, int, Any]] = []
+            for wx in estimate_idlers:
+                wx_pos = _as_position(wx.position)
+                Ta = _cached_estimate(wx_pos, P, estimate_obstacles)
+                tiebreak = manhattan(wx_pos, P)
+                T_other_list.append((Ta + T_P_to_core, tiebreak, wx))
+            T_other_list.sort(key=lambda t: (t[0], t[1]))
+            T_other_min, _, argmin_wx = T_other_list[0]
+
+            if T_self < T_other_min:
+                # self 更优：wd 送完货后再回 P
+                _pending_return_mines[wd_wkey] = (P, tick)
+                logs.append(
+                    f"worker:{wd_wkey}:dispatch:option=self"
+                    f":T_self={T_self}:T_other={T_other_min}"
+                )
+            else:
+                # other 更优：立即指派空闲 Worker 去 P
+                akey = _worker_key(argmin_wx.id)
+                claimed.add(P)
+                pre_assigned_targets[akey] = P
+                logs.append(
+                    f"worker:{wd_wkey}:dispatch:option=other:to={akey}"
+                    f":T_self={T_self}:T_other={T_other_min}"
+                )
+
     for w in workers:
         uid = w.id
         assignment = role_plan.get(uid)
@@ -384,32 +724,102 @@ def command_workers(
 
         # 撤退 / 治疗：走向 Core
         if role in (Role.RETREAT, Role.HEAL):
+            # 满货冲 Core：即使角色是 RETREAT 也优先 return_deposit，
+            # 避免贴脸敌工把 man≈2 的送货工反复拉远（线上 res 卡 8 根因）
+            if cargo > 0 and pos != core_position and role == Role.RETREAT:
+                man_core = manhattan(pos, core_position)
+                if man_core <= 4:
+                    _set_intent(wkey, target=core_position, phase="deposit", role=str(role))
+                    direction, repath = _guided_move(
+                        pos, core_position, obstacles, wkey, config, tick=tick, memory=memory
+                    )
+                    if direction and hasattr(w, "move"):
+                        w.move(_resolve_direction(w, direction))
+                        tag = f"worker:{uid}:return_deposit:{direction}"
+                        if repath:
+                            tag += ":repath:loop"
+                        logs.append(tag)
+                    continue
             if pos == core_position:
-                if role == Role.HEAL and hasattr(w, "heal"):
-                    w.heal()
-                    logs.append(f"worker:{uid}:heal_at_core")
-                elif cargo > 0 and hasattr(w, "deposit"):
+                # 有货优先 deposit（即使 RETREAT/威胁贴脸），否则资源永远攒不够出 V/R
+                if cargo > 0 and hasattr(w, "deposit"):
+                    _set_intent(wkey, target=core_position, phase="deposit", role=str(role))
                     w.deposit()
                     logs.append(f"worker:{uid}:deposit")
+                    health_tracker["last_deposit_tick"] = tick
+                    health_tracker["stall_ticks"] = 0
+                    _loop_trackers.pop(wkey, None)
+                    _last_move_dir.pop(wkey, None)
+                elif role == Role.HEAL and hasattr(w, "heal"):
+                    _set_intent(wkey, target=core_position, phase="heal", role=str(role))
+                    w.heal()
+                    logs.append(f"worker:{uid}:heal_at_core")
                 elif pos in set(resources_cells) and hasattr(w, "harvest"):
+                    _set_intent(wkey, target=core_position, phase="harvest", role=str(role))
                     w.harvest()
                     logs.append(f"worker:{uid}:harvest_at_core")
-                else:
+                elif role == Role.HEAL and cargo <= 0:
+                    # 治疗角色到 Core 且无货：兜底 wait（heal 分支已优先处理）
+                    _set_intent(wkey, target=core_position, phase="heal", role=str(role))
                     if hasattr(w, "wait"):
                         w.wait()
                     logs.append(f"worker:{uid}:wait_at_core")
+                else:
+                    # 空货 RETREAT 到 Core 后禁止永久 wait（贴脸敌人工时整局饿死）。
+                    # 优先迈出远离敌人的一步；否则直接恢复 spiral 探索找矿。
+                    leave_dir = None
+                    best_score = -10**9
+                    for name, delta in NAME_TO_DELTA.items():
+                        nxt = add_pos(pos, delta)
+                        if nxt in obstacles:
+                            continue
+                        if enemy_positions:
+                            d_en = min(manhattan(nxt, ep) for ep in enemy_positions)
+                        else:
+                            d_en = 99
+                        d_core = manhattan(nxt, core_position)
+                        score = d_en * 100 + d_core
+                        if score > best_score:
+                            best_score = score
+                            leave_dir = name
+                    if leave_dir and hasattr(w, "move"):
+                        _set_intent(
+                            wkey,
+                            target=core_position,
+                            phase="retreat_scatter",
+                            role=str(role),
+                        )
+                        w.move(_resolve_direction(w, leave_dir))
+                        _last_move_dir[wkey] = leave_dir
+                        logs.append(f"worker:{uid}:retreat_scatter:{leave_dir}")
+                    else:
+                        logs.extend(
+                            _explore_spiral_step(
+                                w=w,
+                                workers=workers,
+                                wkey=wkey,
+                                uid=uid,
+                                pos=pos,
+                                core_position=core_position,
+                                obstacles=obstacles,
+                                enemy_positions=enemy_positions,
+                                config=config,
+                                memory=memory,
+                                tick=tick,
+                            )
+                        )
             else:
                 wkey = _worker_key(uid)
-                direction, _ = clamp_step_toward_memo(
-                    pos,
-                    core_position,
-                    obstacles,
-                    last_dir=_last_move_dir.get(wkey),
+                _set_intent(wkey, target=core_position, phase="retreat", role=str(role))
+                direction, repath = _guided_move(
+                    pos, core_position, obstacles, wkey, config, tick=tick, memory=memory
                 )
                 if direction and hasattr(w, "move"):
-                    _last_move_dir[wkey] = direction
                     w.move(_resolve_direction(w, direction))
-                    logs.append(f"worker:{uid}:retreat:{direction}")
+                    tag = f"worker:{uid}:retreat:{direction}"
+                    if repath:
+                        tag += ":repath:loop"
+                    logs.append(tag)
                 elif hasattr(w, "wait"):
                     w.wait()
                     logs.append(f"worker:{uid}:wait")
@@ -417,24 +827,30 @@ def command_workers(
 
         # 有货物且在 Core → deposit
         if cargo > 0 and pos == core_position:
+            _set_intent(wkey, target=core_position, phase="deposit", role=str(role))
             if hasattr(w, "deposit"):
                 w.deposit()
                 logs.append(f"worker:{uid}:deposit")
+                health_tracker["last_deposit_tick"] = tick
+                health_tracker["stall_ticks"] = 0
+            # 交付成功：清足迹，避免下一趟误触发 repath
+            _loop_trackers.pop(wkey, None)
+            _last_move_dir.pop(wkey, None)
             continue
 
         # 有货物 → 回 Core 交付（优先于继续采集）
         if cargo > 0:
             wkey = _worker_key(uid)
-            direction, _ = clamp_step_toward_memo(
-                pos,
-                core_position,
-                obstacles,
-                last_dir=_last_move_dir.get(wkey),
+            _set_intent(wkey, target=core_position, phase="deposit", role=str(role))
+            direction, repath = _guided_move(
+                pos, core_position, obstacles, wkey, config, tick=tick, memory=memory
             )
             if direction and hasattr(w, "move"):
-                _last_move_dir[wkey] = direction
                 w.move(_resolve_direction(w, direction))
-                logs.append(f"worker:{uid}:return_deposit:{direction}")
+                tag = f"worker:{uid}:return_deposit:{direction}"
+                if repath:
+                    tag += ":repath:loop"
+                logs.append(tag)
             continue
 
         # 拾取地面 Beacon（P2-1：同格 GROUND → pickup_beacon）
@@ -454,6 +870,68 @@ def command_workers(
                 logs.append(f"worker:{uid}:harvest")
                 if memory is not None:
                     memory.mark_harvested(pos, tick)
+            # 若此处恰好为 pending_return_mine 的目标，一并清理预约
+            if wkey in _pending_return_mines:
+                P_claimed, _ = _pending_return_mines[wkey]
+                if P_claimed == pos:
+                    del _pending_return_mines[wkey]
+            continue
+
+        # ===== Task 6: 阶段 B — 预约优先（_pending_return_mines 优先执行）=====
+        if wkey in _pending_return_mines and cargo == 0:
+            P, _ = _pending_return_mines[wkey]
+            claimed.add(P)
+            _set_intent(wkey, target=P, phase="to_resource", role=str(role))
+            logs.append(f"worker:{wkey}:to_pending_return_mine:pos={P}")
+            if pos == P:
+                if hasattr(w, "harvest"):
+                    w.harvest()
+                    logs.append(f"worker:{uid}:harvest")
+                    if memory is not None:
+                        memory.mark_harvested(pos, tick)
+                del _pending_return_mines[wkey]
+            else:
+                direction, repath = _guided_move(
+                    pos, P, obstacles, wkey, config, tick=tick, memory=memory
+                )
+                if direction and hasattr(w, "move"):
+                    w.move(_resolve_direction(w, direction))
+                    tag = f"worker:{uid}:to_resource:{direction}"
+                    if repath:
+                        tag += ":repath:loop"
+                    logs.append(tag)
+                elif hasattr(w, "wait"):
+                    w.wait()
+                    logs.append(f"worker:{uid}:wait")
+            continue
+
+        # 预指派目标（阶段 C other 选项的立即执行）优先级高于普通 candidates
+        if wkey in pre_assigned_targets:
+            P = pre_assigned_targets[wkey]
+            _set_intent(wkey, target=P, phase="to_resource", role=str(role))
+            if pos == P:
+                if pos in set(resources_cells) and hasattr(w, "harvest"):
+                    w.harvest()
+                    logs.append(f"worker:{uid}:harvest")
+                    if memory is not None:
+                        memory.mark_harvested(pos, tick)
+                else:
+                    if hasattr(w, "wait"):
+                        w.wait()
+                    logs.append(f"worker:{uid}:wait:bad_target")
+            else:
+                direction, repath = _guided_move(
+                    pos, P, obstacles, wkey, config, tick=tick, memory=memory
+                )
+                if direction and hasattr(w, "move"):
+                    w.move(_resolve_direction(w, direction))
+                    tag = f"worker:{uid}:to_resource:{direction}"
+                    if repath:
+                        tag += ":repath:loop"
+                    logs.append(tag)
+                elif hasattr(w, "wait"):
+                    w.wait()
+                    logs.append(f"worker:{uid}:wait")
             continue
 
         # 候选 = 可见资源 ∪ 记忆回访候选（按 worker 扇区优先；无本扇区候选则放宽）
@@ -486,6 +964,7 @@ def command_workers(
         target = nearest(pos, available) if available else nearest(pos, candidates)
         if target is not None:
             claimed.add(target)
+            _set_intent(wkey, target=target, phase="to_resource", role=str(role))
             if pos == target:
                 if pos in set(resources_cells) and hasattr(w, "harvest"):
                     w.harvest()
@@ -499,16 +978,15 @@ def command_workers(
                     logs.append(f"worker:{uid}:wait:bad_target")
             else:
                 wkey = _worker_key(uid)
-                direction, _ = clamp_step_toward_memo(
-                    pos,
-                    target,
-                    obstacles,
-                    last_dir=_last_move_dir.get(wkey),
+                direction, repath = _guided_move(
+                    pos, target, obstacles, wkey, config, tick=tick, memory=memory
                 )
                 if direction and hasattr(w, "move"):
-                    _last_move_dir[wkey] = direction
                     w.move(_resolve_direction(w, direction))
-                    logs.append(f"worker:{uid}:to_resource:{direction}")
+                    tag = f"worker:{uid}:to_resource:{direction}"
+                    if repath:
+                        tag += ":repath:loop"
+                    logs.append(tag)
                 elif hasattr(w, "wait"):
                     w.wait()
                     logs.append(f"worker:{uid}:wait")
@@ -526,22 +1004,22 @@ def command_workers(
                     cargo_target = cpos
             if cargo_target is not None and cargo_target not in claimed:
                 claimed.add(cargo_target)
+                _set_intent(wkey, target=cargo_target, phase="to_cargo", role=str(role))
                 if pos == cargo_target:
                     if hasattr(w, "harvest"):
                         w.harvest()
                         memory.mark_cargo_collected(cargo_target)
                         logs.append(f"worker:{uid}:reclaim_cargo")
                 else:
-                    direction, _ = clamp_step_toward_memo(
-                        pos,
-                        cargo_target,
-                        obstacles,
-                        last_dir=_last_move_dir.get(wkey),
+                    direction, repath = _guided_move(
+                        pos, cargo_target, obstacles, wkey, config, tick=tick, memory=memory
                     )
                     if direction and hasattr(w, "move"):
-                        _last_move_dir[wkey] = direction
                         w.move(_resolve_direction(w, direction))
-                        logs.append(f"worker:{uid}:to_cargo:{direction}")
+                        tag = f"worker:{uid}:to_cargo:{direction}"
+                        if repath:
+                            tag += ":repath:loop"
+                        logs.append(tag)
                     elif hasattr(w, "wait"):
                         w.wait()
                         logs.append(f"worker:{uid}:wait")
@@ -562,6 +1040,17 @@ def command_workers(
                     tick=tick,
                 )
             )
+            _st = _spiral_state.get(wkey)
+            if _st is not None:
+                _set_intent(
+                    wkey,
+                    target=_st.target,
+                    phase=str(_st.phase or "explore"),
+                    role=str(role),
+                    ring=_st.ring,
+                    sector=_st.sector_id,
+                    dedicated=_st.dedicated,
+                )
         else:
             # 无可见资源：螺旋扫掠 + 目标点导航 + 软回撤（替代旧 recall 硬边界）
             logs.extend(
@@ -577,30 +1066,190 @@ def command_workers(
                     config=config,
                     memory=memory,
                     tick=tick,
+                 )
+             )
+            _st = _spiral_state.get(wkey)
+            if _st is not None:
+                _set_intent(
+                    wkey,
+                    target=_st.target,
+                    phase=str(_st.phase or "explore"),
+                    role=str(role),
+                    ring=_st.ring,
+                    sector=_st.sector_id,
+                    dedicated=_st.dedicated,
                 )
-            )
+
+    # ===== Task 6: 阶段 D — 256 tick GC：清理 _pending_return_mines 中已死亡 Worker =====
+    if tick % 256 == 0:
+        alive = {_worker_key(w.id) for w in workers}
+        # _pending_return_mines（已在 Task 6 加过，确保仍在）
+        for d_name, d in [
+            ("_spiral_state", _spiral_state),
+            ("_last_move_dir", _last_move_dir if '_last_move_dir' in globals() else {}),
+            ("_loop_trackers", _loop_trackers if '_loop_trackers' in globals() else {}),
+            ("_pending_return_mines", _pending_return_mines),
+            ("_worker_intents", _worker_intents),
+        ]:
+            for k in list(d.keys()):
+                if k not in alive:
+                    d.pop(k, None)
 
     return logs
 
 
+def _beacon_chase_allowed(
+    config: TacticConfig,
+    core_position: Position,
+    worker_count: int,
+) -> bool:
+    """是否允许派 dedicated 追 Beacon（混合高效：近距 + 够人）。
+
+    - Beacon 缺失 → False
+    - worker_count < beacon_min_workers → False（早期全员 local 采）
+    - Core→Beacon 曼哈顿 > beacon_max_chase → False（防 d≈900+ 空跑饿死经济）
+    """
+    beacon = config.beacon_position
+    if beacon is None:
+        return False
+    min_w = max(1, int(getattr(config, "beacon_min_workers", 3) or 3))
+    if worker_count < min_w:
+        return False
+    max_chase = max(1, int(getattr(config, "beacon_max_chase", 64) or 64))
+    return manhattan(core_position, beacon) <= max_chase
+
+
+def _drop_to_local(st: SpiralState, reason_log: Optional[list[str]] = None,
+                   uid: Any = None, tag: str = "") -> None:
+    """将 SpiralState 强制回 local（清 target/stall；可选写日志）。"""
+    st.phase = "local"
+    st.dedicated = False
+    st.target = None
+    st.stalled_ticks = 0
+    if reason_log is not None and uid is not None and tag:
+        reason_log.append(f"worker:{uid}:{tag}")
+
+
 def _is_chunk_skippable(
     memory: Optional[MemoryMap],
-    core_position: Position,
+    center: Position,
     cand: Position,
+    beacon_side: bool = False,
+    tick: Optional[int] = None,
 ) -> bool:
-    """目标点是否应被跳过：已探 chunk 且**非 Core 所在 chunk**。
+    """目标点是否应被跳过：已探 chunk 且**非 Core 所在 chunk**（beacon_side=False）。
 
-    共享知识约定（决策 4）：chunk=32×32，Core 在 (10,10) 时 d≤20 本地扫掠
-    几乎全在 chunk (0,0)；若字面「跳过已探 chunk 内所有点」，首次到达 Core
-    即标记 (0,0) 已探 → 本地扫掠被整体吞掉。故「**Core chunk 永不跳过**」
-    （枢纽允许重复扫掠）。`memory is None → False`（不跳过）。
+    beacon_side=True（Beacon 侧新行为）：跳过 explored_chunk **Core chunk 也跳过**
+    （Beacon 侧不关心 Core chunk 例外）。
+    陈旧 chunk 不跳过（允许回访）：tick - last_seen > interval*3 时视为陈旧。
+    `memory is None → False`（不跳过）。
     """
     if memory is None:
         return False
-    cand_chunk = chunk_of(cand)
-    if cand_chunk == chunk_of(core_position):
+    CHUNK = getattr(memory, "CHUNK_SIZE", 16)
+    chunk = (cand[0] // CHUNK, cand[1] // CHUNK)
+    explored = getattr(memory, "explored_chunks", set())
+    if chunk not in explored:
         return False
-    return memory.is_explored(cand_chunk)
+    if tick is not None and hasattr(memory, "is_chunk_stale"):
+        if memory.is_chunk_stale(chunk, tick):
+            return False
+    if not beacon_side:
+        core_chunk = (center[0] // CHUNK, center[1] // CHUNK)
+        if chunk == core_chunk:
+            return False
+    return True
+
+
+def dual_spiral_target(
+    core: tuple[int, int],
+    beacon: Optional[tuple[int, int]],
+    d_core_now: int,
+    sector_id: int,
+    sector_count: int,
+    ring: int,
+    index: int,
+    memory: Any,
+    config: Any,
+    total_workers: int = 0,
+    tick: Optional[int] = None,
+) -> tuple[int, int]:
+    spiral_max_ring = getattr(config, "spiral_max_ring", 24)
+    beacon_max_chase = getattr(config, "beacon_max_chase", 64)
+    beacon_min_workers = getattr(config, "beacon_min_workers", 3)
+
+    if d_core_now <= spiral_max_ring:
+        return _next_spiral_target_simple(
+            core, sector_id, sector_count, ring, index, memory,
+            beacon_side=False, tick=tick,
+        )
+
+    if (
+        beacon is not None
+        and manhattan(core, beacon) <= beacon_max_chase
+        and total_workers >= beacon_min_workers
+    ):
+        for _attempt in range(20):
+            cand = beacon_oriented_spiral_target(
+                core, beacon, sector_id, sector_count, ring, index + _attempt
+            )
+            if _is_chunk_skippable(
+                memory, beacon, cand, beacon_side=True, tick=tick,
+            ):
+                index += 1
+                continue
+            return cand
+        return beacon_oriented_spiral_target(
+            core, beacon, sector_id, sector_count, ring, index
+        )
+
+    # 外环且无 Beacon chase：保持当前 ring 继续扫，禁止硬编码回 ring=3
+    # （线上多 Worker 在 ring=3 局部循环的根因之一）
+    keep_ring = max(3, min(int(ring), int(spiral_max_ring)))
+    return _next_spiral_target_simple(
+        core, sector_id, sector_count, keep_ring, index, memory,
+        beacon_side=False, tick=tick,
+    )
+
+
+def _next_spiral_target_simple(
+    core_position: Position,
+    sector_id: int,
+    sector_count: int,
+    ring: int,
+    index: int,
+    memory: Optional[MemoryMap],
+    beacon_side: bool = False,
+    obstacles: Optional[set[Position]] = None,
+    tick: Optional[int] = None,
+) -> Position:
+    max_iter = 64
+    blocked = obstacles if obstacles is not None else set()
+    cur_index = index
+    cur_ring = ring
+    spiral_max_ring = 24
+    for _ in range(max_iter):
+        pts = sector_points(core_position, cur_ring, sector_id, sector_count)
+        if not pts:
+            return core_position
+        cand = pts[cur_index % len(pts)]
+        if (
+            not _is_chunk_skippable(
+                memory, core_position, cand, beacon_side=beacon_side, tick=tick,
+            )
+            and cand not in blocked
+        ):
+            return cand
+        cur_index += 1
+        if cur_index >= len(pts):
+            cur_index = 0
+            cur_ring += 1
+            if cur_ring > spiral_max_ring:
+                cur_ring = spiral_max_ring
+    pts = sector_points(core_position, cur_ring, sector_id, sector_count)
+    if pts:
+        return pts[cur_index % len(pts)]
+    return core_position
 
 
 def _next_spiral_target(
@@ -610,6 +1259,7 @@ def _next_spiral_target(
     config: TacticConfig,
     memory: Optional[MemoryMap],
     obstacles: Optional[set[Position]] = None,
+    tick: Optional[int] = None,
 ) -> Position:
     """生成螺旋扫掠下一目标点（P0-2），替换现有 3 处 `spiral_target` 直调。
 
@@ -617,6 +1267,7 @@ def _next_spiral_target(
     （环扫完则 ring+1 / 回绕，沿用现有推进语义）；未探或 Core chunk 直接返回。
     `obstacles` 非空时，候选点本身是障碍 → 同样跳过，避免 Worker 反复朝
     不可达格振荡（bugfix：目标点绝不落在障碍上）。
+    陈旧 chunk 不跳过（允许回访）。
     """
     max_iter = 64  # 防死循环（Core chunk 永不跳过，理论上总能返回）
     blocked = obstacles if obstacles is not None else set()
@@ -625,18 +1276,22 @@ def _next_spiral_target(
             core_position, st.sector_id, sector_count, st.ring, st.index
         )
         if (
-            not _is_chunk_skippable(memory, core_position, cand)
+            not _is_chunk_skippable(
+                memory, core_position, cand, tick=tick,
+            )
             and cand not in blocked
         ):
             return cand
-        # 跳过：推进 index；本环扫完 → ring+1 / 回 base ring
+        # 跳过：推进 index；本环扫完 → ring+1 / 超上限切 beacon phase
         st.index += 1
         pts = sector_points(core_position, st.ring, st.sector_id, sector_count)
         if st.index >= len(pts):
             st.index = 0
             st.ring += 1
             if st.ring > config.spiral_max_ring:
-                st.ring = config.spiral_base_ring
+                st.phase = "beacon"
+                base_ring = getattr(config, 'spiral_base_ring', 3)
+                st.ring = max(base_ring, st.ring - config.spiral_max_ring + base_ring)
     return spiral_target(
         core_position, st.sector_id, sector_count, st.ring, st.index
     )
@@ -689,23 +1344,27 @@ def _beacon_explore_step(
 
     target = _regenerate_target()
     dist_to_target = manhattan(pos, target)
-    direction, _ = clamp_step_toward_memo(
-        pos, target, obstacles, last_dir=_last_move_dir.get(wkey)
+    # _guided_move 会写回 _last_move_dir，先捕获 prev 用于反向对抖检测
+    prev_dir = _last_move_dir.get(wkey)
+    direction, did_repath = _guided_move(
+        pos, target, obstacles, wkey, config, tick=tick, memory=memory
     )
 
     # 进度追踪：方向为空（卡住）或未缩短与目标距离 → stall+1 + 障碍记录。
     # 紧接反向对抖（A↔B 贴墙振荡）即使缩短距离也不算进展，保证 stall
-    # 能累积 → 换横向 offset 绕障。
+    # 能累积 → 换横向 offset 绕障。repath 视为有进展。
     progressed = False
-    if direction is not None:
+    if did_repath:
+        progressed = True
+    elif direction is not None:
         nxt = add_pos(pos, NAME_TO_DELTA[direction])
         if manhattan(nxt, target) < dist_to_target:
             progressed = True
-    last_dir = _last_move_dir.get(wkey)
     if (
-        direction is not None
-        and last_dir is not None
-        and direction == _opposite_dir(last_dir)
+        not did_repath
+        and direction is not None
+        and prev_dir is not None
+        and direction == _opposite_dir(prev_dir)
     ):
         progressed = False
     if progressed:
@@ -727,8 +1386,8 @@ def _beacon_explore_step(
         st.stalled_ticks = 0
         st.index += 1
         target = _regenerate_target()
-        direction, _ = clamp_step_toward_memo(
-            pos, target, obstacles, last_dir=_last_move_dir.get(wkey)
+        direction, did_repath = _guided_move(
+            pos, target, obstacles, wkey, config, tick=tick, memory=memory
         )
 
     # 避敌改道（不强制外扩）
@@ -741,24 +1400,26 @@ def _beacon_explore_step(
             core_position=core_position,
             obstacles=obstacles,
         )
+        if direction:
+            _last_move_dir[wkey] = direction
 
     suffix = ":avoid" if avoided else ""
     rl = ":recall_soft:beacon" if soft_recall else ""
     ded = ":dedicated_beacon" if st.dedicated else ""
+    rp = ":repath" if did_repath else ""
     if direction and hasattr(w, "move"):
-        _last_move_dir[wkey] = direction
         w.move(_resolve_direction(w, direction))
         logs.append(
             f"worker:{uid}:explore:{direction}:phase=beacon:ring={st.ring}"
             f":sec={st.sector_id}:stall={st.stalled_ticks}:d={dist_core}"
-            f":d_beacon={d_beacon}{rl}{ded}{suffix}"
+            f":d_beacon={d_beacon}{rl}{ded}{rp}{suffix}"
         )
     elif hasattr(w, "wait"):
         w.wait()
         logs.append(
             f"worker:{uid}:explore:None:phase=beacon:ring={st.ring}"
             f":sec={st.sector_id}:stall={st.stalled_ticks}:d={dist_core}"
-            f":d_beacon={d_beacon}{rl}{ded}"
+            f":d_beacon={d_beacon}{rl}{ded}{rp}"
         )
     return logs
 
@@ -814,49 +1475,66 @@ def _explore_spiral_step(
         _spiral_state[wkey] = st
 
     dist_core = manhattan(pos, core_position)
+    n_workers = len(workers)
+    chase_ok = _beacon_chase_allowed(config, core_position, n_workers)
 
     # 到达标记：记录已探 chunk（新 chunk → new_chunk 日志）
     if memory is not None and memory.mark_explored(pos, tick):
         cx, cy = memory.chunk_of(pos)
         logs.append(f"worker:{uid}:new_chunk=({cx},{cy})")
 
-    # P1-1 dedicated 指派：widx==0 且 Beacon 存在 → 专职 Beacon
-    if config.beacon_position is not None and widx == 0 and not st.dedicated:
+    # 环同步：若 Worker 已明显超出当前 spiral ring，把 ring 抬到当前位置，
+    # 避免 target 永远落在 ring=3（把外圈工人拽回 Core 周边空转）。
+    if st.phase == "local" and dist_core > st.ring + 2:
+        new_ring = min(dist_core, config.spiral_max_ring)
+        if new_ring > st.ring:
+            st.ring = max(st.ring + 1, new_ring)  # 至少 +1，可跳到当前位置
+            if st.ring > config.spiral_max_ring:
+                st.ring = config.spiral_max_ring
+            st.index = 0
+            st.target = None
+            st.stalled_ticks = 0
+
+    # ---- Beacon 策略（混合高效，非照搬）----
+    # 1) 远距 / 人少：禁止 dedicated，已 dedicated 也降级 local
+    # 2) 近距 + 够人 + widx==0：才专职 beacon
+    # 3) 非 dedicated 残留 phase=beacon 每 tick 强制清回 local
+    if st.dedicated and not chase_ok:
+        tag = "beacon_abort:far" if config.beacon_position is not None else "beacon_abort:gone"
+        if n_workers < max(1, int(getattr(config, "beacon_min_workers", 3) or 3)):
+            tag = "beacon_abort:min_workers"
+        _drop_to_local(st, logs, uid, tag)
+    elif chase_ok and widx == 0 and not st.dedicated:
         st.dedicated = True
         st.phase = "beacon"
         logs.append(f"worker:{uid}:dedicated_beacon")
-    # dedicated 强制 beacon（Beacon 存在时）
-    if st.dedicated and config.beacon_position is not None:
+    elif st.dedicated and chase_ok and config.beacon_position is not None:
         st.phase = "beacon"
-    # 非 dedicated 残留 beacon 相位清理：只允许 dedicated 追 Beacon
+    # 非 dedicated 残留 beacon 相位清理（每 tick 强制）
     if not st.dedicated and st.phase == "beacon":
-        st.phase = "local"
-        st.target = None
-        st.stalled_ticks = 0
+        chase_ok = _beacon_chase_allowed(config, core_position, n_workers)
+        if not chase_ok:
+            _drop_to_local(st, logs, uid, "beacon_force_local:chase_not_ok")
 
     # beacon 阶段且 Beacon 消失 / 被拾取 → 回 local（P2-1）
     if st.phase == "beacon" and config.beacon_position is None:
-        st.phase = "local"
-        st.target = None
-        st.stalled_ticks = 0
+        _drop_to_local(st, logs, uid, "beacon_abort:gone")
 
-    # 绝对安全网（**仅 local 阶段生效**）：距 Core 过远直接朝 Core 一步
+    # 绝对安全网（**仅 local 阶段生效**）：距 Core 过远时**不要**强制朝 Core 走
+    # （线上 d≈33 被 recall_soft 拉回 → 永远找不到矿）。改为把 spiral ring
+    # 抬到当前位置附近，继续外扩扫掠。
     if st.phase == "local" and dist_core > config.spiral_max_ring + 8:
-        direction, _ = clamp_step_toward_memo(
-            pos, core_position, obstacles, last_dir=_last_move_dir.get(wkey)
-        )
-        if direction and hasattr(w, "move"):
-            _last_move_dir[wkey] = direction
+        # 抬 ring 到当前距离附近（不超过 max+4 的软上限），清 target 强制重算
+        raise_to = min(dist_core, config.spiral_max_ring + 4)
+        if st.ring < raise_to:
+            st.ring = raise_to
+            st.index = 0
+            st.target = None
             st.stalled_ticks = 0
-            w.move(_resolve_direction(w, direction))
             logs.append(
-                f"worker:{uid}:explore:{direction}:ring={st.ring}:sec={st.sector_id}"
-                f":stall={st.stalled_ticks}:d={dist_core}:recall_soft"
+                f"worker:{uid}:explore_ring_raise:ring={st.ring}:d={dist_core}"
             )
-        elif hasattr(w, "wait"):
-            w.wait()
-            logs.append(f"worker:{uid}:wait_idle")
-        return logs
+        # 不 return：落入下方 local 导航
 
     # ---- beacon 阶段 ----
     if st.phase == "beacon":
@@ -893,10 +1571,14 @@ def _explore_spiral_step(
 
     # ---- local 阶段（目标点导航）----
     if st.target is None:
-        st.target = _next_spiral_target(
-            core_position, st, sector_count, config, memory, obstacles
+        st.target = dual_spiral_target(
+            core_position, config.beacon_position, dist_core, st.sector_id,
+            sector_count, st.ring, st.index, memory, config,
+            total_workers=len(workers), tick=tick,
         )
     dist_to_target = manhattan(pos, st.target)
+
+    in_outer_ring = dist_core > config.spiral_max_ring
 
     # 到达目标 → 推进 index / ring
     if pos == st.target:
@@ -907,42 +1589,54 @@ def _explore_spiral_step(
             st.ring_done = False
             st.ring += 1
             if st.ring > config.spiral_max_ring:
-                st.ring = config.spiral_base_ring  # 回 base ring 重新开始
+                st.phase = "beacon"
+                base_ring = getattr(config, 'spiral_base_ring', 3)
+                st.ring = max(base_ring, st.ring - config.spiral_max_ring + base_ring)
         st.stalled_ticks = 0
-        st.target = _next_spiral_target(
-            core_position, st, sector_count, config, memory, obstacles
+        st.target = dual_spiral_target(
+            core_position, config.beacon_position, dist_core, st.sector_id,
+            sector_count, st.ring, st.index, memory, config,
+            total_workers=len(workers), tick=tick,
         )
         dist_to_target = manhattan(pos, st.target)
 
-    direction, _ = clamp_step_toward_memo(
-        pos, st.target, obstacles, last_dir=_last_move_dir.get(wkey)
+    # 必须在 _guided_move 前捕获 prev_dir：_guided_move 会立刻写回 _last_move_dir
+    prev_dir = _last_move_dir.get(wkey)
+
+    # 带 LoopTracker 的引导移动，打破局部绕圈（修复工人同区域循环）
+    direction, did_repath = _guided_move(
+        pos, st.target, obstacles, wkey, config, tick=tick, memory=memory
     )
 
     # 进度追踪：方向为空（卡住）、目标本身是障碍（不可达）、紧接反向对抖
     # （A↔B 贴墙振荡）或未缩短与目标距离 → stall+1。
     # 反向对抖即使 manhattan 缩短也不算进展（如贴墙横跳），保证 stall
     # 能累积 → 软回撤外扩（bugfix：不再因振荡永远卡在同一环）。
-    last_dir = _last_move_dir.get(wkey)
+    # repath 视为有进展（已强制换路），清 stall。
     if st.target in obstacles:
         st.stalled_ticks += 1
     elif direction is None:
         st.stalled_ticks += 1
-    elif last_dir is not None and direction == _opposite_dir(last_dir):
+    elif prev_dir is not None and direction == _opposite_dir(prev_dir):
+        # 对抖不算进展（即使 repath）
         st.stalled_ticks += 1
-    else:
+    elif direction:
         nxt = add_pos(pos, NAME_TO_DELTA[direction])
-        if manhattan(nxt, st.target) >= dist_to_target:
-            st.stalled_ticks += 1
-        else:
+        if manhattan(nxt, st.target) < dist_to_target:
+            # 真正缩短目标距离才清 stall；裸 repath 不清（否则 ring 永远卡在 3）
             st.stalled_ticks = 0
+        else:
+            st.stalled_ticks += 1
+    else:
+        st.stalled_ticks += 1
 
     # 软回撤：连续 recall_stall_ticks 无进展
     soft_recall = False
     if st.stalled_ticks >= config.recall_stall_ticks:
         st.stalled_ticks = 0
         soft_recall = True
-        # 仅 dedicated 软回撤切 beacon；非 dedicated 走 ring+1 外扩，避免全员追远点 Beacon
-        if config.beacon_position is not None and st.dedicated:
+        # 仅「允许 chase 的 dedicated」可 soft-recall 切 beacon；否则 ring+1 外扩
+        if st.dedicated and _beacon_chase_allowed(config, core_position, n_workers):
             st.phase = "beacon"
             logs.extend(
                 _beacon_explore_step(
@@ -962,31 +1656,41 @@ def _explore_spiral_step(
                 )
             )
             return logs
-        # 非 dedicated / 无 Beacon：软回撤 **向外扩** —— 绝不因 stall 收缩回 Core。
-        # 1) ring+1（向外扩一层；达到上限后保持 max ring，不收缩）
-        # 2) index 跳到环对面（+len(pts)//2），避免反复卡同一障碍
-        st.ring += 1
-        if st.ring > config.spiral_max_ring:
-            st.ring = config.spiral_max_ring
+        # stall 切换逻辑：
+        # - 内环 stall（6 tick 无进展）→ st.ring += 1；若 st.ring > spiral_max_ring → 切 beacon phase
+        # - 外环 stall 超阈值 → 切 beacon phase（不再回内环）
+        if in_outer_ring:
+            st.phase = "beacon"
+            base_ring = getattr(config, 'spiral_base_ring', 3)
+            st.ring = max(base_ring, st.ring - config.spiral_max_ring + base_ring)
+        else:
+            st.ring += 1
+            if st.ring > config.spiral_max_ring:
+                st.phase = "beacon"
+                base_ring = getattr(config, 'spiral_base_ring', 3)
+                st.ring = max(base_ring, st.ring - config.spiral_max_ring + base_ring)
         pts = sector_points(core_position, st.ring, st.sector_id, sector_count)
         if pts:
             st.index = (st.index + len(pts) // 2) % len(pts)
         else:
             st.index = 0
-        st.target = _next_spiral_target(
-            core_position, st, sector_count, config, memory, obstacles
+        st.target = dual_spiral_target(
+            core_position, config.beacon_position, dist_core, st.sector_id,
+            sector_count, st.ring, st.index, memory, config,
+            total_workers=len(workers), tick=tick,
         )
-        direction, _ = clamp_step_toward_memo(
-            pos, st.target, obstacles, last_dir=_last_move_dir.get(wkey)
+        direction, did_repath = _guided_move(
+            pos, st.target, obstacles, wkey, config, tick=tick, memory=memory
         )
         if direction is None:
-            # 兜底：优先远离 Core（绝不因 stall 收缩）；仅四向皆挡时为 None
             direction = outward_step(
                 pos,
                 core_position,
                 obstacles=obstacles,
                 last_dir=_last_move_dir.get(wkey),
             )
+            if direction:
+                _last_move_dir[wkey] = direction
 
     # 避敌改道（不强制外扩）
     avoided = False
@@ -998,22 +1702,25 @@ def _explore_spiral_step(
             core_position=core_position,
             obstacles=obstacles,
         )
+        if direction:
+            _last_move_dir[wkey] = direction
 
     if direction and hasattr(w, "move"):
-        _last_move_dir[wkey] = direction
         w.move(_resolve_direction(w, direction))
         suffix = ":avoid" if avoided else ""
         rl = ":recall_soft" if soft_recall else ""
+        rp = ":repath" if did_repath else ""
         logs.append(
             f"worker:{uid}:explore:{direction}:ring={st.ring}:sec={st.sector_id}"
-            f":stall={st.stalled_ticks}:d={dist_core}{rl}{suffix}"
+            f":stall={st.stalled_ticks}:d={dist_core}{rl}{rp}{suffix}"
         )
     elif hasattr(w, "wait"):
         w.wait()
         rl = ":recall_soft" if soft_recall else ""
+        rp = ":repath" if did_repath else ""
         logs.append(
             f"worker:{uid}:explore:None:ring={st.ring}:sec={st.sector_id}"
-            f":stall={st.stalled_ticks}:d={dist_core}{rl}"
+            f":stall={st.stalled_ticks}:d={dist_core}{rl}{rp}"
         )
 
     return logs

@@ -1,0 +1,177 @@
+{
+  "health": {
+    "ok": true,
+    "snapshots": 8,
+    "logs": 203,
+    "snapshots_data_source": "arena_hero_sdk_turn"
+  },
+  "latest": {
+    "ok": true,
+    "tick": 73828,
+    "resources": 4,
+    "population": 7,
+    "counts": {
+      "RANGER": 0,
+      "VANGUARD": 0,
+      "WORKER": 7
+    },
+    "core": {
+      "action": "core:no_spawn",
+      "hp": 5,
+      "hp_max": null,
+      "position": [
+        -794,
+        -266
+      ],
+      "shield": 5,
+      "shield_max": null,
+      "x": -794,
+      "y": -266
+    },
+    "units_n": 7,
+    "obstacles_n": 38,
+    "enemies_n": 3,
+    "path_estimate_n": 7,
+    "path_samples": [
+      {
+        "type": "WORKER",
+        "id_tail": "d584ea15",
+        "phase": "local",
+        "target": [
+          -796,
+          -267
+        ],
+        "steps": 66,
+        "waypoints": 65,
+        "blocked": 5,
+        "dest": [
+          -796,
+          -267
+        ]
+      },
+      {
+        "type": "WORKER",
+        "id_tail": "5c29ed4d",
+        "phase": "deposit",
+        "target": [
+          -794,
+          -266
+        ],
+        "steps": 73,
+        "waypoints": 65,
+        "blocked": 3,
+        "dest": [
+          -794,
+          -266
+        ]
+      },
+      {
+        "type": "WORKER",
+        "id_tail": "0cde8a44",
+        "phase": "local",
+        "target": [
+          -794,
+          -269
+        ],
+        "steps": 7,
+        "waypoints": 8,
+        "blocked": 0,
+        "dest": [
+          -794,
+          -269
+        ]
+      },
+      {
+        "type": "WORKER",
+        "id_tail": "623c9001",
+        "phase": "retreat",
+        "target": [
+          -794,
+          -266
+        ],
+        "steps": 13,
+        "waypoints": 14,
+        "blocked": 3,
+        "dest": [
+          -794,
+          -266
+        ]
+      },
+      {
+        "type": "WORKER",
+        "id_tail": "4d82ad4d",
+        "phase": "deposit",
+        "target": [
+          -794,
+          -266
+        ],
+        "steps": 80,
+        "waypoints": 65,
+        "blocked": 2,
+        "dest": [
+          -794,
+          -266
+        ]
+      },
+      {
+        "type": "WORKER",
+        "id_tail": "d4ea807c",
+        "phase": "local",
+        "target": [
+          -795,
+          -268
+        ],
+        "steps": 76,
+        "waypoints": 65,
+        "blocked": 4,
+        "dest": [
+          -795,
+          -268
+        ]
+      },
+      {
+        "type": "WORKER",
+        "id_tail": "d286be7c",
+        "phase": "retreat",
+        "target": [
+          -794,
+          -266
+        ],
+        "steps": 1,
+        "waypoints": 2,
+        "blocked": 0,
+        "dest": [
+          -794,
+          -266
+        ]
+      }
+    ],
+    "data_source": "arena_hero_sdk_turn"
+  },
+  "pid": "25940",
+  "tasklist": "映像名称                       PID 会话名              会话#       内存使用 \n========================= ======== ================ =========== ============\npython.exe                   25940 Console                    1      4,200 K",
+  "alive": true,
+  "log_lines": 79681,
+  "log_tail": [
+    "21:20:22 [DEBUG] arena_hero_tactic:   worker:25f9e094-0418-43e9-bfa3-60225c29ed4d:return_deposit:RIGHT",
+    "21:20:22 [DEBUG] arena_hero_tactic:   worker:6fa9325e-0807-45ca-884f-9ae00cde8a44:explore:RIGHT:ring=3:sec=2:stall=0:d=9:avoid",
+    "21:20:22 [DEBUG] arena_hero_tactic:   worker:7e5687b8-9713-4920-beb9-bd1e623c9001:retreat:DOWN",
+    "21:20:22 [DEBUG] arena_hero_tactic:   worker:b8a162c9-3fbb-4815-879b-997b4d82ad4d:return_deposit:UP",
+    "21:20:22 [DEBUG] arena_hero_tactic:   worker:f7abe11e-e13a-4c67-8989-01a4d4ea807c:explore:RIGHT:ring=3:sec=1:stall=0:d=12:avoid",
+    "21:20:22 [DEBUG] arena_hero_tactic:   worker:fa7407d7-e267-4edd-a7b9-a000d286be7c:retreat:DOWN",
+    "21:20:22 [DEBUG] arena_hero_tactic:   core:no_spawn",
+    "21:20:39 [INFO] arena_hero_tactic: tick=73828 pop=7 res=4 W7/V0/R0 [THREAT] core=core:no_spawn (1694ms)",
+    "21:20:39 [DEBUG] arena_hero_tactic:   strategy:beacon:pos=(0, 0):status=None",
+    "21:20:39 [DEBUG] arena_hero_tactic:   threat:count=3:near=3:min_core=1:min_w=1:res_vis=0",
+    "21:20:39 [DEBUG] arena_hero_tactic:   worker:065ed71c-0891-4f23-82cf-f761d584ea15:explore:LEFT:ring=3:sec=0:stall=0:d=5:avoid",
+    "21:20:39 [DEBUG] arena_hero_tactic:   worker:25f9e094-0418-43e9-bfa3-60225c29ed4d:return_deposit:UP",
+    "21:20:39 [DEBUG] arena_hero_tactic:   worker:6fa9325e-0807-45ca-884f-9ae00cde8a44:explore:LEFT:ring=3:sec=2:stall=0:d=10:avoid",
+    "21:20:39 [DEBUG] arena_hero_tactic:   worker:7e5687b8-9713-4920-beb9-bd1e623c9001:retreat:DOWN",
+    "21:20:39 [DEBUG] arena_hero_tactic:   worker:b8a162c9-3fbb-4815-879b-997b4d82ad4d:return_deposit:RIGHT",
+    "21:20:39 [DEBUG] arena_hero_tactic:   worker:f7abe11e-e13a-4c67-8989-01a4d4ea807c:explore:DOWN:ring=3:sec=1:stall=1:d=11:avoid",
+    "21:20:39 [DEBUG] arena_hero_tactic:   worker:fa7407d7-e267-4edd-a7b9-a000d286be7c:retreat:DOWN",
+    "21:20:39 [DEBUG] arena_hero_tactic:   core:no_spawn",
+    "21:20:48 [INFO] werkzeug: 127.0.0.1 - - [08/Aug/2026 21:20:48] \"GET /health HTTP/1.1\" 200 -",
+    "21:20:48 [INFO] werkzeug: 127.0.0.1 - - [08/Aug/2026 21:20:48] \"GET /api/state/latest HTTP/1.1\" 200 -"
+  ]
+}

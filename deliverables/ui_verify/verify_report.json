@@ -1,0 +1,79 @@
+{
+  "base": "http://127.0.0.1:8769",
+  "summary": {
+    "tick": 128,
+    "units": 4,
+    "obstacles": 6,
+    "path_estimate_units": 3,
+    "path_samples": [
+      {
+        "id": "1111",
+        "type": "WORKER",
+        "steps": 8,
+        "wps": 9,
+        "blocked": 3,
+        "dest": [
+          8,
+          3
+        ]
+      },
+      {
+        "id": "2222",
+        "type": "WORKER",
+        "steps": 10,
+        "wps": 11,
+        "blocked": 0,
+        "dest": [
+          0,
+          0
+        ]
+      },
+      {
+        "id": "3333",
+        "type": "VANGUARD",
+        "steps": 2,
+        "wps": 3,
+        "blocked": 0,
+        "dest": [
+          3,
+          0
+        ]
+      }
+    ]
+  },
+  "probe": {
+    "health": {
+      "status": 200,
+      "bytes": 217
+    },
+    "index": {
+      "status": 200,
+      "bytes": 37396,
+      "checks": {
+        "primary": true,
+        "bg": true,
+        "logo": true,
+        "paths": true,
+        "drawPaths": true
+      }
+    },
+    "logo": {
+      "status": 200,
+      "bytes": 274
+    },
+    "latest": {
+      "status": 200,
+      "bytes": 2197,
+      "tick": 128,
+      "path_n": 3,
+      "obs_n": 6,
+      "ok": true
+    }
+  },
+  "dashboard_ok": false,
+  "docs_ok": false,
+  "dashboard_path": "C:\\Users\\Administrator\\arena_ui_verify\\dashboard_ui.png",
+  "docs_path": "C:\\Users\\Administrator\\arena_ui_verify\\official_docs.png",
+  "dashboard_bytes": 0,
+  "docs_bytes": 0
+}

@@ -169,20 +169,38 @@ def assign_roles(
             # 2) 满货：距敌 ≤ retreat_radius 才撤（保货）
             # 3) 近 Core 威胁：仅当敌人 near Core 且 worker 贴身（≤ adjacent）才撤
             #    —— 空货中距离敌人改由 explore 避让，不打断外扩
+            # 4) 满货已逼近 Core（man≤4）时禁止因敌人改 RETREAT：
+            #    线上敌工贴 Core 导致 deposit 工人 man≈2 来回拉扯，资源永远 ≤8
+            dist_core = manhattan(snap.position, core_position)
+            near_core_deposit = snap.cargo > 0 and dist_core <= 4
             adjacent_danger = any(
                 manhattan(snap.position, ep) <= config.retreat_adjacent
                 for ep in enemies
             )
-            cargo_danger = snap.cargo > 0 and any(
-                manhattan(snap.position, ep) <= config.retreat_radius
-                for ep in enemies
+            cargo_danger = (
+                snap.cargo > 0
+                and not near_core_deposit
+                and any(
+                    manhattan(snap.position, ep) <= config.retreat_radius
+                    for ep in enemies
+                )
             )
-            core_melee_danger = any(
-                manhattan(ep, core_position) <= config.threat_radius
-                and manhattan(snap.position, ep) <= config.retreat_adjacent
-                for ep in enemies
+            core_melee_danger = (
+                not near_core_deposit
+                and any(
+                    manhattan(ep, core_position) <= config.threat_radius
+                    and manhattan(snap.position, ep) <= config.retreat_adjacent
+                    for ep in enemies
+                )
             )
-            if adjacent_danger or cargo_danger or core_melee_danger:
+            # 满货冲 Core 时仅邻格贴身才被迫撤（真正被打）；否则继续 deposit
+            if near_core_deposit:
+                if adjacent_danger and dist_core > 0:
+                    # 贴脸但尚未站上 Core：仍朝 Core 走（economy 会 return_deposit）
+                    role = Role.RETREAT
+                    hint = core_position
+                # 已在 Core 或无人贴脸 → 保持 HARVESTER，走 deposit 分支
+            elif adjacent_danger or cargo_danger or core_melee_danger:
                 role = Role.RETREAT
                 hint = core_position
 

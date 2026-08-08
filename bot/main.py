@@ -187,8 +187,13 @@ def run_session(
     base_url: Optional[str],
     max_turns: Optional[int],
     turns_done: int,
+    dashboard_push=None,
 ) -> tuple[int, bool]:
     """单次连接会话：处理 turns 直到断开或达到 max_turns。
+
+    Args:
+        dashboard_push: 可选回调 safe_push_snapshot(turn, result, memory, econ_states)。
+            由 run_loop 在 --dashboard 时注入；None 表示不启用 dashboard（零污染）。
 
     Returns:
         (累计 turn 数, 是否因 max_turns 正常结束应停止重连)
@@ -207,6 +212,38 @@ def run_session(
             tick = getattr(turn, "tick", "?")
             try:
                 result = decide(turn, config=config)
+                # --- Dashboard 快照钩子（零兜底伪造；dashboard_push 由 run_loop 直接注入）---
+                if dashboard_push is not None:
+                    try:
+                        from bot.memory import WORLD_MEMORY
+                        econ_states: Any = None
+                        # 真实 Worker 状态字典：仅当 bot.economy 显式导出时读取
+                        # （禁止自己发明 ECONOMY_STATES 这样的模块名；不存在则传 None）
+                        try:
+                            import importlib as _dash_il
+                            _eco_mod = _dash_il.import_module("bot.economy")
+                            # 按优先级尝试官方可能的导出名（都没有则 None，绝不兜底伪造）
+                            for _name in ("WORKER_STATES", "worker_states", "ECONOMY_STATES",
+                                          "_worker_states", "get_worker_states"):
+                                _obj = getattr(_eco_mod, _name, None)
+                                if _obj is None:
+                                    continue
+                                if callable(_obj):
+                                    try:
+                                        econ_states = _obj()
+                                    except Exception:
+                                        econ_states = None
+                                elif isinstance(_obj, dict):
+                                    econ_states = _obj
+                                if econ_states is not None:
+                                    break
+                        except Exception:
+                            econ_states = None
+                        dashboard_push(turn, result, WORLD_MEMORY, econ_states)
+                    except Exception:  # noqa: BLE001
+                        import logging as _log
+                        _log.getLogger("arena_hero_tactic").warning("dashboard:hook_failed", exc_info=True)
+                # ---------------------------------------------------------
                 try:
                     turn.submit()
                 except Exception as submit_exc:
@@ -246,6 +283,9 @@ def run_loop(
     config: TacticConfig = DEFAULT_CONFIG,
     base_url: Optional[str] = None,
     max_turns: Optional[int] = None,
+    dashboard_enabled: bool = False,
+    dashboard_port: int = 8765,
+    dashboard_logger=None,
 ) -> int:
     """外层无限重连循环 + 内层 turns 决策。
 
@@ -263,7 +303,7 @@ def run_loop(
     session = 0
 
     logger.info(
-        "启动战术「均衡扩张+防守」 %s max_pop=%s workers=%s vanguards=%s rangers=%s max_turns=%s",
+        "启动战术「资源优先+均衡防守」 %s max_pop=%s workers=%s vanguards=%s rangers=%s max_turns=%s",
         mask_api_key(api_key),
         config.max_population,
         config.target_workers,
@@ -271,6 +311,42 @@ def run_loop(
         config.target_rangers,
         max_turns if max_turns is not None else "∞",
     )
+
+    # --- P3-1 SDK 版本自检（>=0.2.9,<0.3） ---
+    try:
+        from importlib.metadata import version
+        v = version("arena-hero")
+    except Exception:
+        v = "0.0.0"
+    try:
+        parts = v.split(".")
+        major = int(parts[0])
+        minor = int(parts[1])
+        patch = int(parts[2]) if len(parts) >= 3 else 0
+        ok = (major == 0 and minor == 2 and patch >= 9)
+        if not ok:
+            raise RuntimeError(f"version {v}")
+    except Exception as e:
+        logger.error(f"SDK 版本检查失败（要求 >=0.2.9,<0.3）: {e}")
+        raise SystemExit(1)
+
+    dashboard_push = None
+    if dashboard_enabled:
+        import importlib as _il
+        _db = _il.import_module('bot.dashboard')
+        get_store = _db.get_store
+        start_dashboard_server = _db.start_dashboard_server
+        DashboardLogHandler = _db.DashboardLogHandler
+        start_dashboard_server(
+            host='127.0.0.1', port=dashboard_port,
+            store=get_store(),
+            logger=dashboard_logger or logger
+        )
+        _handler = DashboardLogHandler(level=logging.DEBUG)
+        logging.getLogger("arena_hero_tactic").addHandler(_handler)
+        logging.getLogger().addHandler(_handler)
+        # 直接注入回调，避免依赖模块全局（run_session 通过参数接收，零污染）
+        dashboard_push = _db.safe_push_snapshot
 
     while True:
         session += 1
@@ -282,6 +358,7 @@ def run_loop(
                 base_url=base_url,
                 max_turns=max_turns,
                 turns_done=turn_count,
+                dashboard_push=dashboard_push,
             )
             if stop_for_max:
                 break
@@ -365,6 +442,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         metavar="PATH",
         help="同时写入文件日志，例如 logs/agent.log",
     )
+    parser.add_argument('--dashboard', action='store_true', default=False,
+                        help='启动本地 Dashboard Web UI (localhost)，需 pip install flask>=3.0')
+    parser.add_argument('--dashboard-port', type=int, default=8765,
+                        help='Dashboard 监听端口（默认 8765）')
     return parser.parse_args(argv)
 
 
@@ -380,11 +461,14 @@ def main(argv: Optional[list[str]] = None) -> None:
         logger.info("使用自定义 base_url=%s", base_url)
 
     try:
-        run_loop(
+        turns = run_loop(
             api_key=api_key,
             config=DEFAULT_CONFIG,
             base_url=base_url,
             max_turns=args.max_turns,
+            dashboard_enabled=args.dashboard,
+            dashboard_port=args.dashboard_port,
+            dashboard_logger=logger,
         )
     except KeyboardInterrupt:
         logger.info("用户中断，退出码 0")

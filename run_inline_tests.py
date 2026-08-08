@@ -42,6 +42,7 @@ config = TacticConfig(
     retreat_adjacent=1,
     retreat_radius=3,
     reserve_resources=2,
+    early_game_pop=4,  # 内联测固定：pop<4 reserve=0
 )
 
 passed = 0
@@ -120,7 +121,12 @@ def main() -> int:
         + DEFAULT_CONFIG.target_vanguards
         + DEFAULT_CONFIG.target_rangers
     )
-    check("default_pop", total_target < 20)
+    # 混合高效：12+4+4=20 用满基础价区间（允许 == max）
+    check(
+        "default_pop",
+        total_target == 20 and DEFAULT_CONFIG.max_population == 20,
+        f"total={total_target} max={DEFAULT_CONFIG.max_population}",
+    )
 
     print("=== economy ===")
     turn = StubTurn(
@@ -760,7 +766,13 @@ def main() -> int:
 
     _sp2.clear()
     _lmd2.clear()
-    _cfg_b = TacticConfig(recall_stall_ticks=2, sector_count=2)
+    # 单测 2 Worker：放宽 min_workers；近距 chase 允许 dedicated
+    _cfg_b = TacticConfig(
+        recall_stall_ticks=2,
+        sector_count=2,
+        beacon_min_workers=1,
+        beacon_max_chase=200,
+    )
     _sb2(_cfg_b, (50, 10))
     # widx==0（专职 Beacon）置于四向障碍陷阱 → 首 tick 即 beacon_obstacle
     _w_a = StubUnit(position=(20, 10), cargo=0, unit_type="WORKER")

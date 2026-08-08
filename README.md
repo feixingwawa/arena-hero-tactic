@@ -1,48 +1,72 @@
-# Arena Hero 战术框架 —「均衡扩张 + 防守」
+# Arena Hero 战术框架 —「资源优先 + 均衡防守」
 
-面向 [Arena Hero](https://doc.arenahero.io/) 的**可长期运行** Python 战术客户端。  
+面向 [Arena Hero](https://doc.arenahero.io/zh-Hans/) 的**可长期运行** Python 战术客户端。  
 基于官方 SDK [`arena-hero`](https://pypi.org/project/arena-hero/)，你掌控游戏循环；本仓库只做决策。
 
-> 社区战术示例，非官方客户端。仓库内**不包含**任何真实 API Key。
+> 社区战术示例，非官方客户端。仓库内**不包含**任何真实 API Key。  
+> 规则基准：**玩法 v0.14** · API v0.1 · **SDK ≥ 0.2.9**（0.2.8 会 ProtocolError）。
+
+## 游戏一句话
+
+共享永久网格世界；Agent 每 Tick 看私有视野、交一份 15 秒窗口内的计划。  
+**没有官方通关**——有效目标是 Core 存活、资源正循环、编制扩张；Champion Beacon 是可选双倍采集乘数。
+
+详细理解见：[`docs/GAME_UNDERSTANDING.md`](docs/GAME_UNDERSTANDING.md)
+战术原则（对齐 [Drew-Z](https://github.com/Drew-Z/arena-hero-agent)）见：[`docs/STRATEGY.md`](docs/STRATEGY.md)
+
+### v2 升级速览
+
+本次 v2 围绕「**经济更快正循环 + 更早满编 20 + 探索不空转 + 工人智能分工 + 真实朝 Beacon 推进**」做了 5 大升级：
+
+| 升级项 | 要点 |
+|--------|------|
+| 🚀 **阈值型 12W/4V/4R 爬坡** | W 达 3/6/9/12 → 插排 V/R，节奏明确不返工 |
+| 🧠 **矿点智能调度** | Worker 满载发现矿时，含障碍寻路估算对比「自采往返」vs「派最近空闲」，执行更短路径 |
+| 🌀 **双中心螺旋探索** | 内环（d≤24）Core 中心螺旋 → 环爆到上限自动切相位→ **Beacon 导向外环推进**（不再小范围死循环）|
+| 🧱 **障碍历史主动避障** | 同方向 ≥3 次被挡评分 -100，**避开"老堵墙"** 节省空转 tick |
+| 🔎 **P1-P3 观测性** | Core 迁徙评估/守环分散/陈旧回访/火力 ledger/SDK 版本自检/经济健康 stall 诊断 |
+
+离线测试：**154 passed**（115 旧 + 39 新增）。
 
 ## 战术目标
 
 | 阶段 | 行为 |
 |------|------|
-| 早期 | 优先生产 Worker，采集与交付，快速攒资源 |
-| 中期 | 维持经济，同时生产少量 Vanguard / Ranger 做周边防守 |
-| 全程 | Core 周边形成防守圈；有威胁时优先防守/反击，再考虑扩张 |
-| 人口 | 默认压在 18 以下，**upkeep = 0**，避免维护费自杀式膨胀 |
-| 生存 | Core / 单位低血时有条件治疗、修盾 |
+| 早期 | 优先生产 Worker，VISIBLE 采集 → deposit，打通经济 |
+| 中期 | 向 **12 Worker + 若干 Vanguard/Ranger** 满编（建议总 pop≤20） |
+| 全程 | Core 周边防守；威胁时撤退/反击优先于扩张 |
+| Beacon | **最多 1 名 dedicated** 侦察；远距放弃；Core 不宜追信标 |
+| 生存 | Core/单位低血有条件 heal、修盾；v0.14 **无维护费** |
+| 监控指标 | 用户目标：Core 库存 **resources ≥ 100** |
 
 ## 项目结构
 
 ```
 arena-hero-tactic/
   README.md
-  pyproject.toml
-  requirements.txt
-  .env.example
+  docs/
+    GAME_UNDERSTANDING.md   # 游戏怎么运行 / 目标 / Agent 职责
+    STRATEGY.md             # 战术原则与 Drew-Z 对照
+    system_design*.md       # 架构与探索设计
   bot/
-    __init__.py
-    main.py         # 入口：读 Key → 连接 → turns 循环
-    config.py       # 战术参数
-    strategy.py     # decide(turn) 主策略
-    economy.py      # 采集/交付/生产/维护费
-    combat.py       # 威胁、防守圈、sweep/shoot、治疗
-    pathing.py      # 曼哈顿移动、环位、射程判定
-    roles.py        # harvester/guard/retreat/heal 角色分配
+    main.py         # 入口：Key → 连接 → turns 循环
+    config.py       # TacticConfig
+    strategy.py     # decide(turn)
+    economy.py      # 采集/交付/生产/螺旋探索
+    combat.py       # 威胁、防守圈、sweep/shoot
+    pathing.py      # 防抖步进、螺旋、beacon 目标
+    memory.py       # 资源/障碍/chunk 记忆
+    roles.py        # 角色分配
+    rules.py        # 动态单位价 / 容量 / chunk 配额
   tests/
-    conftest.py     # 离线 Turn/Unit stub
-    test_economy.py
-    test_combat.py
-    test_strategy.py
+  deliverables/
 ```
 
 ## 环境要求
 
 - Python **3.11+**
-- 依赖：`arena-hero`（运行时）、`python-dotenv`（可选）、`pytest`（测试）
+- `arena-hero>=0.2.9,<0.3`、`python-dotenv`（可选）、`pytest`（测试）
+- **SDK 版本自检（v2 P3-1）**：启动时 `main.run_loop` 会强制校验 arena-hero 版本 ≥ 0.2.9 且 < 0.3；不满足直接 `SystemExit(1)`，避免 `ProtocolError` 到线上才报错
 
 ## 安装
 
@@ -58,133 +82,139 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-开发/测试额外依赖已包含在 `requirements.txt` 的 pytest 中。
-
 ## 配置 API Key
-
-1. 复制环境变量模板：
 
 ```bash
 copy .env.example .env          # Windows
 # cp .env.example .env          # Unix
 ```
 
-2. 编辑 `.env`，填入你的 Key：
+编辑 `.env`：
 
 ```
 ARENA_HERO_API_KEY=你的_API_KEY
 ```
 
-3. **不要**把 `.env` 或真实 Key 提交到 Git。
-
-也可直接设置环境变量（优先级高于 `.env`）：
-
-```bash
-set ARENA_HERO_API_KEY=你的_API_KEY          # Windows CMD
-# export ARENA_HERO_API_KEY=你的_API_KEY    # Unix
-```
+**不要**把 `.env` 或真实 Key 提交到 Git。
 
 ## 启动
 
 ```bash
 python -m bot.main
+python -m bot.main -v --log-file logs/agent.log
+python -m bot.main --max-turns 50
 ```
 
-常用参数：
-
-```bash
-python -m bot.main -v                 # 调试日志（打印每单位动作）
-python -m bot.main --max-turns 50     # 只跑 50 个 turn 后退出
-```
-
-程序会在每个 Tick 收到 `state` 后尽快调用 `decide(turn)` 并 `turn.submit()`。  
-官方命令窗口约 15 秒，请保持决策轻量。
+每个 Tick 收到 `state` 后尽快 `decide(turn)` 并 `turn.submit()`。命令窗口约 15 秒，决策须轻量。
 
 ## 战术逻辑摘要
 
-### 生产优先级（Core 空闲时）
+### 生产优先级（Core 空闲且非危急治疗）
 
-1. Worker 数量 < 目标 → `spawn WORKER`
-2. 有可见威胁且战斗单位不足 → `spawn VANGUARD`（近防、更便宜）或 `RANGER`（远距）
-3. 和平期补齐目标 Vanguard / Ranger
-4. 资源不足以保留应急储备 → 跳过 spawn
-5. 人口接近 20 / 已有 upkeep → 停止常规扩军（严重零防除外）
+1. Worker < 目标 → `spawn WORKER`（动态价格）
+2. 可见威胁且战斗单位不足 → `VANGUARD` / `RANGER`
+3. 和平期补齐目标战斗单位
+4. 资源不足应急储备 → 跳过 spawn
+5. 人口触及 `max_population` → 停扩
 
 ### Worker
 
 - 有 cargo → 优先回 Core `deposit`
-- 站在 `resource_cells` → `harvest`
-- 否则走向最近可见资源（目标去重）
-- 附近有敌人 → 撤退向 Core；低血 → 回城 `heal`
+- 站在可见 `resource_cells` → `harvest`
+- **矿点智能调度（v2）**：
+  - 空载发现矿 → 直接采集（与 v1 相同）
+  - **满载发现矿** → 用 `estimate_path_steps`（**含障碍寻路估算**）精确对比：
+    - 选项 A「自采往返」= 送回 Core → 再回矿 的总步数
+    - 选项 B「派最近空闲 Worker」= 其他 idle Worker 到矿 → 回 Core 的最短步数
+    - 选更短的：A 胜 → 写入预约（送完 cargo 下一 tick 优先返程采）；B 胜 → 立刻指派最优 idle Worker
+    - 预约 TTL 16 tick；RETREAT/HEAL 角色立刻释放
+- **双中心螺旋探索（v2，修复不再小范围循环）**：
+  - 内环：距 Core ≤ 24 格 → Core 中心螺旋，扇区分散 + 跳过已探 chunk
+  - 环推进到上限后 **自动切 Beacon 相位** → 外环以 Beacon 为中心螺旋，不再回退到内环（v2 关键 bugfix）
+  - 距离 Beacon 太远（>64）或工人不足（<3）→ 守门不追，防止饿死经济
+- **历史障碍主动避障（v2）**：寻路时若某邻格历史被挡 ≥3 次 → 评分 -100 主动绕开；1-2 次 -30 降权
+- 附近敌人 → 向 Core 撤退；低血 → 回城 heal
 
-### Vanguard
+### Vanguard / Ranger
 
-- 邻格敌人 → `sweep` 该方向
-- 有近威胁 → 有限距离拦截
-- 否则驻守 Core 周边 `DEFENSE_RADIUS` 环
-
-### Ranger
-
-- 射程内（直线/斜线 1–3 格）→ `shoot` / `shoot_cell`
-- 否则驻守稍外圈 `RANGER_RADIUS`
+- 邻格 / 射程内攻击；否则驻守 Core 防守环
+- **守环位分散（v2 P1-2）**：多单位同相位 slot 冲突时，+1 偏移避让，不再堆同格堵 Core 入口
+- Ranger 射击：**火力 ledger 轻量（v2 P2-2）**，预计伤害已满 HP 的目标跳过，避免 overkill（日志 `shoot_avoid_overkill`）
 
 ### Core
 
-- HP / 盾过低且有资源 → `heal` / `repair_shield`（战斗后结算，可预排）
-- 否则按生产优先级 `spawn`
-- 默认**不** `start_move`（防守型静止）
+- HP/盾过低 → `heal` / `repair_shield`（战斗后结算，可预排）
+- 否则按**阈值型生产节奏（v2）** `spawn`：W=3→V；W=6→V+R；W=9→V+R；W=12→V+R+R；达到 12/4/4 停扩
+- **Core 迁徙评估（v2 P1-1 日志-only）**：邻格敌且 Core HP≤3 / Beacon 距 Core≤4 时，写入评估日志但**不真正 start_move**（避免移动 bug）
+- 默认不主动追 Beacon；未来可对齐 Drew-Z「远离信标迁徙」
 
-## 默认参数（`bot/config.py`）
+## 默认参数（`bot/config.py`，以代码为准）
 
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `MAX_POPULATION` | 18 | 硬人口上限 |
-| `TARGET_WORKERS` | 12 | 目标工人 |
-| `TARGET_VANGUARDS` | 3 | 目标先锋 |
-| `TARGET_RANGERS` | 2 | 目标游侠 |
-| `DEFENSE_RADIUS` | 3 | 先锋防守环 |
-| `RANGER_RADIUS` | 4 | 游侠防守环 |
-| `THREAT_RADIUS` | 8 | 威胁判定半径 |
-| `RETREAT_RADIUS` | 4 | 工人遇敌撤退半径 |
-| `RESERVE_RESOURCES` | 2 | spawn 前预留资源 |
-| Core 治疗阈值 | HP≤3 / 盾≤2 | 优先占用 Core 动作 |
+| 参数 | 典型默认 | 说明 |
+|------|----------|------|
+| `max_population` | **20** | 基础价满编硬顶 |
+| `target_workers` | **12** | 目标工人 |
+| `target_vanguards` | **4** | 目标先锋 |
+| `target_rangers` | **4** | 目标游侠 |
+| `spiral_base_ring` | 3 | 本地螺旋起始环 |
+| `spiral_max_ring` | **24** | 本地螺旋上限（收紧空转） |
+| `sector_count` | **4** | Worker 扇区分散 |
+| `beacon_max_chase` | **64** | 超距不追 Beacon |
+| `beacon_min_workers` | **3** | 早期全员采，够人再 1 人侦察 |
+| `recall_stall_ticks` | 6 | 无进展软回撤 |
+| `retreat_adjacent` | 1 | 空货贴身才撤 |
+| `retreat_radius` | 3 | 满货保护半径 |
+| `beacon_step_radius` | 8 | Beacon 阶段步距 |
+| `CHUNK_SIZE` | **16** | 地图块尺寸（MemoryMap explored 标记粒度；v2 从 32 → 16，切 chunk 更频密）|
+| `refresh_interval_ticks` | 4 | 资源回补节拍 / 陈旧 chunk 回访基准（陈旧阈值 = refresh_interval * 50 ≈ 200 tick）|
 
-调参：直接改 `bot/config.py` 中 `TacticConfig` 默认值，或在代码里构造新配置传给 `decide(turn, config=...)`。
+调参：改 `TacticConfig` 或 `decide(turn, config=...)`。
 
-**建议：** 总编制保持 `< 20`，这样 `upkeep = 0`（官方：`tier = floor(pop/20)`）。
+**建议：** 总编制保持 **≤20**，用满 v0.14 基础价格区间；第 21 个单位开始动态涨价。
+
+> **生产节奏（v2）**：Worker 达 3/6/9/12 阈值时按序插排 VANGUARD 与 RANGER，最终目标 12W / 4V / 4R（基础价满编 20）。
+
+## 官方规则速查（v0.14）
+
+- 命令窗口 **15s**；每对象每 tick **一个**动作
+- **无**每 tick 维护费；动态价：`k=max(0,floor((pop-20)/5)+1)`，`price≈base×1.3^k`
+- 基础价（pop 0–19）：Worker **5** / Vanguard **10** / Ranger **12**
+- 资源：每 4 resolved tick 按 chunk 配额补点；持 Beacon 时 harvest ×2
+- 结算顺序要点：移动 → harvest/deposit → 战斗 → heal → spawn
+- Beacon：坐标公开；SDK `status=None` 视为地面可追踪
+
+更多：[游戏规则](https://doc.arenahero.io/zh-Hans/rules/world-and-ticks) · [规则速查](https://doc.arenahero.io/zh-Hans/reference/numbers) · [Python SDK](https://doc.arenahero.io/zh-Hans/sdk/quickstart)
 
 ## 离线测试
 
-决策与网络解耦，使用 stub Turn 即可单测：
-
 ```bash
-pytest -q
+pytest -q          # 154 passed / 0 failed (截至 v2)
+pytest tests/test_pathing.py tests/test_economy.py -v   # 定向测探索 + 经济
 ```
-
-关键入口：
 
 ```python
 from bot.strategy import decide
-
-result = decide(turn)   # 只排队动作，不 submit
+result = decide(turn)   # 只排队，不 submit
 print(result.summary())
 ```
 
-## 官方规则速查（v0.13）
-
-- 命令窗口 15 秒；每个 unit/core 每 tick **一个**动作，后写覆盖前写
-- 结算顺序要点：自毁 → 维护费 → 移动 → 采集交付 → 战斗 → 治疗 → spawn
-- Worker 成本 3 / Vanguard 10 / Ranger 12
-- 维护费：`upkeep = tier*(tier+1)/2`，`tier = floor(pop/20)`
-- 欠费伤害超额单位（最近 19 个保护），不伤 Core
-
-更多：[游戏规则](https://doc.arenahero.io/) · [Python SDK](https://doc.arenahero.io/sdk/quickstart)
+**观测性验证（v2 专用）**：用仓库内 `deliverables/short_v2_sim.py` 跑 stub 150–400 tick，`logs/short_v2.log` 中 grep 检查：
+- `core:spawn:WORKER / VANGUARD / RANGER` → 阈值节奏正确
+- `dispatch:option=self / option=other` → 矿点调度生效
+- `:ring=`（内环）与 `phase=beacon`（外环）同时出现 → 双中心切换正常
+- `new_chunk=` → 探索在推进；`pickup_beacon=` → 已实际到 Beacon
+- `ERROR` / `ProtocolError` = 0
 
 ## 设计说明
 
-- **I/O 分离**：`strategy.decide` 可纯函数式测试；`main` 只负责连接与 `submit`
-- **类型友好**：核心数据结构用 `dataclass`；对 SDK 对象用 duck-typing，便于 stub
-- **失败安全**：单 turn 异常会打日志并尝试空提交，避免卡死循环
+- **I/O 分离**：`strategy.decide` 可纯测；`main` 只连接与 submit
+- **地图记忆**：进程内 `MemoryMap`，服务端不回放历史；含资源/障碍/chunk 三维 + chunk_last_seen 陈旧判定（200 tick）
+- **防抖寻路**：`clamp_step_toward_memo` 避免障碍对抖；v2 **叠加历史障碍降权**（≥3 次被挡 -100）
+- **路径估算（v2）**：`estimate_path_steps` dry-run 寻路，只用于矿点调度相对排序，不改变真实状态
+- **阈值生产（v2）**：`choose_spawn` 按 3/6/9/12 四档阈值插排 V/R，终态 12/4/4 基础价满编 20
+- **双中心螺旋（v2）**：`dual_spiral_target` 内环 Core + 外环 Beacon，环爆后自动切相位，**不再回退到内环小范围死循环**
+- **经济健康（v2 P3-2）**：连续 50 tick 无 deposit → 打结构化预警日志，回 40 防刷屏；256 tick GC 死亡 Worker 相关模块字典 4 个
+- **失败安全**：单 turn 异常记日志并尽量不卡死循环
 
 ## License
 

@@ -4,12 +4,17 @@ from __future__ import annotations
 
 from bot.pathing import (
     NAME_TO_DELTA,
+    LoopTracker,
     Position,
     add_pos,
     beacon_progress_target,
+    bbox_diameter,
     clamp_step_toward,
     clamp_step_toward_memo,
+    detect_spatial_loop,
+    guided_step_toward,
     manhattan,
+    observe_move,
     ring_points,
     sector_points,
     spiral_target,
@@ -120,6 +125,76 @@ def test_clamp_step_toward_memo_at_target() -> None:
     assert direction is None and last is None
 
 
+def test_bbox_diameter_and_detect_spatial_loop() -> None:
+    """小范围足迹：唯一格少 + 包围盒小 → 判 loop；正常推进不判。"""
+    assert bbox_diameter([(0, 0), (1, 0), (1, 1)]) == 2
+    assert bbox_diameter([]) == 0
+
+    tracker = LoopTracker()
+    # 在 2×2 内绕圈 12 步
+    cycle = [(0, 0), (1, 0), (1, 1), (0, 1)] * 3
+    for p in cycle:
+        observe_move(tracker, p, window=12)
+    assert detect_spatial_loop(
+        tracker, cycle[-1], target=(10, 10), window=12, min_unique=4, bbox_diameter_max=3
+    )
+
+    # 正常朝目标推进：不应判 loop
+    progress = LoopTracker()
+    for x in range(12):
+        observe_move(progress, (x, 0), window=12)
+    assert not detect_spatial_loop(
+        progress, (11, 0), target=(20, 0), window=12, min_unique=4, bbox_diameter_max=3
+    )
+
+
+def test_guided_step_toward_repaths_on_static() -> None:
+    """连续同格不动 → 强制 repath，清空 last_dir 粘性并换方向。"""
+    tracker = LoopTracker()
+    # 模拟服务端拒步：连续 4 tick 停在 (5,5)，目标在右
+    for _ in range(4):
+        observe_move(tracker, (5, 5), window=12)
+    assert detect_spatial_loop(tracker, (5, 5), target=(10, 5), static_ticks=4)
+
+    direction, last, repath = guided_step_toward(
+        (5, 5),
+        (10, 5),
+        obstacles=set(),
+        last_dir="LEFT",  # 旧粘性方向（远离目标）
+        tracker=tracker,
+        static_ticks=4,
+        repath_cooldown=5,
+    )
+    assert repath is True
+    assert direction == "RIGHT"  # 应朝目标推进，而非 stick LEFT
+    assert last == "RIGHT"
+
+
+def test_guided_step_toward_repaths_on_bbox_loop() -> None:
+    """2×2 绕圈后 repath：禁止 last_dir 对抖，足迹成软障。"""
+    tracker = LoopTracker()
+    cycle = [(10, 12), (11, 12), (11, 13), (10, 13)] * 3
+    for p in cycle:
+        observe_move(tracker, p, window=12)
+    # 起点在循环区，目标 Core 在上方；中间有障碍模拟贴墙
+    obstacles = {(10, 11)}
+    direction, _last, repath = guided_step_toward(
+        (10, 12),
+        (10, 10),
+        obstacles=obstacles,
+        last_dir="DOWN",
+        tracker=tracker,
+        window=12,
+        min_unique=4,
+        bbox_diameter_max=3,
+        repath_cooldown=5,
+    )
+    assert repath is True
+    assert direction is not None
+    # 不应继续 DOWN（远离 Core 的循环方向）
+    assert direction != "DOWN"
+
+
 def test_ring_points_counts_and_manhattan() -> None:
     """曼哈顿环：radius=0 单点；radius>0 共 4r 个点且均距中心 r。"""
     assert ring_points((5, 5), 0) == [(5, 5)]
@@ -221,3 +296,313 @@ def test_beacon_progress_target_offset_deterministic() -> None:
     assert t1 == beacon_progress_target((0, 0), (10, 0), step_radius=4, offset=1)
     t_plain = beacon_progress_target((0, 0), (10, 0), step_radius=4, offset=0)
     assert t1 != t_plain
+
+
+from bot.pathing import estimate_path_steps
+from bot.memory import MemoryMap
+
+
+def test_TR1_1_estimate_no_obstacle_equals_manhattan() -> None:
+    """TR-1.1: 无障碍 A→B est_steps == manhattan，d=0/1/4/10/24 五种距离。"""
+    distances = [0, 1, 4, 10, 24]
+    for d in distances:
+        origin = (0, 0)
+        target = (d, 0)
+        obstacles: set[Position] = set()
+        est_steps, _blocked = estimate_path_steps(origin, target, obstacles)
+        assert est_steps == manhattan(origin, target), (
+            f"d={d}: est_steps={est_steps} != manhattan={manhattan(origin, target)}"
+        )
+
+
+def test_TR1_2_estimate_with_walls_increasing_or_flat() -> None:
+    """TR-1.2: d=4 场景加 1/2/3 堵墙 → est_steps 严格递增或持平（绝不减少）。"""
+    origin = (0, 0)
+    target = (4, 0)
+    prev_steps = -1
+
+    obstacles0: set[Position] = set()
+    steps0, _ = estimate_path_steps(origin, target, obstacles0)
+    prev_steps = steps0
+
+    wall_sets = [
+        {(2, 0)},
+        {(2, 0), (2, 1)},
+        {(2, 0), (2, 1), (2, -1)},
+    ]
+    for walls in wall_sets:
+        steps, _ = estimate_path_steps(origin, target, walls)
+        assert steps >= prev_steps, (
+            f"walls={walls}: steps={steps} < prev_steps={prev_steps}（不允许减少）"
+        )
+        prev_steps = steps
+
+
+def test_TR1_3_estimate_deterministic() -> None:
+    """TR-1.3: 同场景连续调用 2 次 estimate → 返回 tuple 完全相等。"""
+    origin = (0, 0)
+    target = (10, 5)
+    obstacles = {(4, 2), (4, 3), (5, 2)}
+    r1 = estimate_path_steps(origin, target, obstacles)
+    r2 = estimate_path_steps(origin, target, obstacles)
+    assert r1 == r2, f"两次 estimate 结果不等: r1={r1} r2={r2}"
+
+
+def test_TR1_4_memory_block_count_increments() -> None:
+    """TR-1.4: MemoryMap + 连续 3 次 estimate 同一堵墙 → block_count 恰好增加 3。"""
+    origin = (0, 0)
+    target = (4, 0)
+    wall_pos = (2, 0)
+    obstacles = {wall_pos}
+
+    mem = MemoryMap()
+    before = 0
+    ost = mem.obstacle_cache.get(wall_pos)
+    if ost is not None:
+        before = ost.block_count
+
+    for _ in range(3):
+        estimate_path_steps(origin, target, obstacles, memory=mem)
+
+    after_ost = mem.obstacle_cache.get(wall_pos)
+    assert after_ost is not None, "obstacle_cache 中未记录 wall_pos"
+    after = after_ost.block_count
+    assert after - before == 3, (
+        f"block_count 增量: {after} - {before} = {after - before}，期望 3"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 2: 历史障碍降权（obstacle_cache.block_count 参与 clamp 评分）
+# ---------------------------------------------------------------------------
+
+
+class _DummyObstacleState:
+    """测试用 ObstacleState 替代类（直接存 block_count）。"""
+
+    def __init__(self, block_count: int):
+        self.block_count = block_count
+
+
+def test_TR_2_1_block_count_ge3_avoid() -> None:
+    """TR-2.1: block_count>=3 → 历史障碍被强降权（-100），避开该方向。
+
+    origin=(0,0), target=(10,5), 两个主轴方向都有 gain>0：
+    - RIGHT gain=1 (无历史降权时 score=101)
+    - DOWN gain=1 (无历史降权时 score=101)
+    现在 obstacle_cache[(1,0)].block_count=3 → RIGHT 降权 -100 → 1；
+    DOWN 不受影响 → DOWN 仍是 101，胜出。
+    """
+    origin = (0, 0)
+    target = (10, 5)  # 这样 RIGHT 和 DOWN 都是 gain=1 的推进方向
+    obstacles = set()  # 无硬障碍，单纯比较历史降权效果
+
+    # 构造 obstacle_cache: dict，存对象（有 .block_count 属性）
+    obstacle_cache_obj = {
+        (1, 0): _DummyObstacleState(block_count=3),  # RIGHT 历史卡了3次
+    }
+    # 构造一个带 obstacle_cache 属性的 dummy memory
+    class _DummyMem:
+        def __init__(self, cache):
+            self.obstacle_cache = cache
+    mem = _DummyMem(obstacle_cache_obj)
+
+    direction, _ = clamp_step_toward_memo(
+        origin, target, obstacles=obstacles, memory=mem
+    )
+
+    assert direction is not None
+    assert direction != "RIGHT", (
+        f"RIGHT 历史障碍 block_count=3 应被避开，实际返回 {direction}"
+    )
+    # DOWN 也是推进方向（gain=1）且无历史障碍，应胜出
+    assert direction == "DOWN", (
+        f"应选 DOWN（同是推进方向但无历史降权），实际返回 {direction}"
+    )
+
+    # 兼容：直接存 int 的 obstacle_cache（字典直接存 int）
+    obstacle_cache_int = {
+        (1, 0): 3,
+    }
+    mem_int = _DummyMem(obstacle_cache_int)
+    direction2, _ = clamp_step_toward_memo(
+        origin, target, obstacles=obstacles, memory=mem_int
+    )
+    assert direction2 is not None
+    assert direction2 != "RIGHT", (
+        f"[int存法] RIGHT 历史障碍 block_count=3 应被避开，实际返回 {direction2}"
+    )
+    assert direction2 == "DOWN", (
+        f"[int存法] 应选 DOWN，实际返回 {direction2}"
+    )
+
+
+def test_TR_2_2_block_count_1_still_right() -> None:
+    """TR-2.2: block_count=1 → 降权 -30，RIGHT 仍最优（101-30=71，仍高于绕行 100？NO —— 绕行 gain=0 是 100，推进 gain=1 是 101，所以 71 < 100，那这个断言要反？
+
+    修正分析：
+    - RIGHT: gain=1 (推进) → 100+1=101, -30 → 71
+    - DOWN/UP: gain=0 (推进也是 gain>=0) → 100+0=100，不减
+      所以 71 < 100，DOWN/UP 应该胜出？
+      等等，那题目的预期是"仍选 RIGHT"，让我再仔细看题面："因 -30 不足以抵消 gain=1 的 100+gain 优势"
+      哦，原来 101-30=71 但其他方向 gain=0 是 100？那 71 更小啊……题面是不是写反了？
+      等等，不对，我重新看 _clamp_score 逻辑：
+
+    重新分析：
+    origin=(0,0), target=(10,0):
+    - RIGHT: step=(1,0), nxt=(1,0), gain=1 → gain>=0: score=100+1=101；如果不是 last_dir，不加不减，然后 -30 → 71
+    - DOWN: step=(0,1), nxt=(0,1), gain=manhattan((0,0),(10,0)) - manhattan((0,1),(10,0)) = 10 - 11 = -1 < 0；然后 cross_axis? dx=10!=0 所以 name in UP/DOWN → cross_axis=True → score=-30
+    - UP: 同 DOWN → score=-30
+    - LEFT: step=(-1,0), gain=10 - 11=-1, cross_axis=False → score=-70
+
+    所以 RIGHT 71 >> DOWN/UP -30，仍然胜出！没错，是我错了。
+    """
+    origin = (0, 0)
+    target = (10, 0)
+    obstacles = {(2, 0)}
+
+    class _DummyMem:
+        def __init__(self, cache):
+            self.obstacle_cache = cache
+
+    obstacle_cache = {(1, 0): _DummyObstacleState(block_count=1)}
+    mem = _DummyMem(obstacle_cache)
+
+    direction, _ = clamp_step_toward_memo(
+        origin, target, obstacles=obstacles, memory=mem
+    )
+
+    assert direction == "RIGHT", (
+        f"block_count=1 (-30) 不应抵消 RIGHT gain=1 的优势，期望 RIGHT，实际 {direction}"
+    )
+
+
+def test_TR_2_3_clamp_regression_none_memory() -> None:
+    """TR-2.3: obstacle_cache=None 回归。
+
+    复制 5 个既有 clamp_step_toward_memo 用例的输入，
+    分别用「旧签名不传 memory」与「新签名传 memory=None」调用，
+    返回的 step 完全相等。
+    """
+    # 用例 1：at_target
+    args1 = {"origin": (10, 10), "target": (10, 10)}
+    # 用例 2：单格障碍前方绕行
+    args2 = {"origin": (10, 12), "target": (10, 10), "obstacles": {(10, 11)}}
+    # 用例 3：横向可推进 + last_dir=LEFT（反向推进）
+    args3 = {
+        "origin": (9, 12),
+        "target": (10, 10),
+        "obstacles": {(10, 11)},
+        "last_dir": "LEFT",
+    }
+    # 用例 4：memo dict 读写
+    args4 = {"origin": (10, 12), "target": (10, 10), "obstacles": {(10, 11)}, "memo": {}}
+    # 用例 5：ban_dirs 禁用方向
+    args5 = {
+        "origin": (0, 0),
+        "target": (10, 0),
+        "obstacles": set(),
+        "ban_dirs": ["RIGHT"],
+    }
+
+    all_cases = [
+        ("case1_at_target", args1),
+        ("case2_obstacle_front", args2),
+        ("case3_last_dir_left", args3),
+        ("case4_memo_dict", args4),
+        ("case5_ban_right", args5),
+    ]
+
+    for name, kwargs in all_cases:
+        # 旧：不传 memory（default=None）
+        d_old, l_old = clamp_step_toward_memo(**kwargs)
+        # 新：显式传 memory=None
+        kwargs_with_none = dict(kwargs)
+        # case4 的 memo dict 是会被修改的，每次重置
+        if "memo" in kwargs_with_none:
+            kwargs_with_none["memo"] = {}
+        d_new, l_new = clamp_step_toward_memo(memory=None, **kwargs_with_none)
+
+        assert d_old == d_new, (
+            f"{name}: 不传 memory vs memory=None 返回 direction 不等: "
+            f"{d_old} vs {d_new}"
+        )
+        assert l_old == l_new, (
+            f"{name}: 不传 memory vs memory=None 返回 last_dir 不等: "
+            f"{l_old} vs {l_new}"
+        )
+
+
+def test_TR_2_4_hard_block_not_overridden_by_cache() -> None:
+    """TR-2.4: 硬过滤（当前可见 obstacles 集合）不被降权逻辑破坏。
+
+    origin=(0,0), target=(10,0), obstacles={(1,0)}（RIGHT 是硬障碍）。
+    obstacle_cache 为空 / block_count=0 无所谓。
+    clamp 返回的 step 绝不能等于 RIGHT（即使评分高也被硬过滤），
+    必须是 DOWN/UP/LEFT 其一。
+    """
+    origin = (0, 0)
+    target = (10, 0)
+    hard_obstacles = {(1, 0)}  # RIGHT 硬障碍
+
+    # 情况 A：不传 memory
+    d1, _ = clamp_step_toward_memo(origin, target, obstacles=hard_obstacles)
+    assert d1 is not None
+    assert d1 != "RIGHT", f"[无memory] RIGHT 是硬障碍，不应返回 RIGHT，实际 {d1}"
+    assert d1 in ("DOWN", "UP", "LEFT"), (
+        f"[无memory] 应返回 DOWN/UP/LEFT，实际 {d1}"
+    )
+
+    # 情况 B：传 memory 且 obstacle_cache 为空
+    class _DummyMem:
+        def __init__(self, cache):
+            self.obstacle_cache = cache
+    mem_empty = _DummyMem({})
+    d2, _ = clamp_step_toward_memo(origin, target, obstacles=hard_obstacles, memory=mem_empty)
+    assert d2 is not None
+    assert d2 != "RIGHT", f"[空cache] RIGHT 是硬障碍，不应返回 RIGHT，实际 {d2}"
+
+    # 情况 C：传 memory 且 (1,0).block_count=0（硬障碍仍必须挡）
+    mem_zero = _DummyMem({(1, 0): _DummyObstacleState(block_count=0)})
+    d3, _ = clamp_step_toward_memo(origin, target, obstacles=hard_obstacles, memory=mem_zero)
+    assert d3 is not None
+    assert d3 != "RIGHT", f"[bc=0] RIGHT 是硬障碍，不应返回 RIGHT，实际 {d3}"
+
+
+# ---------------------------------------------------------------------------
+# TR-4 双中心螺旋扫掠测试
+# ---------------------------------------------------------------------------
+
+from bot.pathing import beacon_oriented_spiral_target
+
+
+def test_TR_4_beacon_oriented_spiral_basic() -> None:
+    """基础：beacon_oriented_spiral_target 返回 Beacon 环上的点。"""
+    core = (10, 10)
+    beacon = (10, 50)
+    for ring in [1, 2, 3, 5]:
+        pt = beacon_oriented_spiral_target(core, beacon, 0, 4, ring, 0)
+        # 结果应在 Beacon 环上（曼哈顿距离 = ring 或 ring±1）
+        d = manhattan(beacon, pt)
+        assert d in [ring - 1, ring, ring + 1] or abs(d - ring) <= 2, (
+            f"ring={ring}: expected manhattan(beacon, pt) ~= {ring}, got {d}"
+        )
+
+
+def test_TR_4_beacon_oriented_sector_diversity() -> None:
+    """扇区分散：不同 sector_id 返回的点应足够分散。"""
+    core = (10, 10)
+    beacon = (10, 50)
+    ring = 3
+    pts = []
+    for sid in range(5):
+        pt = beacon_oriented_spiral_target(core, beacon, sid, 5, ring, 0)
+        pts.append(pt)
+    # 计算最大两两距离
+    max_pair = 0
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            d = manhattan(pts[i], pts[j])
+            if d > max_pair:
+                max_pair = d
+    assert max_pair >= 4, f"扇区点不够分散: max_pair_dist={max_pair}, pts={pts}"

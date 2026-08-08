@@ -11,3 +11,7 @@ python-dotenv>=1.0.0
 
 # 测试
 pytest>=8.0.0
+
+# ----- Optional: Dashboard (本地 Web UI，启用 --dashboard 前需手动安装) -----
+# pip install flask>=3.0
+# flask>=3.0   # optional: dashboard

@@ -168,12 +168,12 @@ def test_dropped_cargo_ignores_other_events() -> None:
 def test_chunk_helpers() -> None:
     """chunk_of / chunk_ring。"""
     assert chunk_of((0, 0)) == (0, 0)
-    assert chunk_of((31, 31)) == (0, 0)
-    assert chunk_of((32, 32)) == (1, 1)
-    assert chunk_of((-1, 63)) == (-1, 1)
+    assert chunk_of((15, 15)) == (0, 0)
+    assert chunk_of((16, 16)) == (1, 1)
+    assert chunk_of((-1, 63)) == (-1, 3)
     center = chunk_of((10, 10))
     assert chunk_ring(chunk_of((10, 10)), center) == 0
-    assert chunk_ring(chunk_of((74, 10)), center) == 2  # (2,0) 相对 (0,0)
+    assert chunk_ring(chunk_of((74, 10)), center) == 4  # (4,0) 相对 (0,0)
 
 
 def test_chunk_quota_cache() -> None:
@@ -203,7 +203,7 @@ def test_mark_explored_new_chunk_once() -> None:
     mem = MemoryMap()
     assert mem.mark_explored((10, 10), 1) is True   # chunk (0,0)
     assert mem.mark_explored((15, 12), 2) is False  # 同 chunk (0,0)
-    assert mem.mark_explored((40, 40), 3) is True   # chunk (1,1)
+    assert mem.mark_explored((20, 20), 3) is True   # chunk (1,1) (20//16=1)
     assert mem.explored_chunk_ticks[(0, 0)] == 1
     assert mem.explored_chunk_ticks[(1, 1)] == 3
     assert mem.is_explored((0, 0)) is True
@@ -241,3 +241,136 @@ def test_observe_updates_obstacle_cache_timestamps() -> None:
     assert mem.obstacle_cache[(40, 40)].first_seen_tick == 2
     assert mem.obstacle_cache[(40, 40)].last_seen_tick == 2
     assert mem.obstacles == {(30, 30), (40, 40)}
+
+
+def test_TR_5_3_observe_refresh_chunk_last_seen_ticks() -> None:
+    """TR-5.3 observe() 刷新 chunk_last_seen_ticks：Worker 位置对应 chunk tick=42。"""
+    from tests.stubs import StubTurn, StubUnit, StubCore
+
+    worker = StubUnit(position=(0, 0))
+    turn = StubTurn(
+        tick=42,
+        core=StubCore(position=(10, 10)),
+        workers=[worker],
+    )
+    mm = MemoryMap()
+    mm.observe(turn, 42)
+    assert (0, 0) in mm.chunk_last_seen_ticks
+    assert mm.chunk_last_seen_ticks[(0, 0)] == 42
+
+
+def test_TR_5_4_fresh_instance_chunk_last_seen_empty() -> None:
+    """TR-5.4 清理生效：新 MemoryMap 实例 chunk_last_seen_ticks 为空。"""
+    mm1 = MemoryMap()
+    mm1.mark_chunk_seen((0, 0), 10)
+    assert mm1.chunk_last_seen_ticks == {(0, 0): 10}
+    mm2 = MemoryMap()
+    assert mm2.chunk_last_seen_ticks == {}
+    mm3 = MemoryMap()
+    assert mm3.chunk_last_seen_ticks == {}
+
+
+def test_vision_disk_size() -> None:
+    """曼哈顿菱形：r=0→1，r=1→5，r=3→25，r=5→61。"""
+    from bot.memory import vision_disk
+
+    assert len(vision_disk((0, 0), 0)) == 1
+    assert len(vision_disk((10, 10), 1)) == 5
+    assert len(vision_disk((10, 10), 3)) == 25
+    assert len(vision_disk((10, 10), 5)) == 61
+    # 全部点曼哈顿 ≤ r
+    for p in vision_disk((10, 10), 3):
+        assert abs(p[0] - 10) + abs(p[1] - 10) <= 3
+
+
+def test_has_line_of_sight_blocked_by_obstacle() -> None:
+    """中间障碍挡视线；目标墙格本身可见。"""
+    from bot.memory import has_line_of_sight
+
+    origin = (10, 10)
+    target = (14, 10)
+    # 无障碍
+    assert has_line_of_sight(origin, target, set()) is True
+    # 中间墙 (12,10) 挡住 (14,10)
+    assert has_line_of_sight(origin, target, {(12, 10)}) is False
+    # 目标本身是墙：仍可见（看到墙面）
+    assert has_line_of_sight(origin, (12, 10), {(12, 10)}) is True
+
+
+def test_observe_marks_vision_disk_as_explored() -> None:
+    """observe：Core 视距 5 + Worker 视距 3 → 可见格全部进入 explored_cells。
+
+    官方：能看见的格子 = 已探索区域（非仅落脚点）。
+    """
+    from bot.memory import MemoryMap, VISION_RADIUS, vision_disk
+    from tests.stubs import StubTurn, StubCore, StubUnit
+
+    core_pos = (10, 10)
+    worker_pos = (20, 10)  # 与 Core 分开，Worker 盘不与 Core 完全重叠
+    mem = MemoryMap()
+    turn = StubTurn(
+        tick=1,
+        core=StubCore(position=core_pos),
+        workers=[StubUnit(position=worker_pos)],
+        obstacle_cells=set(),
+    )
+    mem.observe(turn, 1)
+
+    # Core r=5 全盘应已探
+    for cell in vision_disk(core_pos, VISION_RADIUS["CORE"]):
+        assert cell in mem.explored_cells, f"Core FOV missing {cell}"
+    # Worker r=3 全盘应已探
+    for cell in vision_disk(worker_pos, VISION_RADIUS["WORKER"]):
+        assert cell in mem.explored_cells, f"Worker FOV missing {cell}"
+    # 落脚点外的格也在（证明不是 footprint-only）
+    assert (13, 10) in mem.explored_cells  # Core 东 3 格
+    assert (20, 13) in mem.explored_cells  # Worker 北 3 格
+    # 超出视野不应标记
+    assert (10, 16) not in mem.explored_cells  # Core 南 6 > 5
+    assert (24, 10) not in mem.explored_cells  # Worker 东 4 > 3
+
+
+def test_observe_vision_respects_obstacle_los() -> None:
+    """障碍挡视线：墙后格子不标已探；墙格本身标已探。"""
+    from bot.memory import MemoryMap
+    from tests.stubs import StubTurn, StubCore, StubUnit
+
+    core_pos = (10, 10)
+    wall = (12, 10)
+    behind = (14, 10)
+    mem = MemoryMap()
+    turn = StubTurn(
+        tick=1,
+        core=StubCore(position=core_pos),
+        workers=[],  # 仅 Core 视野，避免 Worker 干扰
+        obstacle_cells={wall},
+    )
+    mem.observe(turn, 1)
+    assert wall in mem.explored_cells, "wall cell itself should be visible"
+    assert behind not in mem.explored_cells, "cell behind wall should not be explored"
+    assert (11, 10) in mem.explored_cells
+
+
+def test_mark_vision_disk_vanguard_ranger_radii() -> None:
+    """Vanguard r=4 / Ranger r=5 写入正确。"""
+    from bot.memory import MemoryMap, VISION_RADIUS, vision_disk
+    from tests.stubs import StubTurn, StubCore, StubUnit
+
+    mem = MemoryMap()
+    vpos, rpos = (0, 0), (30, 0)
+    turn = StubTurn(
+        tick=5,
+        core=StubCore(position=(100, 100)),  # 远离，不污染
+        workers=[],
+        vanguards=[StubUnit(position=vpos, unit_type="VANGUARD")],
+        rangers=[StubUnit(position=rpos, unit_type="RANGER")],
+        obstacle_cells=set(),
+    )
+    mem.observe(turn, 5)
+    for cell in vision_disk(vpos, VISION_RADIUS["VANGUARD"]):
+        assert cell in mem.explored_cells
+    for cell in vision_disk(rpos, VISION_RADIUS["RANGER"]):
+        assert cell in mem.explored_cells
+    # Vanguard 不覆盖 r=5 外点
+    assert (0, 5) not in mem.explored_cells
+    assert (30, 5) in mem.explored_cells  # Ranger r=5

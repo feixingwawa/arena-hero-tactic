@@ -357,18 +357,43 @@ def test_default_config_new_defaults() -> None:
     cfg = DEFAULT_CONFIG
     total = cfg.target_workers + cfg.target_vanguards + cfg.target_rangers
     assert total <= cfg.max_population
-    assert cfg.max_population == 30
-    assert cfg.target_workers == 14
-    assert cfg.sector_count == 2
+    # 混合高效默认：基础价满编 12/4/4=20（非照搬旧 14/3/2 max30）
+    assert cfg.max_population == 20
+    assert cfg.target_workers == 12
+    assert cfg.target_vanguards == 4
+    assert cfg.target_rangers == 4
+    assert cfg.beacon_max_chase == 64
+    assert cfg.beacon_min_workers == 3
+    assert cfg.sector_count == 4
     assert cfg.spiral_base_ring == 3
-    assert cfg.spiral_max_ring == 32
+    assert cfg.spiral_max_ring == 24
     assert cfg.recall_stall_ticks == 6
     assert cfg.refresh_interval_ticks == 4
-    assert cfg.revisit_max_distance == 40
-    # Beacon 导向探索新增字段（探索优化 T01）
+    assert cfg.revisit_max_distance == 48
     assert cfg.beacon_step_radius == 8
     assert cfg.beacon_position is None
     # v0.14 已移除维护费与固定成本字段
     assert not hasattr(cfg, "upkeep_soft_cap")
     assert not hasattr(cfg, "upkeep_hard_cap")
     assert not hasattr(cfg, "worker_cost")
+
+
+def test_TR_7_1_core_move_eval_logs(config: TacticConfig) -> None:
+    """TR-7.1: Core HP=2, 邻格敌 (10,11) visible, beacon=None → 日志含 core_move_eval，core.action 不是 start_move。"""
+    turn = StubTurn(
+        tick=1,
+        resources=5,
+        core=StubCore(position=(10, 10), hp=2, shield=5),
+        workers=[StubUnit(position=(11, 10), unit_type="WORKER")],
+        visible_enemies=[StubEnemy(position=(10, 11), hp=3, unit_type="VANGUARD")],
+        resource_cells={(14, 10)},
+        beacon=None,
+    )
+    result = decide(turn, config=config)
+    assert any(
+        "strategy:core_move_eval:reason=adjacent_enemy_low_hp" in line
+        for line in result.logs
+    ), f"logs={result.logs}"
+    # core.action 不是 start_move（应仍是 None 或其他 noop 操作）
+    core_action = getattr(turn.core, "action", None)
+    assert core_action != "start_move", f"core.action={core_action} 不应该是 start_move"

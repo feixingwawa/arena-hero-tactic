@@ -1,0 +1,58 @@
+{
+  "health": {
+    "status": 200,
+    "bytes": 217,
+    "ct": "application/json",
+    "snapshots": 20
+  },
+  "index": {
+    "status": 200,
+    "bytes": 37396,
+    "ct": "text/html; charset=utf-8",
+    "html_checks": {
+      "token_primary": true,
+      "token_bg": true,
+      "logo_href": true,
+      "cb_paths": true,
+      "cb_dest": true,
+      "cb_obs": true,
+      "drawPaths": true,
+      "path_estimate": true
+    },
+    "all_ok": true
+  },
+  "logo": {
+    "status": 200,
+    "bytes": 274,
+    "ct": "image/svg+xml; charset=utf-8",
+    "head": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 40 40\">   <path d=\"M20 3 34"
+  },
+  "favicon": {
+    "status": 200,
+    "bytes": 326,
+    "ct": "image/svg+xml; charset=utf-8",
+    "head": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 40 40\">   <rect width=\"40\" "
+  },
+  "latest": {
+    "status": 200,
+    "bytes": 2197,
+    "ct": "application/json",
+    "ok": true,
+    "tick": 128,
+    "path_estimate_n": 3,
+    "obstacles_n": 6,
+    "primary_tokens_check": null
+  },
+  "history": {
+    "status": 200,
+    "bytes": 11004,
+    "ct": "application/json",
+    "frames": 5
+  },
+  "logs": {
+    "status": 200,
+    "bytes": 550,
+    "ct": "application/json",
+    "items": 4
+  }
+}

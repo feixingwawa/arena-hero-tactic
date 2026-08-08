@@ -133,6 +133,21 @@ def decide(
         set_beacon_position(config, None)
         result.logs.append("strategy:beacon:absent")
 
+    # --- P1-1 Core 迁徙评估（只记日志，不真的 start_move） ---
+    core_pos_tuple = tuple(turn.core.position)
+    reasons = []
+    visible_threats = getattr(turn, "visible_enemies", None) or ()
+    threat_positions = [tuple(t.position) for t in visible_threats]
+    if turn.core.hp <= 3 and any(
+        abs(p[0] - core_pos_tuple[0]) + abs(p[1] - core_pos_tuple[1]) <= 1 for p in threat_positions
+    ):
+        reasons.append("adjacent_enemy_low_hp")
+    beacon_pos = getattr(config, 'beacon_position', None)
+    if beacon_pos is not None and (abs(beacon_pos[0]-core_pos_tuple[0]) + abs(beacon_pos[1]-core_pos_tuple[1])) <= 4:
+        reasons.append("beacon_near_core")
+    if reasons:
+        result.logs.append(f"strategy:core_move_eval:reason={'+'.join(reasons)}")
+
     # 1) 角色分配 + 威胁评估
     role_plan = assign_roles(turn, config=config, core_position=core_pos)
     threat = assess_threats(turn, core_pos, config=config)

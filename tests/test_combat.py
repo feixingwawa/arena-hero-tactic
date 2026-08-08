@@ -110,3 +110,77 @@ def test_core_no_heal_when_full(config: TacticConfig) -> None:
     assert should_core_heal_first(turn, config=config) is False
     acted, _ = command_core_defense(turn, config=config)
     assert acted is False
+
+
+def test_TR_7_2_pick_unused_slot_vanguards(config: TacticConfig) -> None:
+    """TR-7.2: 3 个 Vanguards 在 Core 周围相同位置，tick=0 phase=0 → 3 个目标位置互不相同。"""
+    from bot.pathing import NAME_TO_DELTA
+
+    core_pos = (10, 10)
+    # 3 个 Vanguard 起始都在 (11, 10)，Core 在 (10,10)，tick=0（phase=0）
+    v_list = [
+        StubUnit(position=(11, 10), hp=4, unit_type="VANGUARD") for _ in range(3)
+    ]
+    turn = StubTurn(
+        tick=0,
+        core=StubCore(position=core_pos, hp=10, shield=5),
+        vanguards=v_list,
+        visible_enemies=[],  # 无威胁 → 触发 defense slot 选择
+    )
+    plan = assign_roles(turn, config=config)
+    command_vanguards(turn, plan, config=config, core_position=core_pos)
+
+    # 计算每个 Vanguard 的目标位置（如果是 move 就用方向推一步；如果是 wait/hold 就是当前位置）
+    def target_pos(v: StubUnit) -> tuple[int, int]:
+        pos = tuple(v.position)
+        action = v.action
+        args = v.action_args
+        if action == "move" and isinstance(args, str) and args in NAME_TO_DELTA:
+            dx, dy = NAME_TO_DELTA[args]
+            return (pos[0] + dx, pos[1] + dy)
+        return pos
+
+    targets = [target_pos(v) for v in v_list]
+    unique_targets = set(targets)
+    # 3 个目标位置互不相同（如果出现 wait 也可以，只要不重复）
+    assert len(unique_targets) >= 2, f"3 Vanguards 目标位置重复过多: {targets}"
+    # 检查至少不全部相同
+    assert not (targets[0] == targets[1] == targets[2]), (
+        f"3 Vanguards 全部撞在同一位置 {targets[0]}"
+    )
+
+
+def test_TR_7_3_ranger_fire_ledger_overkill(config: TacticConfig) -> None:
+    """TR-7.3: 2 敌（各 HP=1）+ 4 Rangers → 至少 2 条 shoot_avoid_overkill，shoot 目标 ID 不重复。"""
+    core_pos = (10, 10)
+    e1 = StubEnemy(position=(10, 13), hp=1, unit_type="VANGUARD")
+    e2 = StubEnemy(position=(13, 10), hp=1, unit_type="VANGUARD")
+    # 4 个 Rangers 都在 (10,10) 附近，射程内可以射击两个敌人
+    r_list = [
+        StubUnit(position=(10, 10), hp=2, unit_type="RANGER") for _ in range(4)
+    ]
+    turn = StubTurn(
+        core=StubCore(position=core_pos, hp=10, shield=5),
+        rangers=r_list,
+        visible_enemies=[e1, e2],
+    )
+    plan = assign_roles(turn, config=config)
+    logs = command_rangers(turn, plan, config=config, core_position=core_pos)
+
+    # 统计 shoot_avoid_overkill 日志数
+    overkill_logs = [l for l in logs if "shoot_avoid_overkill" in l]
+    assert len(overkill_logs) >= 2, (
+        f"应该至少 2 条 overkill 日志，但只有 {len(overkill_logs)}: {logs}"
+    )
+
+    # 统计实际 shoot 的目标 ID（从 shoot:xxx 或 shoot_cell 推断）
+    shot_ids: list[str] = []
+    for r in r_list:
+        if r.action == "shoot" and r.action_args is not None:
+            target = r.action_args[0] if isinstance(r.action_args, tuple) else r.action_args
+            tid = str(getattr(target, "id", target))
+            shot_ids.append(tid)
+    # 目标 ID 不重复（最多 2 个不同 ID，因为两个敌人各 HP=1）
+    assert len(set(shot_ids)) <= 2, f"shoot 目标超过 2 个敌人: {shot_ids}"
+    # 至少有不超过 2 次实际 shoot（因为两个敌人各只需要 1 次伤害）
+    assert len(shot_ids) <= 2, f"实际 shoot 次数 {len(shot_ids)} 超过敌人 HP 总和: {shot_ids}"

@@ -20,6 +20,23 @@ from bot.pathing import (
 from bot.roles import Role, RolePlan, _as_position
 
 
+def _pick_unused_slot(
+    slot_candidates: list[tuple[int,int]],
+    taken_positions: set[tuple[int,int]],
+) -> Optional[tuple[int,int]]:
+    """从 slot_candidates 中选第一个未被 taken 的；若全部占用则横向 +1 相位偏移再找一轮。"""
+    for slot in slot_candidates:
+        if slot not in taken_positions:
+            return slot
+    # 偏移一轮
+    for slot in slot_candidates:
+        alt = (slot[0]+1, slot[1])
+        if alt not in taken_positions: return alt
+        alt = (slot[0], slot[1]+1)
+        if alt not in taken_positions: return alt
+    return slot_candidates[0] if slot_candidates else None
+
+
 def _obstacle_cells(turn: Any) -> set[Position]:
     cells = getattr(turn, "obstacle_cells", None)
     if cells is None:
@@ -95,6 +112,7 @@ def command_vanguards(
         count=max(len(vanguards), 1),
         phase=int(getattr(turn, "tick", 0) or 0) % 8,
     )
+    taken: set[tuple[int,int]] = set()
 
     for i, v in enumerate(vanguards):
         uid = v.id
@@ -146,9 +164,15 @@ def command_vanguards(
                         continue
 
         # 默认：守在防守环
-        slot = slots[i % len(slots)] if slots else cells_toward_ring(
+        base_slot = cells_toward_ring(
             pos, core_position, config.defense_radius
         )
+        slot_candidates = list(slots) if slots else [base_slot]
+        slot = _pick_unused_slot(slot_candidates, taken)
+        if slot is not None:
+            taken.add(slot)
+        else:
+            slot = base_slot
         if pos == slot:
             if hasattr(v, "wait"):
                 v.wait()
@@ -188,6 +212,8 @@ def command_rangers(
         count=max(len(rangers), 1),
         phase=(int(getattr(turn, "tick", 0) or 0) + 3) % 8,
     )
+    ranger_fire_ledger: dict = {}
+    taken: set[tuple[int,int]] = set()
 
     for i, r in enumerate(rangers):
         uid = r.id
@@ -218,21 +244,34 @@ def command_rangers(
                 hp = int(getattr(e, "hp", 99) or 99)
                 return (manhattan(ep, core_position), hp, str(getattr(e, "id", "")))
 
-            target = min(shootable, key=shoot_key)
-            if hasattr(r, "shoot"):
-                try:
-                    r.shoot(target)
-                    logs.append(f"ranger:{uid}:shoot:{getattr(target, 'id', target)}")
-                except TypeError:
-                    # stub 可能签名不同，退回 shoot_cell
-                    if hasattr(r, "shoot_cell"):
-                        r.shoot_cell(_as_position(target.position))
-                        logs.append(f"ranger:{uid}:shoot_cell:{_as_position(target.position)}")
-                continue
-            if hasattr(r, "shoot_cell"):
-                r.shoot_cell(_as_position(target.position))
-                logs.append(f"ranger:{uid}:shoot_cell:{_as_position(target.position)}")
-                continue
+            sorted_enemies = sorted(shootable, key=shoot_key)
+            target = None
+            for candidate in sorted_enemies:
+                enemy_id_str = str(getattr(candidate, "id", ""))
+                enemy_hp = int(getattr(candidate, "hp", 99) or 99)
+                expected = ranger_fire_ledger.get(enemy_id_str, 0)
+                if expected + 1 > enemy_hp:
+                    logs.append(f"ranger:{uid}:shoot_avoid_overkill:enemy={enemy_id_str}")
+                    continue
+                target = candidate
+                ranger_fire_ledger[enemy_id_str] = expected + 1
+                break
+
+            if target is not None:
+                if hasattr(r, "shoot"):
+                    try:
+                        r.shoot(target)
+                        logs.append(f"ranger:{uid}:shoot:{getattr(target, 'id', target)}")
+                    except TypeError:
+                        # stub 可能签名不同，退回 shoot_cell
+                        if hasattr(r, "shoot_cell"):
+                            r.shoot_cell(_as_position(target.position))
+                            logs.append(f"ranger:{uid}:shoot_cell:{_as_position(target.position)}")
+                    continue
+                if hasattr(r, "shoot_cell"):
+                    r.shoot_cell(_as_position(target.position))
+                    logs.append(f"ranger:{uid}:shoot_cell:{_as_position(target.position)}")
+                    continue
 
         # 可见威胁但不在射程：微调位置（仍靠近防守环）
         if enemies:
@@ -249,9 +288,15 @@ def command_rangers(
                         continue
 
         # 默认守外圈
-        slot = slots[i % len(slots)] if slots else cells_toward_ring(
+        base_slot = cells_toward_ring(
             pos, core_position, config.ranger_radius
         )
+        slot_candidates = list(slots) if slots else [base_slot]
+        slot = _pick_unused_slot(slot_candidates, taken)
+        if slot is not None:
+            taken.add(slot)
+        else:
+            slot = base_slot
         if pos == slot:
             if hasattr(r, "wait"):
                 r.wait()
