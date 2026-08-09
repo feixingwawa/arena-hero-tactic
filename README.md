@@ -1,113 +1,113 @@
-﻿# Arena Hero 鎴樻湳妗嗘灦 鈥斻€岃祫婧愪紭鍏?+ 鍧囪　闃插畧銆?
+# Arena Hero 战术框架 —「资源优先 + 均衡防守」
 
-闈㈠悜 [Arena Hero](https://doc.arenahero.io/zh-Hans/) 鐨?*鍙暱鏈熻繍琛?* Python 鎴樻湳瀹㈡埛绔€?
-鍩轰簬瀹樻柟 SDK [`arena-hero`](https://pypi.org/project/arena-hero/)锛屼綘鎺屾帶娓告垙寰幆锛涙湰浠撳簱鍙仛鍐崇瓥銆?
+面向 [Arena Hero](https://doc.arenahero.io/zh-Hans/) 的**可长期运行** Python 战术客户端。  
+基于官方 SDK [`arena-hero`](https://pypi.org/project/arena-hero/)，你掌控游戏循环；本仓库只做决策。
 
-# **绀惧尯锛歔linux.do](https://linux.do)**
+# **社区：[linux.do](https://linux.do)**
 
-> 绀惧尯鎴樻湳绀轰緥锛岄潪瀹樻柟瀹㈡埛绔€備粨搴撳唴**涓嶅寘鍚?*浠讳綍鐪熷疄 API Key銆?  
-> 瑙勫垯鍩哄噯锛?*鐜╂硶 v0.14** 路 API v0.1 路 **SDK 鈮?0.2.9**锛?.2.8 浼?ProtocolError锛夈€?
+> 社区战术示例，非官方客户端。仓库内**不包含**任何真实 API Key。  
+> 规则基准：**玩法 v0.14** · API v0.1 · **SDK ≥ 0.2.9**（0.2.8 会 ProtocolError）。
 
-## 娓告垙涓€鍙ヨ瘽
+## 游戏一句话
 
-鍏变韩姘镐箙缃戞牸涓栫晫锛汚gent 姣?Tick 鐪嬬鏈夎閲庛€佷氦涓€浠?15 绉掔獥鍙ｅ唴鐨勮鍒掋€? 
-**娌℃湁瀹樻柟閫氬叧**鈥斺€旀湁鏁堢洰鏍囨槸 Core 瀛樻椿銆佽祫婧愭寰幆銆佺紪鍒舵墿寮狅紱Champion Beacon 鏄彲閫夊弻鍊嶉噰闆嗕箻鏁般€?
+共享永久网格世界；Agent 每 Tick 看私有视野、交一份 15 秒窗口内的计划。  
+**没有官方通关**——有效目标是 Core 存活、资源正循环、编制扩张；Champion Beacon 是可选双倍采集乘数。
 
-璇︾粏鐞嗚В瑙侊細[`docs/GAME_UNDERSTANDING.md`](docs/GAME_UNDERSTANDING.md)
-鎴樻湳鍘熷垯瑙侊細[`docs/STRATEGY.md`](docs/STRATEGY.md)
+详细理解见：[`docs/GAME_UNDERSTANDING.md`](docs/GAME_UNDERSTANDING.md)
+战术原则见：[`docs/STRATEGY.md`](docs/STRATEGY.md)
 
-### v2 鍗囩骇閫熻
+### v2 升级速览
 
-鏈 v2 鍥寸粫銆?*缁忔祹鏇村揩姝ｅ惊鐜?+ 鏇存棭婊＄紪 20 + 鎺㈢储涓嶇┖杞?+ 宸ヤ汉鏅鸿兘鍒嗗伐 + 鐪熷疄鏈?Beacon 鎺ㄨ繘 + 鏈湴 Dashboard 瀹炴椂瑙傛祴**銆嶅仛浜嗗杞崌绾э細
+本次 v2 围绕「**经济更快正循环 + 更早满编 20 + 探索不空转 + 工人智能分工 + 真实朝 Beacon 推进 + 本地 Dashboard 实时观测**」做了多轮升级：
 
-| 鍗囩骇椤?| 瑕佺偣 |
+| 升级项 | 要点 |
 |--------|------|
-| 馃殌 **鍙伴樁鍨?12W/4V/4R 鐖潯** | W 杈?3/6/9/12 鈫?鎻掓帓 V/R锛岃妭濂忔槑纭笉杩斿伐 |
-| 馃 **鐭跨偣鏅鸿兘璋冨害** | Worker 婊¤浇鍙戠幇鐭挎椂锛屽惈闅滅瀵昏矾浼扮畻瀵规瘮銆岃嚜閲囧線杩斻€峷s銆屾淳鏈€杩戠┖闂层€嶏紝鎵ц鏇寸煭璺緞 |
-| 馃寑 **鍙屼腑蹇冭灪鏃嬫帰绱?* | 鍐呯幆锛坉鈮?4锛塁ore 涓績铻烘棆 鈫?鐜垎鍒颁笂闄愯嚜鍔ㄥ垏鐩镐綅鈫?**Beacon 瀵煎悜澶栫幆鎺ㄨ繘**锛堜笉鍐嶅皬鑼冨洿姝诲惊鐜級|
-| 馃П **闅滅鍘嗗彶涓诲姩閬块殰** | 鍚屾柟鍚?鈮? 娆¤鎸¤瘎鍒?-100锛?*閬垮紑"鑰佸牭澧?** 鑺傜渷绌鸿浆 tick |
-| 馃攷 **P1-P3 瑙傛祴鎬?* | Core 杩佸緳璇勪及/瀹堢幆鍒嗘暎/闄堟棫鍥炶/鐏姏 ledger/SDK 鐗堟湰鑷/缁忔祹鍋ュ悍 stall 璇婃柇 |
-| 馃憗 **瀹樻柟瑙嗛噹宸叉帰** | `explored_cells` 鎸夊崟浣?FOV 鍐欏叆锛欳ore 5 / Worker 3 / Vanguard 4 / Ranger 5锛堟浖鍝堥】锛夛紝闅滅閬尅 LOS |
-| 馃椇 **鏈湴 Dashboard** | `--dashboard` 鍚?Flask 鍦板浘锛氬崟浣?璺緞/闅滅/宸叉帰/璧勬簮锛?00ms 杞 + `Cache-Control: no-store` 瀹炴椂鍒锋柊 |
-| 馃洡 **杩?Core 浼樺厛 deposit / 璐村缁曡** | 婊¤揣杩戝浼樺厛涓婄即锛涗富杞村牭澧欐椂 `wall_follow_step` 璐村缁曡锛屽噺灏戝彛琚嬫尟鑽?|
+| 🚀 **台阶型 12W/4V/4R 爬坡** | W 达 3/6/9/12 → 插排 V/R，节奏明确不返工 |
+| 🧠 **矿点智能调度** | Worker 满载发现矿时，含障碍寻路估算对比「自采往返」vs「派最近空闲」，执行更短路径 |
+| 🌀 **双中心螺旋探索** | 内环（d≤24）Core 中心螺旋 → 环爆到上限自动切相位→ **Beacon 导向外环推进**（不再小范围死循环）|
+| 🧱 **障碍历史主动避障** | 同方向 ≥3 次被挡评分 -100，**避开"老堵墙"** 节省空转 tick |
+| 🔎 **P1-P3 观测性** | Core 迁徙评估/守环分散/陈旧回访/火力 ledger/SDK 版本自检/经济健康 stall 诊断 |
+| 👁 **官方视野已探** | `explored_cells` 按单位 FOV 写入：Core 5 / Worker 3 / Vanguard 4 / Ranger 5（曼哈顿），障碍遮挡 LOS |
+| 🗺 **本地 Dashboard** | `--dashboard` 启 Flask 地图：单位/路径/障碍/已探/资源；500ms 轮询 + `Cache-Control: no-store` 实时刷新 |
+| 🛤 **近 Core 优先 deposit / 贴墙绕行** | 满货近家优先上缴；主轴堵墙时 `wall_follow_step` 贴墙绕行，减少口袋振荡 |
 
-## 鎴樻湳鐩爣
+## 战术目标
 
-| 闃舵 | 琛屼负 |
+| 阶段 | 行为 |
 |------|------|
-| 鏃╂湡 | 浼樺厛鐢熶骇 Worker锛孷ISIBLE 閲囬泦 鈫?deposit锛屾墦閫氱粡娴?|
-| 涓湡 | 鍚?**12 Worker + 鑻ュ共 Vanguard/Ranger** 婊＄紪锛堝缓璁€?pop鈮?0锛?|
-| 鍏ㄧ▼ | Core 鍛ㄨ竟闃插畧锛涘▉鑳佹椂鎾ら€€/鍙嶅嚮浼樺厛浜庢墿寮?|
-| Beacon | **鏈€澶?1 鍚?dedicated** 渚﹀療锛涜繙璺濇斁寮冿紱Core 涓嶅疁杩戒俊鏍?|
-| 鐢熷瓨 | Core/鍗曚綅浣庤鏈夋潯浠?heal銆佷慨鐩撅紱v0.14 **鏃犵淮鎶よ垂** |
-| 鐩戞帶鎸囨爣 | 鐢ㄦ埛鐩爣锛欳ore 搴撳瓨 **resources 鈮?100** |
+| 早期 | 优先生产 Worker，VISIBLE 采集 → deposit，打通经济 |
+| 中期 | 向 **12 Worker + 若干 Vanguard/Ranger** 满编（建议总 pop≤20） |
+| 全程 | Core 周边防守；威胁时撤退/反击优先于扩张 |
+| Beacon | **最多 1 名 dedicated** 侦察；远距放弃；Core 不宜追信标 |
+| 生存 | Core/单位低血有条件 heal、修盾；v0.14 **无维护费** |
+| 监控指标 | 用户目标：Core 库存 **resources ≥ 100** |
 
-## 椤圭洰缁撴瀯
+## 项目结构
 
 ```
 arena-hero-tactic/
   README.md
-  deploy.bat / deploy.sh # 涓€閿儴缃插叆鍙ｏ紙Windows 鍙屽嚮 / Unix锛?
+  deploy.bat / deploy.sh # 一键部署入口（Windows 双击 / Unix）
   docs/
-    GAME_UNDERSTANDING.md   # 娓告垙鎬庝箞杩愯 / 鐩爣 / Agent 鑱岃矗
-    STRATEGY.md             # 鎴樻湳鍘熷垯涓庢敼閫犺矾绾?
-    system_design*.md       # 鏋舵瀯涓庢帰绱㈣璁?
+    GAME_UNDERSTANDING.md   # 游戏怎么运行 / 目标 / Agent 职责
+    STRATEGY.md             # 战术原则与改造路线
+    system_design*.md       # 架构与探索设计
   bot/
-    main.py              # 鍏ュ彛锛欿ey 鈫?杩炴帴 鈫?turns 寰幆锛堝彲閫?--dashboard锛?
+    main.py              # 入口：Key → 连接 → turns 循环（可选 --dashboard）
     config.py            # TacticConfig
     strategy.py          # decide(turn)
-    economy.py           # 閲囬泦/浜や粯/鐢熶骇/铻烘棆鎺㈢储
-    combat.py            # 濞佽儊銆侀槻瀹堝湀銆乻weep/shoot
-    pathing.py           # 闃叉姈姝ヨ繘銆佽灪鏃嬨€乥eacon 鐩爣銆佽创澧欑粫琛?
-    memory.py            # 璧勬簮/闅滅/chunk/瀹樻柟 FOV 宸叉帰
-    roles.py             # 瑙掕壊鍒嗛厤
-    rules.py             # 鍔ㄦ€佸崟浣嶄环 / 瀹归噺 / chunk 閰嶉
-    dashboard.py         # 鍙€夋湰鍦拌娴嬶細蹇収鐜紦鍐?+ Flask API + SSE 鏃ュ織
-    dashboard_static/    # Dashboard 鍓嶇锛堝湴鍥?/ 瓒嬪娍 / 鏃ュ織锛?
+    economy.py           # 采集/交付/生产/螺旋探索
+    combat.py            # 威胁、防守圈、sweep/shoot
+    pathing.py           # 防抖步进、螺旋、beacon 目标、贴墙绕行
+    memory.py            # 资源/障碍/chunk/官方 FOV 已探
+    roles.py             # 角色分配
+    rules.py             # 动态单位价 / 容量 / chunk 配额
+    dashboard.py         # 可选本地观测：快照环缓冲 + Flask API + SSE 日志
+    dashboard_static/    # Dashboard 前端（地图 / 趋势 / 日志）
   scripts/
-    deploy.py            # 涓€閿細venv / 渚濊禆 / .env / 鍚?Dashboard / health
-    restart_agent.py     # 鐜宸插氨缁椂浠呭悗鍙伴噸鍚?agent
+    deploy.py            # 一键：venv / 依赖 / .env / 启 Dashboard / health
+    restart_agent.py     # 环境已就绪时仅后台重启 agent
   tests/
   deliverables/
 ```
 
-## 鐜瑕佹眰
+## 环境要求
 
 - Python **3.11+**
-- `arena-hero>=0.2.9,<0.3`銆乣python-dotenv`锛堝彲閫夛級銆乣pytest`锛堟祴璇曪級
-- **鍙€?Dashboard**锛歚flask>=3.0`锛坄requirements.txt` 涓粯璁ゆ敞閲婏紱浠?`--dashboard` 鏃堕渶瑕侊級
-- **SDK 鐗堟湰鑷锛坴2 P3-1锛?*锛氬惎鍔ㄦ椂 `main.run_loop` 浼氬己鍒舵牎楠?arena-hero 鐗堟湰 鈮?0.2.9 涓?< 0.3锛涗笉婊¤冻鐩存帴 `SystemExit(1)`锛岄伩鍏?`ProtocolError` 鍒扮嚎涓婃墠鎶ラ敊
+- `arena-hero>=0.2.9,<0.3`、`python-dotenv`（可选）、`pytest`（测试）
+- **可选 Dashboard**：`flask>=3.0`（`requirements.txt` 中默认注释；仅 `--dashboard` 时需要）
+- **SDK 版本自检（v2 P3-1）**：启动时 `main.run_loop` 会强制校验 arena-hero 版本 ≥ 0.2.9 且 < 0.3；不满足直接 `SystemExit(1)`，避免 `ProtocolError` 到线上才报错
 
-## 涓€閿儴缃诧紙鎺ㄨ崘锛?
+## 一键部署（推荐）
 
-鍏嬮殕浠撳簱鍚庯紝鐢ㄦ牴鐩綍鑴氭湰鑷姩瀹屾垚锛氭鏌?Python 鈮?3.11 鈫?鍒涘缓/澶嶇敤 `.venv` 鈫?瀹夎 `requirements.txt` + Flask锛圖ashboard锛? psutil 鈫?鍒濆鍖?`.env` 鈫掞紙鍙€夛級缁撴潫鏃?`bot.main` 鈫?鍚庡彴鍚姩 `python -m bot.main -v --dashboard` 鈫?鎺㈡祴 `GET /health`銆?
+克隆仓库后，用根目录脚本自动完成：检查 Python ≥ 3.11 → 创建/复用 `.venv` → 安装 `requirements.txt` + Flask（Dashboard）+ psutil → 初始化 `.env` →（可选）结束旧 `bot.main` → 后台启动 `python -m bot.main -v --dashboard` → 探测 `GET /health`。
 
 ```bash
-# Windows锛堜篃鍙祫婧愮鐞嗗櫒鍙屽嚮 deploy.bat锛?
+# Windows（也可资源管理器双击 deploy.bat）
 deploy.bat
-deploy.bat --api-key 浣犵殑_API_KEY
-deploy.bat --no-start          # 鍙鐜涓嶅惎鍔?
-deploy.bat --skip-pip          # 宸茶濂戒緷璧栨椂璺宠繃 pip
-deploy.bat --no-kill           # 涓嶇粨鏉熷凡鍦ㄨ窇鐨?agent
+deploy.bat --api-key 你的_API_KEY
+deploy.bat --no-start          # 只装环境不启动
+deploy.bat --skip-pip          # 已装好依赖时跳过 pip
+deploy.bat --no-kill           # 不结束已在跑的 agent
 deploy.bat --port 8765
 
 # Linux / macOS
 chmod +x deploy.sh
 ./deploy.sh
-./deploy.sh --api-key 浣犵殑_API_KEY
+./deploy.sh --api-key 你的_API_KEY
 
-# 绛変环鐩存帴璋冪敤
+# 等价直接调用
 python scripts/deploy.py
-python scripts/deploy.py --foreground   # 鍓嶅彴璺戯紝Ctrl+C 鍋?
-python scripts/deploy.py --quiet        # 鍚姩涓嶅姞 -v
+python scripts/deploy.py --foreground   # 前台跑，Ctrl+C 停
+python scripts/deploy.py --quiet        # 启动不加 -v
 ```
 
-鎴愬姛鍚庢墦寮€ **http://127.0.0.1:8765/**锛汸ID 鍐欏湪 `logs/agent.pid`锛屾棩蹇楀湪 `logs/agent.log`銆?
-**涓嶈**鎶?`.env` 鎴栫湡瀹?Key 鎻愪氦鍒?Git锛沗--api-key` 鍙啓鍏ユ湰鍦?`.env` 涓斾笉浼氬湪缁堢鎵撳嵃鏄庢枃銆?
+成功后打开 **http://127.0.0.1:8765/**；PID 写在 `logs/agent.pid`，日志在 `logs/agent.log`。
+**不要**把 `.env` 或真实 Key 提交到 Git；`--api-key` 只写入本地 `.env` 且不会在终端打印明文。
 
-浠呴噸鍚紙鐜宸插氨缁級锛歚python scripts/restart_agent.py`銆?
+仅重启（环境已就绪）：`python scripts/restart_agent.py`。
 
-## 鎵嬪姩瀹夎
+## 手动安装
 
 ```bash
 cd arena-hero-tactic
@@ -119,177 +119,175 @@ python -m venv .venv
 # source .venv/bin/activate
 
 pip install -r requirements.txt
-# 鑻ュ惎鐢?Dashboard锛?
+# 若启用 Dashboard：
 # pip install "flask>=3.0"
 ```
 
-## 閰嶇疆 API Key
+## 配置 API Key
 
 ```bash
 copy .env.example .env          # Windows
 # cp .env.example .env          # Unix
 ```
 
-缂栬緫 `.env`锛?
+编辑 `.env`：
 
 ```
-ARENA_HERO_API_KEY=浣犵殑_API_KEY
+ARENA_HERO_API_KEY=你的_API_KEY
 ```
 
-**涓嶈**鎶?`.env` 鎴栫湡瀹?Key 鎻愪氦鍒?Git銆?
+**不要**把 `.env` 或真实 Key 提交到 Git。
 
-## 鍚姩
+## 启动
 
 ```bash
 python -m bot.main
 python -m bot.main -v --log-file logs/agent.log
 python -m bot.main --max-turns 50
 
-# 鏈湴瀹炴椂鍦板浘 / 鏃ュ織闈㈡澘锛堥粯璁?http://127.0.0.1:8765锛?
+# 本地实时地图 / 日志面板（默认 http://127.0.0.1:8765）
 python -m bot.main --dashboard
 python -m bot.main --dashboard --dashboard-host 127.0.0.1 --dashboard-port 8765
 ```
 
-姣忎釜 Tick 鏀跺埌 `state` 鍚庡敖蹇?`decide(turn)` 骞?`turn.submit()`銆傚懡浠ょ獥鍙ｇ害 15 绉掞紝鍐崇瓥椤昏交閲忋€?
+每个 Tick 收到 `state` 后尽快 `decide(turn)` 并 `turn.submit()`。命令窗口约 15 秒，决策须轻量。
 
-### Dashboard锛堝彲閫夎娴嬶紝闆舵薄鏌撲富寰幆锛?
+### Dashboard（可选观测，零污染主循环）
 
-- **榛樿鍏抽棴**锛氫笉鍔?`--dashboard` 鏃朵笉瀵煎叆 Flask銆佷笉鍚?HTTP 绾跨▼锛屽喅绛栬矾寰勪笌绾夸笂涓€鑷淬€?
-- **鍚悗鑳藉姏**锛?
-  - 鍦板浘锛欳ore / Worker / Vanguard / Ranger / 鏁屼汉 / 璧勬簮 / 闅滅 / **瀹樻柟 FOV 宸叉帰鏍煎瓙** / 璺緞 dry-run 璺偣
-  - 椤舵爮锛歵ick銆佽祫婧愩€佺紪鍒躲€乴ive/paused/stale 妯″紡銆佽窛涓婃鎴愬姛鎷夊彇鐨勫勾榫?
-  - 鍘嗗彶瓒嬪娍锛歚/api/state/history` 杩斿洖 `{ok, frames, count}`锛涘墠绔?`normalizeHistory` 瑙ｅ寘
-  - 鏃ュ織锛歋SE `/api/logs/stream` + 杞鍏滃簳
-- **瀹炴椂鎬?*锛氬墠绔害 **500ms** 杞 `latest`+`history`锛岃姹傚甫 `cache: no-store` 涓?bust query锛涘悗绔椤甸潰涓庣姸鎬?API 鍐?`Cache-Control: no-store`銆?
-- **鍋ュ悍妫€鏌?*锛歚GET /health` 鈫?`{ok, tick, ...}`銆?
+- **默认关闭**：不加 `--dashboard` 时不导入 Flask、不启 HTTP 线程，决策路径与线上一致。
+- **启后能力**：
+  - 地图：Core / Worker / Vanguard / Ranger / 敌人 / 资源 / 障碍 / **官方 FOV 已探格子** / 路径 dry-run 路点
+  - 顶栏：tick、资源、编制、live/paused/stale 模式、距上次成功拉取的年龄
+  - 历史趋势：`/api/state/history` 返回 `{ok, frames, count}`；前端 `normalizeHistory` 解包
+  - 日志：SSE `/api/logs/stream` + 轮询兜底
+- **实时性**：前端约 **500ms** 轮询 `latest`+`history`，请求带 `cache: no-store` 与 bust query；后端对页面与状态 API 写 `Cache-Control: no-store`。
+- **健康检查**：`GET /health` → `{ok, tick, ...}`。
 
-## 鎴樻湳閫昏緫鎽樿
+## 战术逻辑摘要
 
-### 鐢熶骇浼樺厛绾э紙Core 绌洪棽涓旈潪鍗辨€ユ不鐤楋級
+### 生产优先级（Core 空闲且非危急治疗）
 
-1. Worker < 鐩爣 鈫?`spawn WORKER`锛堝姩鎬佷环鏍硷級
-2. 鍙濞佽儊涓旀垬鏂楀崟浣嶄笉瓒?鈫?`VANGUARD` / `RANGER`
-3. 鍜屽钩鏈熻ˉ榻愮洰鏍囨垬鏂楀崟浣?
-4. 璧勬簮涓嶈冻搴旀€ュ偍澶?鈫?璺宠繃 spawn
-5. 浜哄彛瑙﹀強 `max_population` 鈫?鍋滄墿
+1. Worker < 目标 → `spawn WORKER`（动态价格）
+2. 可见威胁且战斗单位不足 → `VANGUARD` / `RANGER`
+3. 和平期补齐目标战斗单位
+4. 资源不足应急储备 → 跳过 spawn
+5. 人口触及 `max_population` → 停扩
 
 ### Worker
 
-- 鏈?cargo 鈫?浼樺厛鍥?Core `deposit`锛?*杩?Core 鏃惰繘涓€姝ユ彁楂?deposit 浼樺厛绾?*锛屽噺灏戙€岄棬鍙ｅ緲寰娿€嶏級
-- 绔欏湪鍙 `resource_cells` 鈫?`harvest`
-- **鐭跨偣鏅鸿兘璋冨害锛坴2锛?*锛?
-  - 绌鸿浇鍙戠幇鐭?鈫?鐩存帴閲囬泦锛堜笌 v1 鐩稿悓锛?
-  - **婊¤浇鍙戠幇鐭?* 鈫?鐢?`estimate_path_steps`锛?*鍚殰纰嶅璺及绠?*锛夌簿纭姣旓細
-    - 閫夐」 A銆岃嚜閲囧線杩斻€? 閫佸洖 Core 鈫?鍐嶅洖鐭?鐨勬€绘鏁?
-    - 閫夐」 B銆屾淳鏈€杩戠┖闂?Worker銆? 鍏朵粬 idle Worker 鍒扮熆 鈫?鍥?Core 鐨勬渶鐭鏁?
-    - 閫夋洿鐭殑锛欰 鑳?鈫?鍐欏叆棰勭害锛堥€佸畬 cargo 涓嬩竴 tick 浼樺厛杩旂▼閲囷級锛汢 鑳?鈫?绔嬪埢鎸囨淳鏈€浼?idle Worker
-    - 棰勭害 TTL 16 tick锛汻ETREAT/HEAL 瑙掕壊绔嬪埢閲婃斁
-- **鍙屼腑蹇冭灪鏃嬫帰绱紙v2锛屼慨澶嶄笉鍐嶅皬鑼冨洿寰幆锛?*锛?
-  - 鍐呯幆锛氳窛 Core 鈮?24 鏍?鈫?Core 涓績铻烘棆锛屾墖鍖哄垎鏁?+ 璺宠繃宸叉帰 chunk
-  - 鐜帹杩涘埌涓婇檺鍚?**鑷姩鍒?Beacon 鐩镐綅** 鈫?澶栫幆浠?Beacon 涓轰腑蹇冭灪鏃嬶紝涓嶅啀鍥為€€鍒板唴鐜紙v2 鍏抽敭 bugfix锛?
-  - 璺濈 Beacon 澶繙锛?64锛夋垨宸ヤ汉涓嶈冻锛?3锛夆啋 瀹堥棬涓嶈拷锛岄槻姝㈤タ姝荤粡娴?
-- **鍘嗗彶闅滅涓诲姩閬块殰锛坴2锛?*锛氬璺椂鑻ユ煇閭绘牸鍘嗗彶琚尅 鈮? 娆?鈫?璇勫垎 -100 涓诲姩缁曞紑锛?-2 娆?-30 闄嶆潈
-- **璐村缁曡**锛氫富杞磋纭鎸′綇鏃?`wall_follow_step` 閫変晶鍚戣创澧欙紝鍑忚交鍙ｈ鏉ュ洖鎶?
-- 闄勮繎鏁屼汉 鈫?鍚?Core 鎾ら€€锛涗綆琛€ 鈫?鍥炲煄 heal
+- 有 cargo → 优先回 Core `deposit`（**近 Core 时进一步提高 deposit 优先级**，减少「门口徘徊」）
+- 站在可见 `resource_cells` → `harvest`
+- **矿点智能调度（v2）**：
+  - 空载发现矿 → 直接采集（与 v1 相同）
+  - **满载发现矿** → 用 `estimate_path_steps`（**含障碍寻路估算**）精确对比：
+    - 选项 A「自采往返」= 送回 Core → 再回矿 的总步数
+    - 选项 B「派最近空闲 Worker」= 其他 idle Worker 到矿 → 回 Core 的最短步数
+    - 选更短的：A 胜 → 写入预约（送完 cargo 下一 tick 优先返程采）；B 胜 → 立刻指派最优 idle Worker
+    - 预约 TTL 16 tick；RETREAT/HEAL 角色立刻释放
+- **双中心螺旋探索（v2，修复不再小范围循环）**：
+  - 内环：距 Core ≤ 24 格 → Core 中心螺旋，扇区分散 + 跳过已探 chunk
+  - 环推进到上限后 **自动切 Beacon 相位** → 外环以 Beacon 为中心螺旋，不再回退到内环（v2 关键 bugfix）
+  - 距离 Beacon 太远（>64）或工人不足（<3）→ 守门不追，防止饿死经济
+- **历史障碍主动避障（v2）**：寻路时若某邻格历史被挡 ≥3 次 → 评分 -100 主动绕开；1-2 次 -30 降权
+- **贴墙绕行**：主轴被硬墙挡住时 `wall_follow_step` 选侧向贴墙，减轻口袋来回抖
+- 附近敌人 → 向 Core 撤退；低血 → 回城 heal
 
 ### Vanguard / Ranger
 
-- 閭绘牸 / 灏勭▼鍐呮敾鍑伙紱鍚﹀垯椹诲畧 Core 闃插畧鐜?
-- **瀹堢幆浣嶅垎鏁ｏ紙v2 P1-2锛?*锛氬鍗曚綅鍚岀浉浣?slot 鍐茬獊鏃讹紝+1 鍋忕Щ閬胯锛屼笉鍐嶅爢鍚屾牸鍫?Core 鍏ュ彛
-- Ranger 灏勫嚮锛?*鐏姏 ledger 杞婚噺锛坴2 P2-2锛?*锛岄璁′激瀹冲凡婊?HP 鐨勭洰鏍囪烦杩囷紝閬垮厤 overkill锛堟棩蹇?`shoot_avoid_overkill`锛?
+- 邻格 / 射程内攻击；否则驻守 Core 防守环
+- **守环位分散（v2 P1-2）**：多单位同相位 slot 冲突时，+1 偏移避让，不再堆同格堵 Core 入口
+- Ranger 射击：**火力 ledger 轻量（v2 P2-2）**，预计伤害已满 HP 的目标跳过，避免 overkill（日志 `shoot_avoid_overkill`）
 
 ### Core
 
-- HP/鐩捐繃浣?鈫?`heal` / `repair_shield`锛堟垬鏂楀悗缁撶畻锛屽彲棰勬帓锛?
-- 鍚﹀垯鎸?*鍙伴樁鍨嬬敓浜ц妭濂忥紙v2锛?* `spawn`锛歐=3鈫扸锛沇=6鈫扸+R锛沇=9鈫扸+R锛沇=12鈫扸+R+R锛涜揪鍒?12/4/4 鍋滄墿
-- **Core 杩佸緳璇勪及锛坴2 P1-1 鏃ュ織-only锛?*锛氶偦鏍兼晫涓?Core HP鈮? / Beacon 璺?Core鈮? 鏃讹紝鍐欏叆璇勪及鏃ュ織浣?*涓嶇湡姝?start_move**锛堥伩鍏嶇Щ鍔?bug锛?
-- 榛樿涓嶄富鍔ㄨ拷 Beacon锛涘悗缁彲瀹炵幇銆孋ore 杩滅淇℃爣銆嶈縼寰?
+- HP/盾过低 → `heal` / `repair_shield`（战斗后结算，可预排）
+- 否则按**台阶型生产节奏（v2）** `spawn`：W=3→V；W=6→V+R；W=9→V+R；W=12→V+R+R；达到 12/4/4 停扩
+- **Core 迁徙评估（v2 P1-1 日志-only）**：邻格敌且 Core HP≤3 / Beacon 距 Core≤4 时，写入评估日志但**不真正 start_move**（避免移动 bug）
+- 默认不主动追 Beacon；后续可实现「Core 远离信标」迁徙
 
-### 鍦板浘璁板繂涓庡畼鏂硅閲?
+### 地图记忆与官方视野
 
-- `MemoryMap`锛氳祫婧愮姸鎬佹満銆佹案涔呴殰纰嶃€佹帀钀?cargo銆?6脳16 chunk 宸叉帰涓庨檲鏃у洖璁?
-- **榛樿钀界洏**鍒?`.arena_hero_state.json`锛堝凡 gitignore锛夛細鍚姩鍔犺浇銆佹瘡 N tick 涓庤繘绋嬮€€鍑烘椂淇濆瓨锛?*閲嶅惎 agent 涓嶄涪宸叉帰**
-- **宸叉帰鏍煎瓙 = 瀹樻柟 FOV 鍘嗗彶**锛堥潪銆岃蛋杩囩殑瓒宠抗銆嶏級锛?
-  - 鍗婂緞锛堟浖鍝堥】锛夛細**Core 5 / Worker 3 / Vanguard 4 / Ranger 5**
-  - 闅滅閬尅瑙嗙嚎锛坄has_line_of_sight`锛夊悗鍐欏叆 `explored_cells`
-  - Dashboard 瀵煎嚭鏍煎瓙绾у凡鎺紝渚夸簬瀵圭収鐪熷疄鍙鑼冨洿
-- **Beacon 鍧愭爣**锛氭瘡 tick 鐢?`decide()` 浠?`turn.beacon` 鍚屾鍒?`config.beacon_position`锛圙ROUND/None 鍐欎綅缃紝CARRIED 娓呯┖锛夛紱鎺ㄨ繘鐢?`beacon_progress_target` 閫愭闈犺繎
+- 进程内 `MemoryMap`：资源状态机、永久障碍、掉落 cargo、16×16 chunk 已探与陈旧回访
+- **已探格子 = 官方 FOV 历史**（非「走过的足迹」）：
+  - 半径（曼哈顿）：**Core 5 / Worker 3 / Vanguard 4 / Ranger 5**
+  - 障碍遮挡视线（`has_line_of_sight`）后写入 `explored_cells`
+  - Dashboard 导出格子级已探，便于对照真实可见范围
 
-## 榛樿鍙傛暟锛坄bot/config.py`锛屼互浠ｇ爜涓哄噯锛?
+## 默认参数（`bot/config.py`，以代码为准）
 
-| 鍙傛暟 | 鍏稿瀷榛樿 | 璇存槑 |
+| 参数 | 典型默认 | 说明 |
 |------|----------|------|
-| `max_population` | **20** | 鍩虹浠锋弧缂栫‖椤?|
-| `target_workers` | **12** | 鐩爣宸ヤ汉 |
-| `target_vanguards` | **4** | 鐩爣鍏堥攱 |
-| `target_rangers` | **4** | 鐩爣娓镐緺 |
-| `spiral_base_ring` | 3 | 鏈湴铻烘棆璧峰鐜?|
-| `spiral_max_ring` | **24** | 鏈湴铻烘棆涓婇檺锛堟敹绱х┖杞級 |
-| `sector_count` | **4** | Worker 鎵囧尯鍒嗘暎 |
-| `beacon_max_chase` | **10000** | Core鈫払eacon 瓒呰窛涓嶈拷锛堥粯璁も増涓嶉檺锛岀嚎涓?d鈮?000 鍙拷锛?|
-| `beacon_min_workers` | **3** | 鏃╂湡鍏ㄥ憳閲囷紝澶熶汉鍐?1 浜轰睛瀵?|
-| `beacon_push_population` | **10** | 鎬讳汉鍙?鈮?姝ゅ€?鈫?鍚戜俊鏍囨帹杩?|
-| `beacon_push_explore_ratio` | **0.8** | 鏈湴锛坰piral_max_ring锛夋帰绱㈠害 鈮?姝ゆ瘮渚?鈫?鍚戜俊鏍囨帹杩?|
-| `recall_stall_ticks` | 6 | 鏃犺繘灞曡蒋鍥炴挙 |
-| `retreat_adjacent` | 1 | 绌鸿揣璐磋韩鎵嶆挙 |
-| `retreat_radius` | 3 | 婊¤揣淇濇姢鍗婂緞 |
-| `beacon_step_radius` | 8 | Beacon 闃舵姝ヨ窛 |
-| `CHUNK_SIZE` | **16** | 鍦板浘鍧楀昂瀵革紙MemoryMap explored 鏍囪绮掑害锛泇2 浠?32 鈫?16锛屽垏 chunk 鏇撮瀵嗭級|
-| `refresh_interval_ticks` | 4 | 璧勬簮鍥炶ˉ鑺傛媿 / 闄堟棫 chunk 鍥炶鍩哄噯锛堥檲鏃ч槇鍊?= refresh_interval * 50 鈮?200 tick锛墊
+| `max_population` | **20** | 基础价满编硬顶 |
+| `target_workers` | **12** | 目标工人 |
+| `target_vanguards` | **4** | 目标先锋 |
+| `target_rangers` | **4** | 目标游侠 |
+| `spiral_base_ring` | 3 | 本地螺旋起始环 |
+| `spiral_max_ring` | **24** | 本地螺旋上限（收紧空转） |
+| `sector_count` | **4** | Worker 扇区分散 |
+| `beacon_max_chase` | **64** | 超距不追 Beacon |
+| `beacon_min_workers` | **3** | 早期全员采，够人再 1 人侦察 |
+| `beacon_push_population` | **10** | 总人口 ≥ 此值 → 向信标推进 |
+| `beacon_push_explore_ratio` | **0.8** | 本地（spiral_max_ring）探索度 ≥ 此比例 → 向信标推进 |
+| `recall_stall_ticks` | 6 | 无进展软回撤 |
+| `retreat_adjacent` | 1 | 空货贴身才撤 |
+| `retreat_radius` | 3 | 满货保护半径 |
+| `beacon_step_radius` | 8 | Beacon 阶段步距 |
+| `CHUNK_SIZE` | **16** | 地图块尺寸（MemoryMap explored 标记粒度；v2 从 32 → 16，切 chunk 更频密）|
+| `refresh_interval_ticks` | 4 | 资源回补节拍 / 陈旧 chunk 回访基准（陈旧阈值 = refresh_interval * 50 ≈ 200 tick）|
 
-璋冨弬锛氭敼 `TacticConfig` 鎴?`decide(turn, config=...)`銆?
+调参：改 `TacticConfig` 或 `decide(turn, config=...)`。
 
-**寤鸿锛?* 鎬荤紪鍒朵繚鎸?**鈮?0**锛岀敤婊?v0.14 鍩虹浠锋牸鍖洪棿锛涚 21 涓崟浣嶅紑濮嬪姩鎬佹定浠枫€?
+**建议：** 总编制保持 **≤20**，用满 v0.14 基础价格区间；第 21 个单位开始动态涨价。
 
-> **鐢熶骇鑺傚锛坴2锛?*锛歐orker 杈?3/6/9/12 鍙伴樁鏃舵寜搴忔彃鎺?VANGUARD 涓?RANGER锛屾渶缁堢洰鏍?12W / 4V / 4R锛堝熀纭€浠锋弧缂?20锛夈€?
+> **生产节奏（v2）**：Worker 达 3/6/9/12 台阶时按序插排 VANGUARD 与 RANGER，最终目标 12W / 4V / 4R（基础价满编 20）。
 
-## 瀹樻柟瑙勫垯閫熸煡锛坴0.14锛?
+## 官方规则速查（v0.14）
 
-- 鍛戒护绐楀彛 **15s**锛涙瘡瀵硅薄姣?tick **涓€涓?*鍔ㄤ綔
-- **鏃?*姣?tick 缁存姢璐癸紱鍔ㄦ€佷环锛歚k=max(0,floor((pop-20)/5)+1)`锛宍price鈮坆ase脳1.3^k`
-- 鍩虹浠凤紙pop 0鈥?9锛夛細Worker **5** / Vanguard **10** / Ranger **12**
-- 璧勬簮锛氭瘡 4 resolved tick 鎸?chunk 閰嶉琛ョ偣锛涙寔 Beacon 鏃?harvest 脳2
-- 缁撶畻椤哄簭瑕佺偣锛氱Щ鍔?鈫?harvest/deposit 鈫?鎴樻枟 鈫?heal 鈫?spawn
-- Beacon锛氬潗鏍囧叕寮€锛汼DK `status=None` 瑙嗕负鍦伴潰鍙拷韪?
-- **瑙嗛噹锛堟浖鍝堥】锛?*锛欳ore **5** / Worker **3** / Vanguard **4** / Ranger **5**锛涢殰纰嶅彲鎸¤绾?
+- 命令窗口 **15s**；每对象每 tick **一个**动作
+- **无**每 tick 维护费；动态价：`k=max(0,floor((pop-20)/5)+1)`，`price≈base×1.3^k`
+- 基础价（pop 0–19）：Worker **5** / Vanguard **10** / Ranger **12**
+- 资源：每 4 resolved tick 按 chunk 配额补点；持 Beacon 时 harvest ×2
+- 结算顺序要点：移动 → harvest/deposit → 战斗 → heal → spawn
+- Beacon：坐标公开；SDK `status=None` 视为地面可追踪
+- **视野（曼哈顿）**：Core **5** / Worker **3** / Vanguard **4** / Ranger **5**；障碍可挡视线
 
-鏇村锛歔娓告垙瑙勫垯](https://doc.arenahero.io/zh-Hans/rules/world-and-ticks) 路 [瑙勫垯閫熸煡](https://doc.arenahero.io/zh-Hans/reference/numbers) 路 [Python SDK](https://doc.arenahero.io/zh-Hans/sdk/quickstart)
+更多：[游戏规则](https://doc.arenahero.io/zh-Hans/rules/world-and-ticks) · [规则速查](https://doc.arenahero.io/zh-Hans/reference/numbers) · [Python SDK](https://doc.arenahero.io/zh-Hans/sdk/quickstart)
 
-## 绂荤嚎娴嬭瘯
+## 离线测试
 
 ```bash
-# 寤鸿鍦?venv 涓?
+# 建议在 venv 中
 pytest -q
 pytest tests/test_pathing.py tests/test_economy.py tests/test_memory.py -v
-pytest tests/test_dashboard.py -q   # 闇€ flask锛汚PI 鍖呰/鐜紦鍐?闆舵薄鏌?绛夋満鍒舵祴
+pytest tests/test_dashboard.py -q   # 需 flask；API 包装/环缓冲/零污染 等机制测
 ```
 
 ```python
 from bot.strategy import decide
-result = decide(turn)   # 鍙帓闃燂紝涓?submit
+result = decide(turn)   # 只排队，不 submit
 print(result.summary())
 ```
 
-**瑙傛祴鎬ч獙璇侊紙v2 涓撶敤锛?*锛氱敤浠撳簱鍐?stub 浠跨湡鎴栫嚎涓?`--dashboard` 瀵圭収锛?
+**观测性验证（v2 专用）**：用仓库内 stub 仿真或线上 `--dashboard` 对照：
 
-- `core:spawn:WORKER / VANGUARD / RANGER` 鈫?鍙伴樁鑺傚姝ｇ‘
-- `dispatch:option=self / option=other` 鈫?鐭跨偣璋冨害鐢熸晥
-- `:ring=`锛堝唴鐜級涓?`phase=beacon`锛堝鐜級鍚屾椂鍑虹幇 鈫?鍙屼腑蹇冨垏鎹㈡甯?
-- `new_chunk=` 鈫?鎺㈢储鍦ㄦ帹杩涳紱`pickup_beacon=` 鈫?宸插疄闄呭埌 Beacon
-- Dashboard 鍦板浘 tick 闅忔椂闂撮€掑銆佸凡鎺㈡牸闅忓崟浣嶇Щ鍔ㄦ墿寮?
+- `core:spawn:WORKER / VANGUARD / RANGER` → 台阶节奏正确
+- `dispatch:option=self / option=other` → 矿点调度生效
+- `:ring=`（内环）与 `phase=beacon`（外环）同时出现 → 双中心切换正常
+- `new_chunk=` → 探索在推进；`pickup_beacon=` → 已实际到 Beacon
+- Dashboard 地图 tick 随时间递增、已探格随单位移动扩张
 - `ERROR` / `ProtocolError` = 0
 
-## 璁捐璇存槑
+## 设计说明
 
-- **I/O 鍒嗙**锛歚strategy.decide` 鍙函娴嬶紱`main` 鍙繛鎺ヤ笌 submit
-- **鍦板浘璁板繂**锛歚MemoryMap` 鍙法閲嶅惎钀界洏锛坄.arena_hero_state.json`锛夛紱鏈嶅姟绔笉鍥炴斁鍘嗗彶 FOV锛屾晠 Agent 蹇呴』鑷瓨锛涘惈璧勬簮/闅滅/chunk 涓夌淮 + chunk_last_seen 闄堟棫鍒ゅ畾锛?00 tick锛? **瀹樻柟 FOV 宸叉帰**
-- **闃叉姈瀵昏矾**锛歚clamp_step_toward_memo` 閬垮厤闅滅瀵规姈锛泇2 **鍙犲姞鍘嗗彶闅滅闄嶆潈**锛堚墺3 娆¤鎸?-100锛夛紱纭涓昏酱鍫垫椂璐村缁曡
-- **璺緞浼扮畻锛坴2锛?*锛歚estimate_path_steps` / `reconstruct_path` dry-run锛屽彧鐢ㄤ簬鐭跨偣璋冨害涓?Dashboard 鍙鍖栵紝涓嶆敼鍙樼湡瀹炵姸鎬?
-- **鍙伴樁鐢熶骇锛坴2锛?*锛歚choose_spawn` 鎸?3/6/9/12 鍥涙。鍙伴樁鎻掓帓 V/R锛岀粓鎬?12/4/4 鍩虹浠锋弧缂?20
-- **鍙屼腑蹇冭灪鏃嬶紙v2锛?*锛歚dual_spiral_target` 鍐呯幆 Core + 澶栫幆 Beacon锛岀幆鐖嗗悗鑷姩鍒囩浉浣嶏紝**涓嶅啀鍥為€€鍒板唴鐜皬鑼冨洿姝诲惊鐜?*
-- **缁忔祹鍋ュ悍锛坴2 P3-2锛?*锛氳繛缁?50 tick 鏃?deposit 鈫?鎵撶粨鏋勫寲棰勮鏃ュ織锛屽洖 40 闃插埛灞忥紱256 tick GC 姝讳骸 Worker 鐩稿叧妯″潡瀛楀吀 4 涓?
-- **Dashboard 闆舵薄鏌?*锛氫粎 flag 寮€鍚椂鍚庡彴绾跨▼ + 鐜舰缂撳啿锛沗safe_push_snapshot` 寮傚父鍚炴帀锛屼笉闃绘柇 `submit`
-- **澶辫触瀹夊叏**锛氬崟 turn 寮傚父璁版棩蹇楀苟灏介噺涓嶅崱姝诲惊鐜?
+- **I/O 分离**：`strategy.decide` 可纯测；`main` 只连接与 submit
+- **地图记忆**：进程内 `MemoryMap`，服务端不回放历史；含资源/障碍/chunk 三维 + chunk_last_seen 陈旧判定（200 tick）+ **官方 FOV 已探**
+- **防抖寻路**：`clamp_step_toward_memo` 避免障碍对抖；v2 **叠加历史障碍降权**（≥3 次被挡 -100）；硬墙主轴堵时贴墙绕行
+- **路径估算（v2）**：`estimate_path_steps` / `reconstruct_path` dry-run，只用于矿点调度与 Dashboard 可视化，不改变真实状态
+- **台阶生产（v2）**：`choose_spawn` 按 3/6/9/12 四档台阶插排 V/R，终态 12/4/4 基础价满编 20
+- **双中心螺旋（v2）**：`dual_spiral_target` 内环 Core + 外环 Beacon，环爆后自动切相位，**不再回退到内环小范围死循环**
+- **经济健康（v2 P3-2）**：连续 50 tick 无 deposit → 打结构化预警日志，回 40 防刷屏；256 tick GC 死亡 Worker 相关模块字典 4 个
+- **Dashboard 零污染**：仅 flag 开启时后台线程 + 环形缓冲；`safe_push_snapshot` 异常吞掉，不阻断 `submit`
+- **失败安全**：单 turn 异常记日志并尽量不卡死循环
 
 ## License
 
