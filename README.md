@@ -45,6 +45,7 @@
 ```
 arena-hero-tactic/
   README.md
+  deploy.bat / deploy.sh # 一键部署入口（Windows 双击 / Unix）
   docs/
     GAME_UNDERSTANDING.md   # 游戏怎么运行 / 目标 / Agent 职责
     STRATEGY.md             # 战术原则与 Drew-Z 对照
@@ -62,7 +63,8 @@ arena-hero-tactic/
     dashboard.py         # 可选本地观测：快照环缓冲 + Flask API + SSE 日志
     dashboard_static/    # Dashboard 前端（地图 / 趋势 / 日志）
   scripts/
-    restart_agent.py     # 后台重启 agent（可带 --dashboard）
+    deploy.py            # 一键：venv / 依赖 / .env / 启 Dashboard / health
+    restart_agent.py     # 环境已就绪时仅后台重启 agent
   tests/
   deliverables/
 ```
@@ -74,7 +76,36 @@ arena-hero-tactic/
 - **可选 Dashboard**：`flask>=3.0`（`requirements.txt` 中默认注释；仅 `--dashboard` 时需要）
 - **SDK 版本自检（v2 P3-1）**：启动时 `main.run_loop` 会强制校验 arena-hero 版本 ≥ 0.2.9 且 < 0.3；不满足直接 `SystemExit(1)`，避免 `ProtocolError` 到线上才报错
 
-## 安装
+## 一键部署（推荐）
+
+克隆仓库后，用根目录脚本自动完成：检查 Python ≥ 3.11 → 创建/复用 `.venv` → 安装 `requirements.txt` + Flask（Dashboard）+ psutil → 初始化 `.env` →（可选）结束旧 `bot.main` → 后台启动 `python -m bot.main -v --dashboard` → 探测 `GET /health`。
+
+```bash
+# Windows（也可资源管理器双击 deploy.bat）
+deploy.bat
+deploy.bat --api-key 你的_API_KEY
+deploy.bat --no-start          # 只装环境不启动
+deploy.bat --skip-pip          # 已装好依赖时跳过 pip
+deploy.bat --no-kill           # 不结束已在跑的 agent
+deploy.bat --port 8765
+
+# Linux / macOS
+chmod +x deploy.sh
+./deploy.sh
+./deploy.sh --api-key 你的_API_KEY
+
+# 等价直接调用
+python scripts/deploy.py
+python scripts/deploy.py --foreground   # 前台跑，Ctrl+C 停
+python scripts/deploy.py --quiet        # 启动不加 -v
+```
+
+成功后打开 **http://127.0.0.1:8765/**；PID 写在 `logs/agent.pid`，日志在 `logs/agent.log`。
+**不要**把 `.env` 或真实 Key 提交到 Git；`--api-key` 只写入本地 `.env` 且不会在终端打印明文。
+
+仅重启（环境已就绪）：`python scripts/restart_agent.py`。
+
+## 手动安装
 
 ```bash
 cd arena-hero-tactic
