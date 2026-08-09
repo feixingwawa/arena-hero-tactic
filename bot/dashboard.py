@@ -2,6 +2,7 @@
 from __future__ import annotations
 import collections
 import logging
+import queue
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -18,6 +19,11 @@ __all__ = [
 
 _store_lock = threading.Lock()
 _store_singleton: Optional["DashboardStore"] = None
+
+# 异步快照队列：主循环只入队，后台线程 build+push，避免 BFS 占满 decide 窗口
+_snap_queue: queue.Queue = queue.Queue(maxsize=1)
+_snap_worker_started = False
+_snap_worker_lock = threading.Lock()
 
 
 def get_store() -> "DashboardStore":
@@ -347,42 +353,377 @@ def _obstacle_set_from_memory(memory: Any) -> set[tuple[int, int]]:
     return out
 
 
+def _bfs_path(
+    origin: tuple[int, int],
+    target: tuple[int, int],
+    obstacles: set[tuple[int, int]],
+    *,
+    max_expand: int = 4000,
+) -> tuple[Optional[list[list[int]]], list[list[int]]]:
+    """四连通 BFS 最短绕障路径（Dashboard 可视化专用）。
+
+    - **绝不**踏入 obstacles 格（起点若叠在障上仅作显示起点，下一步必须离开）；
+    - 终点若在障上：寻到邻接可达自由格即止（不踏入终点障）；
+    - 返回 (waypoints|None, blocked_touched)。
+    """
+    ox, oy = origin
+    tx, ty = target
+    if (ox, oy) == (tx, ty):
+        return [[ox, oy]], []
+
+    hard = set(obstacles)
+    goal = (tx, ty)
+    goal_blocked = goal in hard
+    # 可接受到达格：自由终点，或终点被挡时的邻接自由格（永不含障碍格）
+    goal_accept: set[tuple[int, int]] = set()
+    if not goal_blocked:
+        goal_accept.add(goal)
+    else:
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            n = (tx + dx, ty + dy)
+            if n not in hard:
+                goal_accept.add(n)
+        if not goal_accept:
+            return None, [[tx, ty]]
+
+    from collections import deque
+
+    q: deque[tuple[int, int]] = deque()
+    q.append((ox, oy))
+    parent: dict[tuple[int, int], Optional[tuple[int, int]]] = {(ox, oy): None}
+    blocked_touch: list[list[int]] = [[tx, ty]] if goal_blocked else []
+    seen_block: set[tuple[int, int]] = {goal} if goal_blocked else set()
+    expanded = 0
+
+    def _finish(end: tuple[int, int]) -> tuple[list[list[int]], list[list[int]]]:
+        path: list[list[int]] = []
+        cur: Optional[tuple[int, int]] = end
+        while cur is not None:
+            path.append([cur[0], cur[1]])
+            cur = parent.get(cur)
+        path.reverse()
+        return path, blocked_touch
+
+    if (ox, oy) in goal_accept:
+        return [[ox, oy]], blocked_touch
+
+    while q and expanded < max_expand:
+        x, y = q.popleft()
+        expanded += 1
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = x + dx, y + dy
+            nxt = (nx, ny)
+            if nxt in parent:
+                continue
+            if nxt in hard:
+                # 硬障永不入队；仅记录触碰
+                if nxt not in seen_block:
+                    seen_block.add(nxt)
+                    blocked_touch.append([nx, ny])
+                continue
+            parent[nxt] = (x, y)
+            if nxt in goal_accept:
+                return _finish(nxt)
+            q.append(nxt)
+
+    return None, blocked_touch
+
+
+def _downsample_waypoints(
+    wps: list[list[int]], *, max_points: int = 80
+) -> list[list[int]]:
+    """过密路点降采样，保留首尾与转折，便于前端绘制。"""
+    if len(wps) <= max_points:
+        return wps
+    keep = {0, len(wps) - 1}
+    # 均匀取样
+    step = max(1, (len(wps) - 1) // (max_points - 2))
+    for i in range(0, len(wps), step):
+        keep.add(i)
+    # 转折点
+    for i in range(1, len(wps) - 1):
+        ax, ay = wps[i - 1]
+        bx, by = wps[i]
+        cx, cy = wps[i + 1]
+        if (bx - ax, by - ay) != (cx - bx, cy - by):
+            keep.add(i)
+    idxs = sorted(keep)
+    if len(idxs) > max_points:
+        # 再均匀压缩
+        step2 = max(1, len(idxs) // max_points)
+        core = idxs[::step2]
+        if idxs[-1] not in core:
+            core.append(idxs[-1])
+        idxs = sorted(set(core))
+    return [wps[i] for i in idxs]
+
+
+def _filter_obstacle_waypoints(
+    wps: list[list[int]],
+    obstacles: set[tuple[int, int]],
+    *,
+    origin: tuple[int, int],
+    target: tuple[int, int],
+) -> list[list[int]]:
+    """剥离路径中的障碍格；禁止画线与障碍重合。
+
+    仅保留起点（单位当前格，即使异常叠障也要有起点），其余障碍格一律剔除。
+    目的地菱形由前端 destination 单独绘制，不依赖 waypoints 含 target 障格。
+    """
+    if not wps:
+        return wps
+    out: list[list[int]] = []
+    for p in wps:
+        t = (int(p[0]), int(p[1]))
+        # 除 origin 外，障碍格一律不进折线
+        if t in obstacles and t != origin:
+            continue
+        if out and out[-1] == [t[0], t[1]]:
+            continue
+        out.append([t[0], t[1]])
+    if not out:
+        return [[origin[0], origin[1]]]
+    return out
+
+
+def _runtime_expand_cap(man: int) -> int:
+    """与 guided_step_toward / _install_bfs_route 相同的 A* expand 上限。"""
+    if man <= 12:
+        return 600
+    if man <= 40:
+        return 1800
+    return 4500
+
+
+def _blocked_touch_along_path(
+    wps: list[list[int]],
+    hard: set[tuple[int, int]],
+    *,
+    limit: int = 32,
+) -> list[list[int]]:
+    """沿路径邻接障碍，供前端粉色高亮（非路径本身）。"""
+    out: list[list[int]] = []
+    seen: set[tuple[int, int]] = set()
+    for p in wps:
+        try:
+            x, y = int(p[0]), int(p[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nb = (x + dx, y + dy)
+            if nb in hard and nb not in seen:
+                seen.add(nb)
+                out.append([nb[0], nb[1]])
+                if len(out) >= limit:
+                    return out
+    return out
+
+
+def _path_reached(
+    wps: list[list[int]],
+    tx: int,
+    ty: int,
+    hard: set[tuple[int, int]],
+) -> bool:
+    if not wps:
+        return False
+    lx, ly = int(wps[-1][0]), int(wps[-1][1])
+    if (tx, ty) in hard:
+        return abs(lx - tx) + abs(ly - ty) == 1
+    return lx == tx and ly == ty
+
+
 def _build_path_estimate(
     origin: tuple[int, int],
     target: Optional[list],
     obstacles: set[tuple[int, int]],
+    *,
+    cache: Optional[dict] = None,
+    max_steps: int = 160,
+    far_manhattan: int = 40,
+    runtime_route: Optional[list] = None,
 ) -> Optional[dict]:
-    """用 pathing.reconstruct_path 生成路径可视化数据（不修改 memory）。"""
+    """生成与**运行时执行**一致的导航路径可视化（不修改 memory）。
+
+    硬约束：waypoints 不得落在 obstacles 上（穿障线禁止）。
+    策略（submit 之后，后台线程算，可完整跑 A*）：
+    1. **优先** Worker 本 tick 已缓存的 A* ``route_waypoints``（与 guided 实际走的相同）；
+    2. 否则调用 pathing._astar_route（与 bfs_next_step / _install_bfs_route 同源 + 同 expand cap）；
+    3. A* 失败再 reconstruct_path；仍失败只画原点，**绝不**曼哈顿穿障补线。
+    """
     if target is None or not isinstance(target, (list, tuple)) or len(target) < 2:
         return None
     try:
+        ox, oy = int(origin[0]), int(origin[1])
         tx, ty = int(target[0]), int(target[1])
     except (TypeError, ValueError):
         return None
+
+    hard = set(obstacles) if obstacles else set()
+    man = abs(tx - ox) + abs(ty - oy)
+    if man <= 0:
+        est = {
+            "steps": 0,
+            "waypoints": [[ox, oy]],
+            "blocked": [],
+            "destination": [tx, ty],
+            "planned": "noop",
+            "approx": False,
+            "partial": False,
+        }
+        return est
+
+    # 1) 运行时已装好的 A* 航点：前端黄线 = 单位下一步真正会走的路
+    if runtime_route:
+        raw_rt: list[list[int]] = [[ox, oy]]
+        for p in runtime_route:
+            try:
+                if isinstance(p, dict):
+                    raw_rt.append([int(p["x"]), int(p["y"])])
+                else:
+                    raw_rt.append([int(p[0]), int(p[1])])
+            except (TypeError, ValueError, IndexError, KeyError):
+                continue
+        wps = _filter_obstacle_waypoints(
+            raw_rt, hard, origin=(ox, oy), target=(tx, ty)
+        )
+        # 运行时 route 已是执行路径，不降采样丢拐点（最多 96 与 runtime 缓存一致）
+        if len(wps) > 96:
+            wps = wps[:96]
+        reached = _path_reached(wps, tx, ty, hard)
+        # 终点未在 route 尾：仍画已装航点（单位正沿途走），标 partial 但不改路线
+        est = {
+            "steps": max(0, len(wps) - 1),
+            "waypoints": wps if wps else [[ox, oy]],
+            "blocked": _blocked_touch_along_path(wps, hard),
+            "destination": [tx, ty],
+            "approx": not reached,
+            "partial": not reached,
+            "planned": "runtime",
+        }
+        return est
+
+    key = ((ox, oy), (tx, ty))
+    if cache is not None and key in cache:
+        return cache[key]
+
+    expand_cap = _runtime_expand_cap(man)
+
+    # 2) 与 runtime 同源 A*（接口名历史为 bfs_next_step，实现已是 A*）
+    try:
+        from bot.pathing import _astar_route
+
+        result = _astar_route(
+            (ox, oy), (tx, ty), hard, max_expand=expand_cap, avoid=None
+        )
+        if result is not None:
+            rev, _parent, found = result
+            raw = [[ox, oy]] + [[int(p[0]), int(p[1])] for p in rev]
+            wps = _filter_obstacle_waypoints(
+                raw, hard, origin=(ox, oy), target=(tx, ty)
+            )
+            # 完整路径不降采样（与 runtime route[:96] 对齐）；过长截断尾
+            if len(wps) > 96:
+                wps = wps[:96]
+            reached = _path_reached(wps, tx, ty, hard)
+            # 邻接障碍高亮 + 终点若在障上
+            blocked = _blocked_touch_along_path(wps, hard)
+            if (tx, ty) in hard and [tx, ty] not in blocked:
+                blocked = [[tx, ty]] + blocked
+                blocked = blocked[:32]
+            est = {
+                "steps": max(0, len(rev)),
+                "waypoints": wps if wps else [[ox, oy]],
+                "blocked": blocked[:32],
+                "destination": [tx, ty],
+                "approx": not reached,
+                "partial": not reached,
+                "planned": "astar",  # 与 runtime A* 同源；前端仍按 planned 实线/虚线
+            }
+            if cache is not None:
+                cache[key] = est
+            return est
+    except Exception:
+        pass
+
+    # 兼容旧测试/短路径：本地 BFS（同 cap 语义下的最短路，无 A* 启发时仍正确）
+    try:
+        bfs_wps, bfs_blocked = _bfs_path(
+            (ox, oy), (tx, ty), hard, max_expand=expand_cap
+        )
+        if bfs_wps and len(bfs_wps) >= 1:
+            wps = _filter_obstacle_waypoints(
+                bfs_wps, hard, origin=(ox, oy), target=(tx, ty)
+            )
+            if len(wps) > 96:
+                wps = wps[:96]
+            reached = _path_reached(wps, tx, ty, hard)
+            est = {
+                "steps": max(0, len(bfs_wps) - 1),
+                "waypoints": wps,
+                "blocked": (bfs_blocked or [])[:32],
+                "destination": [tx, ty],
+                "approx": not reached,
+                "partial": not reached,
+                "planned": "bfs",
+            }
+            if cache is not None:
+                cache[key] = est
+            return est
+    except Exception:
+        pass
+
+    # 3) A*/BFS 未通：runtime 同源 reconstruct（仍禁止穿障补线）
     try:
         from bot.pathing import reconstruct_path
 
+        step_cap = max(16, min(int(max_steps), man + max(16, man // 2)))
         steps, blocked, waypoints = reconstruct_path(
-            (int(origin[0]), int(origin[1])),
+            (ox, oy),
             (tx, ty),
-            obstacles,
-            memory=None,  # 禁止 dry-run 写回 memory
-            max_steps=64,
+            hard,
+            memory=None,
+            max_steps=step_cap,
         )
-        return {
-            "steps": int(steps),
-            "waypoints": [[int(p[0]), int(p[1])] for p in waypoints],
-            "blocked": [[int(p[0]), int(p[1])] for p in blocked],
+        raw = [[int(p[0]), int(p[1])] for p in waypoints]
+        wps = _filter_obstacle_waypoints(
+            raw, hard, origin=(ox, oy), target=(tx, ty)
+        )
+        if len(wps) > 96:
+            wps = wps[:96]
+        reached = bool(wps) and wps[-1][0] == tx and wps[-1][1] == ty
+        est = {
+            "steps": int(steps) if reached else max(len(wps) - 1, 0),
+            "waypoints": wps if wps else [[ox, oy]],
+            "blocked": [[int(p[0]), int(p[1])] for p in blocked][:32],
             "destination": [tx, ty],
+            "approx": not reached,
+            "planned": "reconstruct",
+            "partial": not reached,
         }
+        if cache is not None:
+            cache[key] = est
+        return est
     except Exception:
-        return None
+        est = {
+            "steps": int(man),
+            "waypoints": [[ox, oy]],
+            "blocked": [],
+            "destination": [tx, ty],
+            "approx": True,
+            "planned": "none",
+            "partial": True,
+        }
+        if cache is not None:
+            cache[key] = est
+        return est
 
 
 def _build_unit(
     u: Any,
     econ_states: Optional[dict],
     obstacles: Optional[set[tuple[int, int]]] = None,
+    path_cache: Optional[dict] = None,
 ) -> dict:
     uid = str(getattr(u, "id", ""))
     pos_obj = getattr(u, "position", None)
@@ -391,10 +732,11 @@ def _build_unit(
     else:
         ux, uy = int(getattr(u, "x", 0)), int(getattr(u, "y", 0))
     econ: dict
+    tgt_list: Optional[list] = None
+    runtime_route: Optional[list] = None
     if econ_states and uid in econ_states:
         ws = econ_states[uid]
         tgt = getattr(ws, "target", None)
-        tgt_list: Optional[list] = None
         if tgt is not None:
             try:
                 tx, ty = _as_position(tgt)
@@ -408,6 +750,25 @@ def _build_unit(
         phase = getattr(ws, "phase", None)
         role = getattr(ws, "role", None)
         dedicated = getattr(ws, "dedicated", None)
+        raw_route = getattr(ws, "route_waypoints", None)
+        if raw_route:
+            try:
+                runtime_route = []
+                for p in raw_route:
+                    if isinstance(p, dict):
+                        runtime_route.append([int(p["x"]), int(p["y"])])
+                    else:
+                        runtime_route.append([int(p[0]), int(p[1])])
+            except Exception:
+                runtime_route = None
+        if tgt_list is None:
+            rd = getattr(ws, "route_dest", None)
+            if rd is not None:
+                try:
+                    rx, ry = _as_position(rd)
+                    tgt_list = [int(rx), int(ry)]
+                except Exception:
+                    pass
         econ = {"target": tgt_list,
                 "ring": int(ring) if ring is not None else None,
                 "sector": int(sector) if sector is not None else None,
@@ -417,14 +778,27 @@ def _build_unit(
     else:
         econ = {"target": None, "ring": None, "sector": None,
                 "phase": None, "role": None, "dedicated": None}
-        tgt_list = None
     path_estimate = None
-    if tgt_list is not None:
-        path_estimate = _build_path_estimate(
-            (int(ux), int(uy)), tgt_list, obstacles or set()
-        )
+    # 仅 Worker 估路径；优先 runtime A* 航点，与 guided 实际执行一致
+    utype = str(getattr(u, "type", getattr(u, "unit_type", "")) or "")
+    if (tgt_list is not None or runtime_route) and "WORKER" in utype.upper():
+        dest = tgt_list
+        if dest is None and runtime_route:
+            try:
+                last = runtime_route[-1]
+                dest = [int(last[0]), int(last[1])]
+            except Exception:
+                dest = None
+        if dest is not None:
+            path_estimate = _build_path_estimate(
+                (int(ux), int(uy)),
+                dest,
+                obstacles or set(),
+                cache=path_cache,
+                runtime_route=runtime_route,
+            )
     return {"id": uid,
-            "type": str(getattr(u, "type", getattr(u, "unit_type", ""))),
+            "type": utype,
             "x": int(ux), "y": int(uy),
             "hp": int(getattr(u, "hp", 0) or 0),
             "cargo": int(getattr(u, "cargo", 0) or 0),
@@ -494,10 +868,14 @@ def build_snapshot(turn: Any, result: Any, memory: Any, econ_states: Optional[di
                  list(getattr(turn, "vanguards", None) or []) +
                  list(getattr(turn, "rangers", None) or []))
     path_obstacles = _obstacle_set_from_memory(memory)
+    # 同帧路径估算缓存：多 Worker 常指向同一 Core/矿点
+    path_cache: dict = {}
     units_list = []
     for u in all_units:
         try:
-            units_list.append(_build_unit(u, econ_states, path_obstacles))
+            units_list.append(
+                _build_unit(u, econ_states, path_obstacles, path_cache=path_cache)
+            )
         except Exception:
             continue
     beacon = getattr(turn, "beacon", None)
@@ -555,22 +933,81 @@ def build_snapshot(turn: Any, result: Any, memory: Any, econ_states: Optional[di
     }
 
 
-def safe_push_snapshot(turn: Any, result: Any, memory: Any, econ_states: Optional[dict] = None) -> None:
-    try:
-        snap = build_snapshot(turn, result, memory, econ_states)
-        if snap is None:
-            # 临时诊断：记录 build_snapshot 为何返回 None（真实SDK链路排查用）
-            import logging as _lg
-            _lg.getLogger("arena_hero_tactic").warning(
-                "dashboard:build_snapshot=None turn=%s result=%s turn_tick=%r result_tick=%r",
-                type(turn).__name__, type(result).__name__,
-                getattr(turn, "tick", "<noattr>"), getattr(result, "tick", "<noattr>"))
+def _ensure_snap_worker() -> None:
+    """启动单例后台线程：只保留最新一帧快照参数，丢弃积压。"""
+    global _snap_worker_started
+    if _snap_worker_started:
+        return
+    with _snap_worker_lock:
+        if _snap_worker_started:
             return
-        get_store().push_snapshot(snap)
+
+        def _worker() -> None:
+            log = logging.getLogger("arena_hero_tactic")
+            while True:
+                try:
+                    item = _snap_queue.get()
+                except Exception:
+                    continue
+                if item is None:
+                    continue
+                turn, result, memory, econ_states = item
+                try:
+                    snap = build_snapshot(turn, result, memory, econ_states)
+                    if snap is None:
+                        log.warning(
+                            "dashboard:build_snapshot=None turn=%s result=%s "
+                            "turn_tick=%r result_tick=%r",
+                            type(turn).__name__,
+                            type(result).__name__,
+                            getattr(turn, "tick", "<noattr>"),
+                            getattr(result, "tick", "<noattr>"),
+                        )
+                        continue
+                    get_store().push_snapshot(snap)
+                except Exception:  # noqa: BLE001
+                    import traceback
+
+                    log.warning(
+                        "dashboard:ERROR %s", traceback.format_exc(limit=1)
+                    )
+
+        t = threading.Thread(
+            target=_worker, name="dashboard-snap-worker", daemon=True
+        )
+        t.start()
+        _snap_worker_started = True
+
+
+def safe_push_snapshot(
+    turn: Any, result: Any, memory: Any, econ_states: Optional[dict] = None
+) -> None:
+    """非阻塞入队：主循环立刻返回，BFS/path_estimate 在后台做。
+
+    队列 maxsize=1：新帧覆盖旧帧（drop oldest），保证 UI 跟最新 tick，
+    且不会因 build 慢而堆积拖垮进程。
+    """
+    try:
+        _ensure_snap_worker()
+        item = (turn, result, memory, econ_states)
+        try:
+            _snap_queue.put_nowait(item)
+        except queue.Full:
+            try:
+                _snap_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                _snap_queue.put_nowait(item)
+            except queue.Full:
+                # 极端：worker 卡在 put/get 间隙，丢本帧即可
+                pass
     except Exception:  # noqa: BLE001
-        import logging, traceback
+        import traceback
+
         logging.getLogger("arena_hero_tactic").warning(
-            "dashboard:ERROR %s", traceback.format_exc(limit=1))
+            "dashboard:enqueue_ERROR %s", traceback.format_exc(limit=1)
+        )
 
 
 # ============ Module F: Flask App + REST + SSE Routes ============

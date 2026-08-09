@@ -94,12 +94,20 @@ def _make_adapter_fixture() -> tuple[StubTurn, Any, MemoryMap, dict[str, Any]]:
     turn.resource_cells = [cell_obj, ((5, 6), 2)]  # type: ignore[assignment]  # 结构异构
     # 使用真实 MemoryMap，调用官方 API 写入 obstacles/explored_chunks/obstacle_blocks
     # mark_explored(pos, tick)：pos 所在 16×16 chunk；explored_chunk_ticks 记首次 tick
+    # record_obstacle_block(pos, tick) 第二参是 tick，block_count 每次 +1；
+    # 结构测试需要固定 count → 直接写 obstacle_cache（与 runtime 同源结构）
+    from bot.memory import ObstacleState
+
     memory = MemoryMap()
     memory.obstacles.add((2, 3))
     memory.mark_explored((0, 0), 99)   # chunk (0,0)
     memory.mark_explored((16, 0), 95)  # chunk (1,0)
-    memory.record_obstacle_block((2, 3), 77)  # 真实 block_count 写入接口
-    memory.record_obstacle_block((4, 4), 88)
+    memory.obstacle_cache[(2, 3)] = ObstacleState(
+        pos=(2, 3), first_seen_tick=1, last_seen_tick=77, block_count=77
+    )
+    memory.obstacle_cache[(4, 4)] = ObstacleState(
+        pos=(4, 4), first_seen_tick=1, last_seen_tick=88, block_count=88
+    )
     # DecisionResult 使用 SimpleNamespace 结构容器（只存字段，不冒充 bot DecisionPlan）
     result = types.SimpleNamespace(
         tick=7,
@@ -272,30 +280,56 @@ def test_build_snapshot_official_stubs_and_memory() -> None:
 
 def test_build_snapshot_returns_None_for_no_tick_no_result_strictness() -> None:
     """【严格不兜底】turn=None 或 result=None 或 tick 缺失 → build_snapshot 返回 None。
-    EXP-817061：禁止连接失败回退到 tick=0 / 0值伪造。"""
+    EXP-817061：禁止连接失败回退到 tick=0 / 0值伪造。
+
+    注：正式管线 result.tick 优先，turn.tick 可作回退（真实 SDK turn 有 tick）；
+    仅当 result 与 turn 都无 tick 时才返回 None。
+    """
     from tests.stubs import StubTurn
     # Case A: turn=None, result=None → None
     assert dashboard_module.build_snapshot(None, None, None) is None
-    # Case B: valid turn & result but both missing tick attribute
-    turn = StubTurn(tick=1)  # StubTurn has .tick → but result has none
-    result_wo_tick = types.SimpleNamespace(resources=5)  # no tick at all
-    assert dashboard_module.build_snapshot(turn, result_wo_tick, None) is None, (
-        "result 无 tick 时 build_snapshot 必须返回 None，不得兜底伪造 tick=0"
+    # Case B: result 无 tick 但 turn 有真实 tick → 允许用 turn.tick（非伪造 0）
+    turn = StubTurn(tick=1)
+    result_wo_tick = types.SimpleNamespace(resources=5)
+    snap_b = dashboard_module.build_snapshot(turn, result_wo_tick, None)
+    assert snap_b is not None and snap_b.get("tick") == 1
+    # Case C: result 与 turn 都无可用 tick → 必须 None，不得伪造 tick=0
+    turn_wo_tick = types.SimpleNamespace(core=None, workers=[], vanguards=[], rangers=[])
+    assert dashboard_module.build_snapshot(turn_wo_tick, result_wo_tick, None) is None, (
+        "result/turn 均无 tick 时 build_snapshot 必须返回 None，不得兜底伪造 tick=0"
     )
 
 
 # ========== 第四组：safe_push_snapshot 异常吞（纯机制） ==========
 
 def test_safe_push_build_error_swallows_MECHANISM(monkeypatch, caplog) -> None:
-    """【纯机制】build_snapshot 抛异常 → safe_push_snapshot 不抛；logging WARNING。"""
+    """【纯机制】build_snapshot 抛异常 → safe_push_snapshot 不抛；logging WARNING。
+
+    快照已改为后台线程：入队后需短暂等待 worker 消费。
+    """
+    import time as _time
+
     def _boom(*a, **kw):
         raise RuntimeError("boom")
+
     monkeypatch.setattr(dashboard_module, "build_snapshot", _boom)
     with caplog.at_level(logging.WARNING, logger="arena_hero_tactic"):
         dashboard_module.safe_push_snapshot(None, None, None)
+        # 后台 worker 异步 build；轮询最多 ~1s
+        deadline = _time.monotonic() + 1.5
+        while _time.monotonic() < deadline:
+            if any(
+                "dashboard:ERROR" in r.getMessage()
+                for r in caplog.records
+                if r.levelno >= logging.WARNING
+            ):
+                break
+            _time.sleep(0.05)
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     has_dashboard_error = any("dashboard:ERROR" in r.getMessage() for r in warnings)
-    assert has_dashboard_error, f"期望 WARNING 含 'dashboard:ERROR'，实际 {[r.getMessage() for r in warnings]}"
+    assert has_dashboard_error, (
+        f"期望 WARNING 含 'dashboard:ERROR'，实际 {[r.getMessage() for r in warnings]}"
+    )
 
 
 # ========== 第五组：DashboardLogHandler 安全（纯机制） ==========
@@ -510,3 +544,97 @@ def test_requirements_flask_is_commented_out_STRICTNESS() -> None:
         ok = stripped.startswith("#") or "optional" in stripped.lower() or "dashboard" in stripped.lower()
         assert ok, (f"requirements.txt 含未注释启用的 flask 依赖行（违反零污染）: {ln!r}\n"
                     "请改为注释 + '# optional: dashboard' 声明")
+
+
+# ========== 路径估计：真实绕障 / 不穿障 ==========
+
+def test_bfs_path_detours_around_wall() -> None:
+    """中间竖墙时 BFS 必须绕行，路点不得落在障碍格。"""
+    from bot.dashboard import _bfs_path
+
+    origin = (0, 0)
+    target = (4, 0)
+    # 竖墙 x=2,y=-2..2 阻断直线
+    obstacles = {(2, y) for y in range(-2, 3)}
+    wps, blocked = _bfs_path(origin, target, obstacles, max_expand=2000)
+    assert wps is not None, "应找到绕障路径"
+    cells = [(int(p[0]), int(p[1])) for p in wps]
+    for c in cells:
+        assert c not in obstacles, f"路点穿障 {c}"
+    assert cells[0] == origin
+    assert cells[-1] == target
+    # 必须绕行：出现 y!=0 的点
+    assert any(y != 0 for _, y in cells), f"未绕行: {cells}"
+    assert blocked, "应记录触碰墙体"
+
+
+def test_bfs_path_never_enters_blocked_goal() -> None:
+    """终点在障碍上时停在邻接自由格，不踏入终点障。"""
+    from bot.dashboard import _bfs_path
+
+    origin = (0, 0)
+    target = (3, 0)
+    obstacles = {(3, 0)}
+    wps, blocked = _bfs_path(origin, target, obstacles, max_expand=500)
+    assert wps is not None
+    cells = [(int(p[0]), int(p[1])) for p in wps]
+    assert target not in cells
+    assert all(c not in obstacles for c in cells)
+    assert abs(cells[-1][0] - 3) + abs(cells[-1][1] - 0) == 1
+    # 终点障应记入 blocked 供前端高亮
+    assert any(tuple(b) == (3, 0) or list(b) == [3, 0] for b in blocked)
+
+
+def test_build_path_estimate_no_through_obstacles() -> None:
+    """_build_path_estimate 路点不得与障碍重合（除起点异常叠障）。"""
+    from bot.dashboard import _build_path_estimate
+
+    origin = (0, 0)
+    target = [6, 0]
+    obstacles = {(2, 0), (3, 0), (4, 0)}  # 直线全堵
+    est = _build_path_estimate(origin, target, obstacles)
+    assert est is not None
+    assert est.get("planned") in {"astar", "bfs", "reconstruct", "none", "runtime"}
+    wps = est.get("waypoints") or []
+    for p in wps:
+        t = (int(p[0]), int(p[1]))
+        if t == origin:
+            continue
+        assert t not in obstacles, f"estimate 穿障 {t} planned={est.get('planned')}"
+    # 有绕行时应为 astar/bfs 且 steps > manhattan
+    if est.get("planned") in {"astar", "bfs"} and not est.get("partial"):
+        assert est["steps"] > 6 or abs(wps[-1][1]) > 0
+
+
+def test_build_path_estimate_clear_is_bfs_shortest() -> None:
+    """无障碍时 A*/BFS 为曼哈顿最短，planned=astar（或 bfs 兜底），非 approx。"""
+    from bot.dashboard import _build_path_estimate
+
+    est = _build_path_estimate((1, 1), [4, 3], set())
+    assert est is not None
+    assert est["planned"] in {"astar", "bfs"}
+    assert est.get("approx") is False
+    assert est["steps"] == 5  # |3|+|2|
+    wps = est["waypoints"]
+    assert wps[0] == [1, 1]
+    assert wps[-1] == [4, 3]
+
+
+def test_build_path_estimate_prefers_runtime_route() -> None:
+    """有 runtime_route 时 planned=runtime，黄线与执行航点一致。"""
+    from bot.dashboard import _build_path_estimate
+
+    # 故意给一条绕行 runtime 路线（与直线不同）
+    runtime = [[1, 0], [1, 1], [2, 1], [3, 1], [3, 0]]
+    est = _build_path_estimate(
+        (0, 0), [3, 0], set(), runtime_route=runtime
+    )
+    assert est is not None
+    assert est["planned"] == "runtime"
+    wps = est["waypoints"]
+    assert wps[0] == [0, 0]
+    # 必须包含 runtime 拐点，不能被重算成直线
+    cells = [(p[0], p[1]) for p in wps]
+    assert (1, 1) in cells and (2, 1) in cells
+    for c in cells[1:]:
+        assert c not in {(9, 9)}  # smoke

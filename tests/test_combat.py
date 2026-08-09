@@ -71,8 +71,9 @@ def test_vanguard_holds_defense_ring(config: TacticConfig) -> None:
 
 
 def test_ranger_shoots_in_range(config: TacticConfig) -> None:
-    ranger = StubUnit(position=(10, 10), hp=2, unit_type="RANGER")
-    enemy = StubEnemy(position=(10, 13), hp=2)  # 直线距离 3
+    # 不与 Core 同格（同格会优先 leave_core）
+    ranger = StubUnit(position=(10, 12), hp=2, unit_type="RANGER")
+    enemy = StubEnemy(position=(10, 15), hp=2)  # 直线距离 3
     turn = StubTurn(
         core=StubCore(position=(10, 10)),
         rangers=[ranger],
@@ -112,6 +113,54 @@ def test_core_no_heal_when_full(config: TacticConfig) -> None:
     assert acted is False
 
 
+def test_vanguard_leaves_core_overlap(config: TacticConfig) -> None:
+    """Vanguard 与 Core 同格 → 立即 move 离开，日志 leave_core。"""
+    from bot.pathing import NAME_TO_DELTA, add_pos
+
+    core_pos = (10, 10)
+    vanguard = StubUnit(position=core_pos, hp=4, unit_type="VANGUARD")
+    turn = StubTurn(
+        tick=0,
+        core=StubCore(position=core_pos),
+        vanguards=[vanguard],
+        visible_enemies=[],
+    )
+    plan = assign_roles(turn, config=config)
+    logs = command_vanguards(turn, plan, config=config, core_position=core_pos)
+    assert vanguard.action == "move", (vanguard.action, logs)
+    assert any("leave_core" in line for line in logs), logs
+    # action_args 可能是 str 或 SDK Direction 枚举
+    arg = vanguard.action_args
+    name = getattr(arg, "value", arg) if arg is not None else None
+    name = str(name) if name is not None else ""
+    assert name in NAME_TO_DELTA, (arg, name, logs)
+    nxt = add_pos(core_pos, NAME_TO_DELTA[name])
+    assert nxt != core_pos
+
+
+def test_ranger_leaves_core_overlap(config: TacticConfig) -> None:
+    """Ranger 与 Core 同格 → 即使有可射击目标，也优先 leave_core。"""
+    from bot.pathing import NAME_TO_DELTA
+
+    core_pos = (10, 10)
+    ranger = StubUnit(position=core_pos, hp=2, unit_type="RANGER")
+    enemy = StubEnemy(position=(10, 13), hp=2)
+    turn = StubTurn(
+        core=StubCore(position=core_pos),
+        rangers=[ranger],
+        visible_enemies=[enemy],
+    )
+    plan = assign_roles(turn, config=config)
+    logs = command_rangers(turn, plan, config=config, core_position=core_pos)
+    assert ranger.action == "move", (ranger.action, logs)
+    assert ranger.action not in ("shoot", "shoot_cell")
+    assert any("leave_core" in line for line in logs), logs
+    arg = ranger.action_args
+    name = getattr(arg, "value", arg) if arg is not None else None
+    name = str(name) if name is not None else ""
+    assert name in NAME_TO_DELTA, (arg, name, logs)
+
+
 def test_TR_7_2_pick_unused_slot_vanguards(config: TacticConfig) -> None:
     """TR-7.2: 3 个 Vanguards 在 Core 周围相同位置，tick=0 phase=0 → 3 个目标位置互不相同。"""
     from bot.pathing import NAME_TO_DELTA
@@ -135,8 +184,10 @@ def test_TR_7_2_pick_unused_slot_vanguards(config: TacticConfig) -> None:
         pos = tuple(v.position)
         action = v.action
         args = v.action_args
-        if action == "move" and isinstance(args, str) and args in NAME_TO_DELTA:
-            dx, dy = NAME_TO_DELTA[args]
+        name = getattr(args, "value", args) if args is not None else None
+        name = str(name) if name is not None else ""
+        if action == "move" and name in NAME_TO_DELTA:
+            dx, dy = NAME_TO_DELTA[name]
             return (pos[0] + dx, pos[1] + dy)
         return pos
 
@@ -155,9 +206,13 @@ def test_TR_7_3_ranger_fire_ledger_overkill(config: TacticConfig) -> None:
     core_pos = (10, 10)
     e1 = StubEnemy(position=(10, 13), hp=1, unit_type="VANGUARD")
     e2 = StubEnemy(position=(13, 10), hp=1, unit_type="VANGUARD")
-    # 4 个 Rangers 都在 (10,10) 附近，射程内可以射击两个敌人
+    # 4 个 Rangers 不与 Core 同格；两两分别在 e1/e2 直线射程内，
+    # 使后两名会因 fire_ledger 触发 shoot_avoid_overkill。
     r_list = [
-        StubUnit(position=(10, 10), hp=2, unit_type="RANGER") for _ in range(4)
+        StubUnit(position=(10, 12), hp=2, unit_type="RANGER"),  # 射 e1
+        StubUnit(position=(12, 10), hp=2, unit_type="RANGER"),  # 射 e2
+        StubUnit(position=(10, 11), hp=2, unit_type="RANGER"),  # e1 overkill
+        StubUnit(position=(11, 10), hp=2, unit_type="RANGER"),  # e2 overkill
     ]
     turn = StubTurn(
         core=StubCore(position=core_pos, hp=10, shield=5),

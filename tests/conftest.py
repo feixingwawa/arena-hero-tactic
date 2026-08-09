@@ -24,6 +24,7 @@ def _clean_global_state() -> None:
     """
     from bot.config import DEFAULT_CONFIG
     from bot.economy import (
+        _deposit_progress,
         _last_move_dir,
         _loop_trackers,
         _pending_return_mines,
@@ -37,6 +38,7 @@ def _clean_global_state() -> None:
     _last_move_dir.clear()
     _loop_trackers.clear()
     _pending_return_mines.clear()
+    _deposit_progress.clear()
     health_tracker["last_deposit_tick"] = 0
     health_tracker["stall_ticks"] = 0
     WORLD_MEMORY.resource_points.clear()

@@ -34,7 +34,7 @@ class TacticConfig:
         loop_window_ticks / loop_min_unique / loop_bbox_diameter /
         loop_static_ticks / loop_repath_cooldown: 小范围重复行走 → 强制重寻路。
         beacon_step_radius: Beacon 阶段单步目标距离。
-        beacon_max_chase: Core→Beacon 曼哈顿超过此值则**全体不追**（防 d≈1000 空跑）。
+        beacon_max_chase: Core→Beacon 曼哈顿超过此值则**全体不追**（默认极大≈不限，仍可由单测收紧）。
         beacon_min_workers: 至少 N 名 Worker 才允许 1 人 dedicated（否则全员 local）。
         beacon_push_population: 总人口 ≥ 此值时允许/推动向 Beacon 推进。
         beacon_push_explore_ratio: 本地（Core 周围 spiral_max_ring）探索度 ≥ 此比例时推动向 Beacon。
@@ -85,10 +85,11 @@ class TacticConfig:
     loop_static_ticks: int = 4  # 连续同格不动也触发（服务端拒步/贴墙）
     loop_repath_cooldown: int = 5  # 触发后冷却，避免每 tick 抖动
 
-    # ---- Beacon：近距可选乘数，远距放弃（混合高效）----
+    # ---- Beacon：中后期可长途推进（混合高效 + push 门控）----
     beacon_step_radius: int = 8
-    # Core 到 Beacon 超过此曼哈顿距离 → 不派 dedicated、不追（线上 d≈900+ 必须放弃）
-    beacon_max_chase: int = 64
+    # Core→Beacon 曼哈顿上限；线上 d 常达 900～1100，默认 10000≈不限距
+    # （仍可用单测/覆盖值收紧；人口/探索 push 与 min_workers 继续门控）
+    beacon_max_chase: int = 10000
     # 至少这么多 Worker 才允许 widx==0 dedicated；早期 1～2 人全采
     beacon_min_workers: int = 3
     # 中后期推进：本地探索度 ≥ 比例 **或** 总人口 ≥ 阈值 → 向信标推进

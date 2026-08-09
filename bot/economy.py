@@ -20,12 +20,14 @@ from bot.pathing import (
     add_pos,
     beacon_oriented_spiral_target,
     beacon_progress_target,
+    bfs_next_step,
     chunk_of,
     clamp_step_toward_memo,
     estimate_path_steps,
     guided_step_toward,
     manhattan,
     nearest,
+    opposite_name,
     outward_step,
     sector_points,
     spiral_target,
@@ -127,6 +129,7 @@ class WorkerIntent:
 
     与 SpiralState 解耦：探索走 spiral，harvest/deposit/retreat 等走 intent。
     get_worker_states() 合并两者供 main → build_snapshot 导出。
+    route_waypoints：本 tick 运行时 A* 航点（与 guided 实际执行同源），供前端黄线一致。
     """
 
     target: Optional[Position] = None
@@ -135,6 +138,9 @@ class WorkerIntent:
     phase: Optional[str] = None  # harvest|deposit|retreat|to_resource|to_cargo|explore|local|beacon|...
     role: Optional[str] = None
     dedicated: Optional[bool] = None
+    # 运行时 LoopTracker 未走完的 A* 航点（不含当前格）；None/[] 表示本 tick 无缓存 route
+    route_waypoints: Optional[list[Position]] = None
+    route_dest: Optional[Position] = None
 
 
 # 非探索移动（return_deposit / to_resource / retreat / recall）的方向记忆，防 A↔B 对抖
@@ -145,10 +151,20 @@ _spiral_state: dict[str, SpiralState] = {}
 _worker_intents: dict[str, WorkerIntent] = {}
 # 范围循环检测：return_deposit / to_resource / retreat 足迹（小范围重复 → 强制重寻路）
 _loop_trackers: dict[str, LoopTracker] = {}
+# return_deposit 进展追踪：{wkey: (best_man_to_core, last_improve_tick, repath_streak)}
+# 用于打破「:repath:loop 连续触发但 man 不降」的局部卡死（线上 fa7407d7 类）。
+_deposit_progress: dict[str, tuple[int, int, int]] = {}
+# 无进展 tick 阈值：连续 N tick man 未严格下降 → 强制逃逸换侧 + 清足迹
+_DEPOSIT_STALL_TICKS: int = 10
+# repath:loop 连续触发阈值：超过则强制换 repath_side 并放宽 soft trail
+_DEPOSIT_REPATH_STREAK: int = 3
 # return 路径资源目标 claim TTL（tick）
 _PENDING_RETURN_CLAIM_TTL: int = 16
 # return 路径资源目标占用：{worker_key: (mine_pos, claim_tick)}
 _pending_return_mines: dict[str, tuple[tuple[int, int], int]] = {}
+# 近距抢占 claim：空载 Worker 在矿曼哈顿 ≤ 此值时，可抢走更远 owner 的 claim
+# （防「远方工人 claim 后自己还在 beacon 推进，近处发现者却去探索」）
+_CLAIM_STEAL_DIST: int = 5
 # 经济健康追踪：上次交付 tick 与停滞计数
 health_tracker: dict = {"last_deposit_tick": 0, "stall_ticks": 0}
 # 跨 tick 资源目标去重：{pos: (claim_tick, worker_key)}。同一目标被其他 Worker
@@ -188,18 +204,37 @@ def _resource_claimed_by_other(
     wkey: str,
     tick: int,
     claimed: set[Position],
+    *,
+    worker_pos: Optional[Position] = None,
+    owner_pos: Optional[Position] = None,
 ) -> bool:
-    """资源点是否已被其他 Worker 占用（本 tick claimed 或未过期跨 tick claim）。"""
+    """资源点是否已被其他 Worker 占用（本 tick claimed 或未过期跨 tick claim）。
+
+    近距抢占：若 ``worker_pos`` 距矿 ≤ ``_CLAIM_STEAL_DIST``，且比 ``owner_pos``
+    更近（或 owner 位置未知），则**不算**被占用，允许本 Worker 抢走 claim。
+    """
     entry = _claimed_targets.get(pos)
     if entry is not None:
         claim_tick, owner = entry
         if claim_tick > tick or tick - claim_tick > _CLAIM_TTL_TICKS:
             _claimed_targets.pop(pos, None)
+            entry = None
         elif owner != wkey:
+            # 近距发现者可抢远方 claim
+            if worker_pos is not None and manhattan(worker_pos, pos) <= _CLAIM_STEAL_DIST:
+                if owner_pos is None or manhattan(worker_pos, pos) < manhattan(owner_pos, pos):
+                    return False
             return True
     # 本 tick 已被更早处理的 Worker 写入 claimed，且不是自己跨 tick 续约的目标
     if pos in claimed:
         if entry is not None and entry[1] == wkey and tick - entry[0] <= _CLAIM_TTL_TICKS:
+            return False
+        # 近距抢占：本 tick 他人已 claimed，但自己更近 → 允许
+        if (
+            worker_pos is not None
+            and manhattan(worker_pos, pos) <= _CLAIM_STEAL_DIST
+            and (owner_pos is None or manhattan(worker_pos, pos) < manhattan(owner_pos, pos))
+        ):
             return False
         # 无主记录但已在本 tick claimed → 他人占用
         if entry is None or entry[1] != wkey:
@@ -213,12 +248,22 @@ def _pick_resource_target(
     tick: int,
     candidates: list[Position],
     claimed: set[Position],
+    worker_positions: Optional[dict[str, Position]] = None,
 ) -> Optional[Position]:
     """为 Worker 选矿：优先续约自己的 claim；否则最近未占用矿。
 
     **绝不**在无空闲矿时回退到已占用矿（旧逻辑 `nearest(candidates)` 会导致
     发现 1 个矿后全员 `to_resource` 扎堆）。
+    近距（≤ ``_CLAIM_STEAL_DIST``）且比 claim owner 更近的空载 Worker 可抢占。
     """
+    positions = worker_positions or {}
+
+    def _owner_pos_of(mine: Position) -> Optional[Position]:
+        entry = _claimed_targets.get(mine)
+        if entry is None:
+            return None
+        return positions.get(entry[1])
+
     # 1) 续约：自己未过期 claim 且仍在候选中
     own_pos: Optional[Position] = None
     own_dist = 10**9
@@ -233,13 +278,17 @@ def _pick_resource_target(
         if d < own_dist:
             own_dist = d
             own_pos = c
-    if own_pos is not None and not _resource_claimed_by_other(own_pos, wkey, tick, claimed):
+    if own_pos is not None and not _resource_claimed_by_other(
+        own_pos, wkey, tick, claimed, worker_pos=pos, owner_pos=_owner_pos_of(own_pos)
+    ):
         return own_pos
 
-    # 2) 最近空闲矿
+    # 2) 最近空闲矿（含近距可抢占）
     available = [
         c for c in candidates
-        if not _resource_claimed_by_other(c, wkey, tick, claimed)
+        if not _resource_claimed_by_other(
+            c, wkey, tick, claimed, worker_pos=pos, owner_pos=_owner_pos_of(c)
+        )
     ]
     if not available:
         return None
@@ -254,6 +303,177 @@ def _get_loop_tracker(wkey: str) -> LoopTracker:
     return st
 
 
+def _clear_deposit_progress(wkey: str) -> None:
+    """交付成功或放弃回城时清理进展状态。"""
+    _deposit_progress.pop(wkey, None)
+
+
+def _force_deposit_escape(
+    pos: Position,
+    core_position: Position,
+    obstacles: set[Position],
+    wkey: str,
+    tick: int,
+    memory: Optional[Any] = None,
+) -> Optional[str]:
+    """return_deposit 长期无进展时的强制逃逸一步。
+
+    策略（线上 fa7407d7 / acb08516 类：repath:loop 空转 man 不降）：
+    1. 清空 LoopTracker 足迹 + last_dir，避免 soft trail 自我堵死；
+    2. **短 BFS 最短绕障第一步**（真正离开口袋，不再只靠侧向横跳）；
+    3. BFS 失败再：强制切换 repath_side + 跨主轴侧向 / 主轴 / 任意非硬障。
+    """
+    tracker = _get_loop_tracker(wkey)
+    # 保留 repath_side 翻转意图，但 reset 清 route/足迹
+    prev_side = int(getattr(tracker, "repath_side", 0) or 0)
+    tracker.reset()
+    tracker.repath_side = 1 - prev_side
+    tracker.cooldown = 0
+    tracker.last_repath_tick = tick
+    _last_move_dir.pop(wkey, None)
+
+    hard: set[Position] = set(obstacles)
+    if memory is not None:
+        mem_obs = getattr(memory, "obstacles", None)
+        if mem_obs is not None:
+            try:
+                hard |= set(mem_obs)
+            except Exception:
+                pass
+
+    man0 = manhattan(pos, core_position)
+    # 与 guided 对齐：远距迷宫需要更大 expand，否则 BFS 失败又回侧向横跳
+    cap = 800 if man0 <= 16 else (2000 if man0 <= 48 else 5000)
+    from bot.pathing import _install_bfs_route
+
+    installed = _install_bfs_route(
+        pos,
+        core_position,
+        hard,
+        tracker,
+        tick,
+        max_expand=cap,
+        avoid=None,
+        ttl=72,
+    )
+    if installed is not None:
+        _last_move_dir[wkey] = installed
+        return installed
+    # install 失败时仍试一步（无 route）
+    bfs_dir = bfs_next_step(pos, core_position, hard, max_expand=cap)
+    if bfs_dir is not None:
+        _last_move_dir[wkey] = bfs_dir
+        return bfs_dir
+
+    primary = None
+    dx = core_position[0] - pos[0]
+    dy = core_position[1] - pos[1]
+    if abs(dx) >= abs(dy) and dx != 0:
+        primary = "RIGHT" if dx > 0 else "LEFT"
+    elif dy != 0:
+        primary = "DOWN" if dy > 0 else "UP"
+    elif dx != 0:
+        primary = "RIGHT" if dx > 0 else "LEFT"
+
+    side = int(getattr(tracker, "repath_side", 0) or 0)
+    if primary in ("UP", "DOWN"):
+        perps = ("RIGHT", "LEFT") if side == 0 else ("LEFT", "RIGHT")
+    elif primary in ("LEFT", "RIGHT"):
+        perps = ("DOWN", "UP") if side == 0 else ("UP", "DOWN")
+    else:
+        perps = ("RIGHT", "LEFT", "DOWN", "UP")
+
+    prefer: list[str] = list(perps)
+    if primary:
+        prefer.append(primary)
+    anti = opposite_name(primary) if primary else None
+    if anti:
+        prefer.append(anti)
+    for name in ("RIGHT", "LEFT", "DOWN", "UP"):
+        if name not in prefer:
+            prefer.append(name)
+
+    best: Optional[str] = None
+    best_key: Optional[tuple] = None
+    for name in prefer:
+        if name not in NAME_TO_DELTA:
+            continue
+        nxt = add_pos(pos, NAME_TO_DELTA[name])
+        if nxt in hard:
+            continue
+        man_n = manhattan(nxt, core_position)
+        # 1) 绝不优先走远（有 man 不升选项时）；2) 同层侧向优先打破口袋；3) 更近 Core
+        farther = 1 if man_n > man0 else 0
+        is_perp = 0 if name in perps else 1
+        key = (farther, is_perp, man_n)
+        if best_key is None or key < best_key:
+            best_key = key
+            best = name
+    if best:
+        _last_move_dir[wkey] = best
+    return best
+
+
+def _return_deposit_step(
+    pos: Position,
+    core_position: Position,
+    obstacles: set[Position],
+    wkey: str,
+    uid: Any,
+    config: TacticConfig,
+    tick: int,
+    memory: Optional[Any] = None,
+) -> tuple[Optional[str], str]:
+    """满货回城一步：带无进展逃逸。返回 (direction, log_tag_suffix)。
+
+    log_tag_suffix 形如 ``LEFT`` / ``LEFT:repath:loop`` / ``DOWN:escape:stall``。
+    """
+    man = manhattan(pos, core_position)
+    prev = _deposit_progress.get(wkey)
+    if prev is None:
+        best_man, last_improve, repath_streak = man, tick, 0
+    else:
+        best_man, last_improve, repath_streak = prev
+        if man < best_man:
+            best_man = man
+            last_improve = tick
+            repath_streak = 0
+        elif man > best_man + 2:
+            # 明显走远：重置 best，避免旧近点锁死逃逸
+            best_man = man
+            last_improve = tick
+
+    stall_ticks = tick - last_improve if tick >= last_improve else 0
+    need_escape = stall_ticks >= _DEPOSIT_STALL_TICKS or repath_streak >= _DEPOSIT_REPATH_STREAK
+
+    if need_escape:
+        direction = _force_deposit_escape(
+            pos, core_position, obstacles, wkey, tick, memory=memory
+        )
+        # 逃逸后给一个宽限期：清 streak，best 取当前 man
+        _deposit_progress[wkey] = (man, tick, 0)
+        if direction:
+            reason = "stall" if stall_ticks >= _DEPOSIT_STALL_TICKS else "repath_streak"
+            return direction, f"{direction}:escape:{reason}"
+        # 逃逸失败则回落普通 guided
+
+    direction, repath = _guided_move(
+        pos, core_position, obstacles, wkey, config, tick=tick, memory=memory
+    )
+    if repath:
+        repath_streak += 1
+    else:
+        repath_streak = max(0, repath_streak - 1)
+    _deposit_progress[wkey] = (best_man, last_improve, repath_streak)
+
+    if not direction:
+        return None, ""
+    tag = direction
+    if repath:
+        tag += ":repath:loop"
+    return direction, tag
+
+
 def _guided_move(
     pos: Position,
     target: Position,
@@ -262,8 +482,13 @@ def _guided_move(
     config: TacticConfig,
     tick: int = 0,
     memory: Optional[Any] = None,
+    *,
+    prefer_bfs: bool = True,
 ) -> tuple[Optional[str], bool]:
-    """带循环检测的朝目标一步；返回 (direction, did_repath)。"""
+    """带循环检测的朝目标一步；返回 (direction, did_repath)。
+
+    prefer_bfs=True（回城/奔矿/撤退默认）：短 BFS 破障边口袋，避免黄线绕圈。
+    """
     tracker = _get_loop_tracker(wkey)
     # 合并 memory 永久障碍，避免只看见本 tick 可见障碍导致贴墙空转
     blocked: set[Position] = set(obstacles)
@@ -279,6 +504,7 @@ def _guided_move(
         target,
         blocked,
         last_dir=_last_move_dir.get(wkey),
+        prefer_bfs=prefer_bfs,
         tracker=tracker,
         memory=memory,
         window=int(getattr(config, "loop_window_ticks", 12) or 12),
@@ -332,6 +558,7 @@ def get_worker_states() -> dict[str, WorkerIntent]:
     """导出 Worker 状态供 Dashboard：合并 spiral + 本 tick intent。
 
     键为 str(worker.id)。intent 字段优先覆盖 spiral 同名字段。
+    附带 LoopTracker.route_waypoints（运行时 A* 缓存），Dashboard 黄线优先画它。
     main.run_session 通过 getattr(bot.economy, "get_worker_states") 调用。
     """
     out: dict[str, WorkerIntent] = {}
@@ -353,6 +580,37 @@ def get_worker_states() -> dict[str, WorkerIntent]:
             phase=wi.phase if wi.phase is not None else base.phase,
             role=wi.role if wi.role is not None else base.role,
             dedicated=wi.dedicated if wi.dedicated is not None else base.dedicated,
+        )
+    # 挂上本 tick 实际执行的 A* route（与 guided_step_toward / _install_bfs_route 同源）
+    for k, intent in list(out.items()):
+        tr = _loop_trackers.get(k)
+        if tr is None or not tr.route_waypoints:
+            continue
+        raw = list(tr.route_waypoints)
+        wps: list[Position] = []
+        for p in raw:
+            try:
+                wps.append((int(p[0]), int(p[1])))
+            except (TypeError, ValueError, IndexError):
+                continue
+        if not wps:
+            continue
+        dest = tr.route_dest
+        dest_t: Optional[Position] = None
+        if dest is not None:
+            try:
+                dest_t = (int(dest[0]), int(dest[1]))
+            except (TypeError, ValueError, IndexError):
+                dest_t = None
+        out[k] = WorkerIntent(
+            target=intent.target,
+            ring=intent.ring,
+            sector=intent.sector,
+            phase=intent.phase,
+            role=intent.role,
+            dedicated=intent.dedicated,
+            route_waypoints=wps,
+            route_dest=dest_t,
         )
     return out
 
@@ -599,6 +857,10 @@ def command_workers(
     obstacles = _obstacle_cells(turn)
     # Core 格通常不可作为障碍，但移动时不要踩未知；此处仅避 obstacle_cells
     workers = list(getattr(turn, "workers", None) or ())
+    # wkey → 当前位置（近距抢占 claim 时比较 owner 距离）
+    worker_positions: dict[str, Position] = {
+        _worker_key(w.id): _as_position(w.position) for w in workers
+    }
     # 总人口（W+V+R）：本地探索度/人口阈值向信标推进用
     population = total_population(turn)
     # 探索避敌：使用角色计划中的威胁位置（可见敌人）
@@ -675,9 +937,18 @@ def command_workers(
         cached = _estimate_cache.get(key)
         if cached is not None:
             return cached
-        steps, _ = estimate_path_steps(
-            A, B, est_obs, memory=memory, max_steps=12,  # dispatch 只需相对比较，12 步足够
-        )
+        # dispatch 相对比较：短路径 dry-run；远距直接曼哈顿，避免 12 步 guided 空转
+        man = manhattan(A, B)
+        if man >= 10:
+            steps = man
+        else:
+            steps, _ = estimate_path_steps(
+                A,
+                B,
+                est_obs,
+                memory=None,  # 禁止 dispatch dry-run 写回 obstacle_cache
+                max_steps=min(8, man + 2),
+            )
         _estimate_cache[key] = steps
         # 反向路径近似对称（估算目的），反向也写入缓存省一半调用
         _estimate_cache[(B, A)] = steps
@@ -748,8 +1019,9 @@ def command_workers(
             idler_mh_list.sort(key=lambda t: (t[0], t[1]))
             mh_other_min, mh_wx_P_argmin, mh_argmin_wx = idler_mh_list[0]
 
-            # 决策差距 >= 40% 时，用曼哈顿距离直接决定，不调用 estimate_path_steps
-            AMBIGUOUS_RATIO = 1.4
+            # 决策差距 >= 25% 时，用曼哈顿距离直接决定，不调用 estimate_path_steps
+            # （旧 1.4 仍让大量中距 case 落入 dry-run，抬高 decide_ms）
+            AMBIGUOUS_RATIO = 1.25
             if mh_self * AMBIGUOUS_RATIO < mh_other_min:
                 # self 明显更优 → 直接 self 预约
                 _pending_return_mines[wd_wkey] = (P, tick)
@@ -770,9 +1042,8 @@ def command_workers(
                 continue
 
             # ===== 决策模糊 → 调用 _cached_estimate 精确计算（含性能优化 0~4）=====
+            # 仅合并「当前可见障碍」；全图 memory.obstacles 过大且对短距比较收益低
             estimate_obstacles = set(obstacles)
-            if memory is not None:
-                estimate_obstacles |= memory.obstacles
 
             # T_self: Wd → Core → P（缓存命中时零成本）
             T_self_a = _cached_estimate(wd_pos, core_position, estimate_obstacles)
@@ -780,14 +1051,14 @@ def command_workers(
             T_P_to_core = _cached_estimate(P, core_position, estimate_obstacles)
             T_self = T_self_a + T_core_to_P
 
-            # T_other_min：只对 manhattan 前 2 idle Worker 精确 estimate
+            # T_other_min：只对 manhattan 最优 1 个 idle Worker 精确 estimate
             idlers_sorted = sorted(
                 idlers, key=lambda wx: (
                     manhattan(_as_position(wx.position), P),
                     _worker_key(wx.id),
                 )
             )
-            estimate_idlers = idlers_sorted[:2]
+            estimate_idlers = idlers_sorted[:1]
             T_other_list: list[tuple[int, int, Any]] = []
             for wx in estimate_idlers:
                 wx_pos = _as_position(wx.position)
@@ -831,15 +1102,19 @@ def command_workers(
                 man_core = manhattan(pos, core_position)
                 if man_core <= 4:
                     _set_intent(wkey, target=core_position, phase="deposit", role=str(role))
-                    direction, repath = _guided_move(
-                        pos, core_position, obstacles, wkey, config, tick=tick, memory=memory
+                    direction, dep_tag = _return_deposit_step(
+                        pos,
+                        core_position,
+                        obstacles,
+                        wkey,
+                        uid,
+                        config,
+                        tick,
+                        memory=memory,
                     )
                     if direction and hasattr(w, "move"):
                         w.move(_resolve_direction(w, direction))
-                        tag = f"worker:{uid}:return_deposit:{direction}"
-                        if repath:
-                            tag += ":repath:loop"
-                        logs.append(tag)
+                        logs.append(f"worker:{uid}:return_deposit:{dep_tag}")
                     continue
             if pos == core_position:
                 # 有货优先 deposit（即使 RETREAT/威胁贴脸），否则资源永远攒不够出 V/R
@@ -851,6 +1126,7 @@ def command_workers(
                     health_tracker["stall_ticks"] = 0
                     _loop_trackers.pop(wkey, None)
                     _last_move_dir.pop(wkey, None)
+                    _clear_deposit_progress(wkey)
                 elif role == Role.HEAL and hasattr(w, "heal"):
                     _set_intent(wkey, target=core_position, phase="heal", role=str(role))
                     w.heal()
@@ -938,21 +1214,26 @@ def command_workers(
             # 交付成功：清足迹，避免下一趟误触发 repath
             _loop_trackers.pop(wkey, None)
             _last_move_dir.pop(wkey, None)
+            _clear_deposit_progress(wkey)
             continue
 
         # 有货物 → 回 Core 交付（优先于继续采集）
         if cargo > 0:
             wkey = _worker_key(uid)
             _set_intent(wkey, target=core_position, phase="deposit", role=str(role))
-            direction, repath = _guided_move(
-                pos, core_position, obstacles, wkey, config, tick=tick, memory=memory
+            direction, dep_tag = _return_deposit_step(
+                pos,
+                core_position,
+                obstacles,
+                wkey,
+                uid,
+                config,
+                tick,
+                memory=memory,
             )
             if direction and hasattr(w, "move"):
                 w.move(_resolve_direction(w, direction))
-                tag = f"worker:{uid}:return_deposit:{direction}"
-                if repath:
-                    tag += ":repath:loop"
-                logs.append(tag)
+                logs.append(f"worker:{uid}:return_deposit:{dep_tag}")
             continue
 
         # 拾取地面 Beacon（P2-1：同格 GROUND → pickup_beacon）
@@ -1064,7 +1345,10 @@ def command_workers(
                     candidates.append(c)
 
         # 走向最近未声称候选资源（无空闲矿时绝不回退到已占用矿 → 其余人继续探索）
-        target = _pick_resource_target(pos, wkey, tick, candidates, claimed)
+        # 近距发现者可比远方 claim owner 更优先（_CLAIM_STEAL_DIST）
+        target = _pick_resource_target(
+            pos, wkey, tick, candidates, claimed, worker_positions=worker_positions
+        )
         if target is not None:
             _claim_resource_target(target, wkey, tick, claimed)
             _set_intent(wkey, target=target, phase="to_resource", role=str(role))
@@ -1197,6 +1481,7 @@ def command_workers(
             ("_loop_trackers", _loop_trackers if '_loop_trackers' in globals() else {}),
             ("_pending_return_mines", _pending_return_mines),
             ("_worker_intents", _worker_intents),
+            ("_deposit_progress", _deposit_progress),
         ]:
             for k in list(d.keys()):
                 if k not in alive:
@@ -1268,7 +1553,7 @@ def _beacon_chase_allowed(
     """是否允许追 Beacon / 向信标推进。
 
     - Beacon 缺失 → False
-    - Core→Beacon 曼哈顿 > beacon_max_chase → False（防 d≈900+ 空跑）
+    - Core→Beacon 曼哈顿 > beacon_max_chase → False（默认极大≈不限距）
     - 允许条件（满足其一即可）：
       1) 总人口 ≥ beacon_push_population（默认 10）
       2) 本地探索度 ≥ beacon_push_explore_ratio（默认 0.8）
@@ -1277,7 +1562,7 @@ def _beacon_chase_allowed(
     beacon = config.beacon_position
     if beacon is None:
         return False
-    max_chase = max(1, int(getattr(config, "beacon_max_chase", 64) or 64))
+    max_chase = max(1, int(getattr(config, "beacon_max_chase", 10000) or 10000))
     if manhattan(core_position, beacon) > max_chase:
         return False
     if _beacon_push_ready(config, core_position, memory, population):
@@ -1342,7 +1627,7 @@ def dual_spiral_target(
     tick: Optional[int] = None,
 ) -> tuple[int, int]:
     spiral_max_ring = getattr(config, "spiral_max_ring", 24)
-    beacon_max_chase = getattr(config, "beacon_max_chase", 64)
+    beacon_max_chase = getattr(config, "beacon_max_chase", 10000)
     beacon_min_workers = getattr(config, "beacon_min_workers", 3)
 
     if d_core_now <= spiral_max_ring:

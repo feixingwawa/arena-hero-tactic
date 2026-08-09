@@ -172,12 +172,13 @@ def test_decide_memory_injection_smoke(config: TacticConfig) -> None:
 
 
 def test_decide_memory_observe_updates_on_tick(config: TacticConfig) -> None:
-    """decide 每 tick observe：资源点消失后进入 DEPLETED。"""
+    """decide 每 tick observe：FOV 内资源点消失后进入 DEPLETED。"""
     from bot.memory import DEPLETED, MemoryMap
 
     mem = MemoryMap(refresh_interval_ticks=4)
     worker = StubUnit(position=(11, 10), cargo=0, unit_type="WORKER")
     core = StubCore(position=(10, 10), hp=5, shield=5)
+    # (14,10) 在 Core 视距 5 与 Worker 视距附近
     t1 = StubTurn(tick=1, resources=5, core=core, workers=[worker],
                   resource_cells={(14, 10)})
     decide(t1, config=config, memory=mem)
@@ -362,7 +363,7 @@ def test_default_config_new_defaults() -> None:
     assert cfg.target_workers == 12
     assert cfg.target_vanguards == 4
     assert cfg.target_rangers == 4
-    assert cfg.beacon_max_chase == 64
+    assert cfg.beacon_max_chase == 10000
     assert cfg.beacon_min_workers == 3
     assert cfg.sector_count == 4
     assert cfg.spiral_base_ring == 3

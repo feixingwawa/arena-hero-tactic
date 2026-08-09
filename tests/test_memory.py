@@ -12,19 +12,38 @@ from bot.pathing import chunk_of, chunk_ring
 from tests.stubs import StubCore, StubEvent, StubTurn, StubUnit
 
 
-def _turn(tick: int, cells: set, core=(10, 10), events=None, obstacles=None) -> StubTurn:
+def _turn(
+    tick: int,
+    cells: set,
+    core=(10, 10),
+    events=None,
+    obstacles=None,
+    worker_positions=None,
+) -> StubTurn:
+    """构造 StubTurn。
+
+    worker_positions: 可选工人落点列表。默认 1 人在 Core。
+    若要「确认采空」，请把工人放在矿附近，使矿落在 FOV 内。
+    """
+    if worker_positions is None:
+        workers = [StubUnit(position=core)]
+    else:
+        workers = [StubUnit(position=p) for p in worker_positions]
     return StubTurn(
         tick=tick,
         core=StubCore(position=core),
         resource_cells=set(cells),
         obstacle_cells=set(obstacles or ()),
         events=events or [],
-        workers=[StubUnit(position=core)],
+        workers=workers,
     )
 
 
 def test_resource_state_machine_visible_depleted_revisit() -> None:
-    """状态机：可见 → 消失(DEPLETED) → 4 tick 后 REVISIT_DUE → 再可见(VISIBLE)。"""
+    """状态机：可见 → FOV 内消失(DEPLETED) → 4 tick 后 REVISIT_DUE → 再可见(VISIBLE)。
+
+    矿在 Core 视距内（man=4 ≤ 5），resource_cells 空 = 确认采空。
+    """
     mem = MemoryMap(refresh_interval_ticks=4)
     core = (10, 10)
     rp_pos = (14, 10)
@@ -34,7 +53,7 @@ def test_resource_state_machine_visible_depleted_revisit() -> None:
     rp = mem.resource_points[rp_pos]
     assert rp.state == VISIBLE
 
-    # tick 2: 消失 → DEPLETED, refresh_due = 2 + 4 = 6
+    # tick 2: FOV 内消失 → DEPLETED, refresh_due = 2 + 4 = 6
     mem.observe(_turn(2, set(), core=core), 2)
     rp = mem.resource_points[rp_pos]
     assert rp.state == DEPLETED
@@ -61,6 +80,49 @@ def test_resource_state_machine_visible_depleted_revisit() -> None:
     mem.observe(_turn(7, {rp_pos}, core=core), 7)
     assert mem.resource_points[rp_pos].state == VISIBLE
     assert mem.refresh_due(rp_pos, 7) is True
+
+
+def test_resource_out_of_fov_stays_visible() -> None:
+    """走出 FOV 后 resource_cells 为空：仍保持 VISIBLE（不当作采空）。
+
+    回归：空背包 Worker 发现矿后继续探索，旧逻辑会立刻 DEPLETED，
+    revisit_candidates 不再返回该矿 → 永远不回头采。
+    """
+    mem = MemoryMap(refresh_interval_ticks=4)
+    core = (10, 10)
+    mine = (30, 10)  # 距 Core=20，超出 Core 视距 5
+
+    # tick1：工人站在矿上看到矿
+    t1 = StubTurn(
+        tick=1,
+        core=StubCore(position=core),
+        resource_cells={mine},
+        workers=[StubUnit(position=mine, unit_type="WORKER")],
+    )
+    mem.observe(t1, 1)
+    assert mem.resource_points[mine].state == VISIBLE
+
+    # tick2：工人走开，矿不在任何己方 FOV，resource_cells 空
+    t2 = StubTurn(
+        tick=2,
+        core=StubCore(position=core),
+        resource_cells=set(),
+        workers=[StubUnit(position=(11, 10), unit_type="WORKER")],
+    )
+    mem.observe(t2, 2)
+    assert mem.resource_points[mine].state == VISIBLE, "out-of-FOV must not deplete"
+    cands = mem.revisit_candidates(core, 2, (11, 10), max_dist=40)
+    assert mine in cands, "remembered mine must stay harvest candidate"
+
+    # tick3：工人再次进入 FOV 且 resource_cells 仍空 → 才 DEPLETED
+    t3 = StubTurn(
+        tick=3,
+        core=StubCore(position=core),
+        resource_cells=set(),
+        workers=[StubUnit(position=mine, unit_type="WORKER")],
+    )
+    mem.observe(t3, 3)
+    assert mem.resource_points[mine].state == DEPLETED
 
 
 def test_mark_harvested_triggers_depleted() -> None:
@@ -94,9 +156,16 @@ def test_revisit_candidates_max_dist_and_sector_filter() -> None:
     far = (60, 10)  # 距 worker (10,10) = 50 > 40
     near_sector0 = (6, 9)  # ring 5 扇区 0（与 pathing.sector_points 一致）
     near_sector1 = (7, 8)  # ring 5 扇区 1
-    # 先 visible → 消耗 → REVISIT_DUE 到期
-    mem.observe(_turn(1, {far, near_sector0, near_sector1}, core=core), 1)
-    mem.observe(_turn(2, set(), core=core), 2)  # 全部消失 → DEPLETED
+    # 先 visible → FOV 内确认消失 → REVISIT_DUE 到期
+    # far 超出 Core FOV，需把工人放到 far 旁才能确认 DEPLETED
+    mem.observe(
+        _turn(1, {far, near_sector0, near_sector1}, core=core, worker_positions=[far, core]),
+        1,
+    )
+    mem.observe(
+        _turn(2, set(), core=core, worker_positions=[far, core]),
+        2,
+    )  # FOV 覆盖全部 → DEPLETED
     mem.observe(_turn(6, set(), core=core), 6)  # 到期 → REVISIT_DUE
 
     # REVISIT_DUE 点不被返回（非 VISIBLE）
@@ -121,10 +190,10 @@ def test_revisit_candidates_sorted_by_distance() -> None:
     """回访候选按距离排序（仅 VISIBLE 点）。"""
     mem = MemoryMap(refresh_interval_ticks=4)
     core = (10, 10)
-    a = (20, 10)  # dist 10
+    a = (20, 10)  # dist 10（Core FOV=5 覆盖不到，需工人站 a）
     b = (14, 10)  # dist 4
-    mem.observe(_turn(1, {a, b}, core=core), 1)
-    mem.observe(_turn(2, set(), core=core), 2)
+    mem.observe(_turn(1, {a, b}, core=core, worker_positions=[a, core]), 1)
+    mem.observe(_turn(2, set(), core=core, worker_positions=[a, core]), 2)
     mem.observe(_turn(6, set(), core=core), 6)
     # tick 6 时都是 REVISIT_DUE（不返回）
     cands = mem.revisit_candidates(core, 6, (10, 10), max_dist=40)
@@ -374,3 +443,55 @@ def test_mark_vision_disk_vanguard_ranger_radii() -> None:
     # Vanguard 不覆盖 r=5 外点
     assert (0, 5) not in mem.explored_cells
     assert (30, 5) in mem.explored_cells  # Ranger r=5
+
+
+def test_memory_persist_roundtrip(tmp_path) -> None:
+    """save/load 往返：explored_chunks / obstacles / resource 状态可恢复。"""
+    from bot.memory import DEPLETED, MemoryMap, ResourcePointState, VISIBLE
+
+    mem = MemoryMap(refresh_interval_ticks=4)
+    mem.mark_explored((10, 10), tick=3)
+    mem.obstacles.add((5, 5))
+    mem.record_obstacle_block((5, 5), tick=4)
+    mem.resource_points[(14, 10)] = ResourcePointState(
+        pos=(14, 10), state=VISIBLE, seen_tick=2, chunk_ring=0
+    )
+    mem.mark_harvested((14, 10), 5)
+    path = tmp_path / "state.json"
+    mem.save(path)
+
+    mem2 = MemoryMap()
+    assert mem2.load(path) is True
+    assert (0, 0) in mem2.explored_chunks  # chunk_of(10,10) with CHUNK 16
+    assert (5, 5) in mem2.obstacles
+    assert (5, 5) in mem2.obstacle_cache
+    assert mem2.obstacle_cache[(5, 5)].block_count >= 1
+    assert (14, 10) in mem2.resource_points
+    assert mem2.resource_points[(14, 10)].state == DEPLETED
+
+
+def test_memory_load_missing_file(tmp_path) -> None:
+    """缺失文件 load 返回 False，不抛异常。"""
+    from bot.memory import MemoryMap
+
+    mem = MemoryMap()
+    assert mem.load(tmp_path / "nope.json") is False
+
+
+def test_memory_maybe_autosave_interval(tmp_path) -> None:
+    """maybe_autosave 仅在 tick 整除间隔时写入。"""
+    from bot import memory as memmod
+    from bot.memory import MemoryMap
+
+    old = memmod.MEMORY_AUTOSAVE_EVERY_TICKS
+    memmod.MEMORY_AUTOSAVE_EVERY_TICKS = 10
+    try:
+        mem = MemoryMap()
+        mem.mark_explored((1, 1), 1)
+        path = tmp_path / "auto.json"
+        assert mem.maybe_autosave(5, path) is False
+        assert not path.exists()
+        assert mem.maybe_autosave(10, path) is True
+        assert path.is_file()
+    finally:
+        memmod.MEMORY_AUTOSAVE_EVERY_TICKS = old

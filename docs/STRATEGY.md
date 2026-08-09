@@ -67,7 +67,7 @@ target_workers: int = 12
 target_vanguards: int = 4
 target_rangers: int = 4
 # Beacon
-beacon_max_chase: int = 64          # Core→Beacon 超距放弃
+beacon_max_chase: int = 10000       # Core→Beacon 超距放弃（默认≈不限）
 beacon_min_workers: int = 3         # 早期全员采
 beacon_push_population: int = 10    # 人口达标向信标推进
 beacon_push_explore_ratio: float = 0.8  # 本地探索度达标向信标推进
@@ -94,9 +94,9 @@ retreat_radius: int = 3
 
 - [x] soft-recall ring 外扩  
 - [x] beacon status=None 可写  
-- [x] soft-recall 进 beacon 仅 dedicated  
-- [x] **远距 Beacon 放弃**：`beacon_max_chase=64`（Core→Beacon），超限降级 local  
-- [x] **早期不追**：`beacon_min_workers=3`，人少全员 local 采  
+- [x] soft-recall 进 beacon 仅 dedicated
+- [x] **远距 Beacon 门控**：`beacon_max_chase`（默认 10000≈不限；单测可收紧），超限降级 local
+- [x] **早期不追**：`beacon_min_workers=3`，人少全员 local 采
 - [x] **强制非 dedicated 清 beacon 相**（每 tick `_drop_to_local`；探索度/人口推进路径除外）  
 - [x] 编制默认 **12/4/4**，`max_population=20`  
 - [x] spawn 爬坡：先凑 6 Worker 再补战斗单位

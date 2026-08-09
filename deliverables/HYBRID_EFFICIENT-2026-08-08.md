@@ -7,7 +7,7 @@
 
 | 文件 | 变更 |
 |------|------|
-| `bot/config.py` | 默认 **12/4/4 max20**；`beacon_max_chase=64`；`beacon_min_workers=3`；`spiral_max_ring=24`；`sector_count=4`；`early_game_pop=6` |
+| `bot/config.py` | 默认 **12/4/4 max20**；`beacon_max_chase=10000`；`beacon_min_workers=3`；`spiral_max_ring=24`；`sector_count=4`；`early_game_pop=6` |
 | `bot/economy.py` | `_beacon_chase_allowed` / `_drop_to_local`；远距与人少禁止 dedicated；spawn 先 bootstrap 6 Worker |
 | `tests/*` | 新用例 far abort / min_workers / drop dedicated；默认断言对齐 |
 | `README.md` / `docs/STRATEGY.md` | 参数与 P0 勾选更新 |

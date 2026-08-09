@@ -8,6 +8,7 @@ from bot.pathing import (
     Position,
     add_pos,
     beacon_progress_target,
+    bfs_next_step,
     bbox_diameter,
     clamp_step_toward,
     clamp_step_toward_memo,
@@ -606,3 +607,146 @@ def test_TR_4_beacon_oriented_sector_diversity() -> None:
             if d > max_pair:
                 max_pair = d
     assert max_pair >= 4, f"扇区点不够分散: max_pair_dist={max_pair}, pts={pts}"
+
+
+def test_bfs_next_step_detours_u_pocket() -> None:
+    """U 形硬障口袋：贪心主轴撞墙，BFS 第一步必须侧向/反向离开。"""
+    # 开口朝南的 U：底边 y=10，两臂 x=5/7 向南延伸
+    #   . . .        target (6, 8) 在底边北侧
+    #   # # #        (5,10)(6,10)(7,10)
+    #   # . #        unit 在 (6,12)
+    #   # . #
+    obstacles = {
+        (5, 10),
+        (6, 10),
+        (7, 10),
+        (5, 11),
+        (7, 11),
+        (5, 12),
+        (7, 12),
+        (5, 13),
+        (7, 13),
+    }
+    origin = (6, 12)
+    target = (6, 8)
+    step = bfs_next_step(origin, target, obstacles, max_expand=400)
+    assert step is not None
+    # 不能朝北进硬障；合法是 DOWN 出袋或（若更短）无法直接 UP
+    assert step != "UP"
+    nxt = add_pos(origin, NAME_TO_DELTA[step])
+    assert nxt not in obstacles
+
+
+def test_bfs_next_step_never_enters_obstacle() -> None:
+    """BFS 第一步落点永不在硬障上。"""
+    obstacles = {(1, 0), (0, 1), (-1, 0)}
+    step = bfs_next_step((0, 0), (3, 0), obstacles, max_expand=200)
+    assert step is not None
+    assert add_pos((0, 0), NAME_TO_DELTA[step]) not in obstacles
+
+
+def test_guided_prefer_bfs_exits_u_pocket_and_reaches() -> None:
+    """prefer_bfs：U 口袋内多 tick 跟随 route，不得左右横跳，最终 man 下降出袋。"""
+    obstacles = {
+        (5, 10),
+        (6, 10),
+        (7, 10),
+        (5, 11),
+        (7, 11),
+        (5, 12),
+        (7, 12),
+        (5, 13),
+        (7, 13),
+    }
+    origin = (6, 12)
+    target = (6, 8)
+    tracker = LoopTracker()
+    pos = origin
+    last: str | None = None
+    dirs: list[str] = []
+    for t in range(24):
+        d, last, _repath = guided_step_toward(
+            pos,
+            target,
+            obstacles=obstacles,
+            last_dir=last,
+            tracker=tracker,
+            tick=t,
+            prefer_bfs=True,
+            repath_cooldown=2,
+        )
+        assert d is not None, f"stuck at {pos} tick={t}"
+        nxt = add_pos(pos, NAME_TO_DELTA[d])
+        assert nxt not in obstacles, f"stepped on obs {nxt} via {d}"
+        dirs.append(d)
+        pos = nxt
+        if manhattan(pos, target) <= 1:
+            break
+    # 已离开口袋或到达目标邻格
+    assert manhattan(pos, target) <= 2 or pos[1] <= 10, f"still pocketed at {pos}"
+    # 不得出现长时间 LEFT/RIGHT 对抖（旧 wall_follow 横跳症状）
+    assert _max_consecutive_alternation(dirs) <= 2, f"oscillation in {dirs}"
+
+
+def test_guided_bfs_route_persists_across_ticks() -> None:
+    """安装 BFS route 后次 tick 应继续沿航点，不立刻清掉重算横跳。"""
+    # 简单 L 形墙：从 (0,2) 到 (4,0)，墙挡直达
+    obstacles = {(1, 0), (1, 1), (2, 1), (3, 1)}
+    tracker = LoopTracker()
+    d1, last1, r1 = guided_step_toward(
+        (0, 0),
+        (4, 0),
+        obstacles=obstacles,
+        tracker=tracker,
+        tick=1,
+        prefer_bfs=True,
+    )
+    assert d1 is not None
+    assert r1 is False  # 非 loop 触发的 prefer_bfs 不标 repath
+    # 安装后航点仍含第一步目标格（到达才 pop）
+    assert len(tracker.route_waypoints) >= 1
+    first_wp = tracker.route_waypoints[0]
+    pos = add_pos((0, 0), NAME_TO_DELTA[d1])
+    assert pos == first_wp
+    d2, _last2, r2 = guided_step_toward(
+        pos,
+        (4, 0),
+        obstacles=obstacles,
+        last_dir=last1,
+        tracker=tracker,
+        tick=2,
+        prefer_bfs=True,
+    )
+    assert d2 is not None
+    assert r2 is False
+    assert add_pos(pos, NAME_TO_DELTA[d2]) not in obstacles
+    assert first_wp not in tracker.route_waypoints or not tracker.route_waypoints
+
+
+def test_guided_bfs_route_survives_rejected_step() -> None:
+    """服务端拒步（同格停留）时 route 不得被掏空，下一 tick 仍朝同一航点。"""
+    obstacles = {(1, 0), (1, 1), (2, 1)}
+    tracker = LoopTracker()
+    d1, last1, _ = guided_step_toward(
+        (0, 0),
+        (3, 0),
+        obstacles=obstacles,
+        tracker=tracker,
+        tick=1,
+        prefer_bfs=True,
+    )
+    assert d1 is not None
+    assert tracker.route_waypoints
+    wp0 = tracker.route_waypoints[0]
+    d2, last2, _ = guided_step_toward(
+        (0, 0),
+        (3, 0),
+        obstacles=obstacles,
+        last_dir=last1,
+        tracker=tracker,
+        tick=2,
+        prefer_bfs=True,
+    )
+    assert d2 == d1
+    assert tracker.route_waypoints and tracker.route_waypoints[0] == wp0
+    assert last2 == d1

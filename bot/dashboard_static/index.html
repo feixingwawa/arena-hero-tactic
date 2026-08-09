@@ -648,21 +648,27 @@ function drawPaths(units){
               : (hasTarget ? u.target : null);
     if(!dest)continue;
 
-    // 1) 完整导航折线（优先 path_estimate.waypoints）
-    const wps=(pe&&Array.isArray(pe.waypoints)&&pe.waypoints.length>=2)
-      ? pe.waypoints
-      : [[u.x,u.y],[dest[0],dest[1]]];
+    // 1) 仅绘制后端真实绕障路点（禁止 origin→dest 直线兜底，会穿障）
+    const wps=(pe&&Array.isArray(pe.waypoints)) ? pe.waypoints : [];
     mctx.strokeStyle=color;
     mctx.lineWidth=1.8;
     mctx.globalAlpha=0.9;
-    mctx.setLineDash(wps.length>2 ? [] : [5,4]);
-    mctx.beginPath();
-    for(let i=0;i<wps.length;i++){
-      const pt=world2canvas(wps[i][0],wps[i][1]);
-      if(i===0)mctx.moveTo(pt.x,pt.y);else mctx.lineTo(pt.x,pt.y);
+    // 仅真实路点折线；完整规划实线，partial/approx 虚线；不足 2 点不画线
+    // planned=runtime/astar/bfs 均为可执行同源路径；runtime 即使 partial 也画实线（正在执行）
+    if(wps.length>=2){
+      const planned=pe&&pe.planned;
+      const isRuntime=planned==='runtime'||planned==='astar';
+      const isPartial=pe&&(pe.partial||pe.approx||planned==='none')&&!isRuntime;
+      const isSolid=pe&&planned&&planned!=='none'&&(!isPartial||isRuntime);
+      mctx.setLineDash(isSolid ? [] : [5,4]);
+      mctx.beginPath();
+      for(let i=0;i<wps.length;i++){
+        const pt=world2canvas(wps[i][0],wps[i][1]);
+        if(i===0)mctx.moveTo(pt.x,pt.y);else mctx.lineTo(pt.x,pt.y);
+      }
+      mctx.stroke();
+      mctx.setLineDash([]);
     }
-    mctx.stroke();
-    mctx.setLineDash([]);
 
     // 2) 被堵障碍高亮
     if(pe&&Array.isArray(pe.blocked)){
@@ -941,8 +947,9 @@ function showUnitPopover(u,cx,cy){
   const pe=u.path_estimate;
   if(pe){
     if(pe.destination)rows.push(`<div class="row"><span class="k">目的地</span><span class="v">(${pe.destination[0]},${pe.destination[1]})</span></div>`);
-    if(pe.steps!=null)rows.push(`<div class="row"><span class="k">路径步数</span><span class="v">${pe.steps}</span></div>`);
+    if(pe.steps!=null)rows.push(`<div class="row"><span class="k">路径步数</span><span class="v">${pe.steps}${pe.approx?' ≈':''}</span></div>`);
     if(pe.waypoints)rows.push(`<div class="row"><span class="k">路点数</span><span class="v">${pe.waypoints.length}</span></div>`);
+    if(pe.planned)rows.push(`<div class="row"><span class="k">规划</span><span class="v">${pe.planned}</span></div>`);
     if(pe.blocked&&pe.blocked.length)rows.push(`<div class="row"><span class="k">受阻格</span><span class="v">${pe.blocked.length}</span></div>`);
   }
   if(u.action&&u.type==='CORE')rows.push(`<div class="row"><span class="k">动作</span><span class="v">${actionLabel(u.action)}</span></div>`);

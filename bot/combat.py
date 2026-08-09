@@ -7,7 +7,9 @@ from uuid import UUID
 
 from bot.config import TacticConfig, DEFAULT_CONFIG
 from bot.pathing import (
+    NAME_TO_DELTA,
     Position,
+    add_pos,
     cells_toward_ring,
     clamp_step_toward,
     defense_ring_slots,
@@ -42,6 +44,47 @@ def _obstacle_cells(turn: Any) -> set[Position]:
     if cells is None:
         return set()
     return {_as_position(c) for c in cells}
+
+
+def _leave_core_step(
+    unit: Any,
+    pos: Position,
+    core_position: Position,
+    obstacles: set[Position],
+    *,
+    preferred: Optional[Position] = None,
+    uid: Any = None,
+    kind: str = "unit",
+    logs: Optional[list[str]] = None,
+) -> bool:
+    """非工人与 Core 同格时强制移开一格。
+
+    Returns:
+        True 表示已处理（已 move/wait），调用方应 ``continue``。
+        False 表示未重叠，无需处理。
+    """
+    if pos != core_position:
+        return False
+    blocked: set[Position] = set(obstacles)
+    direction: Optional[str] = None
+    if preferred is not None and preferred != pos:
+        direction = clamp_step_toward(pos, preferred, blocked)
+    if direction is None:
+        for name, delta in NAME_TO_DELTA.items():
+            nxt = add_pos(pos, delta)
+            if nxt not in blocked:
+                direction = name
+                break
+    tag = f"{kind}:{uid}" if uid is not None else kind
+    out = logs if logs is not None else []
+    if direction and hasattr(unit, "move"):
+        unit.move(_resolve_direction(direction))
+        out.append(f"{tag}:leave_core:{direction}")
+        return True
+    if hasattr(unit, "wait"):
+        unit.wait()
+    out.append(f"{tag}:leave_core:blocked")
+    return True
 
 
 def _resolve_direction(direction_name: str) -> Any:
@@ -119,7 +162,7 @@ def command_vanguards(
         assignment = role_plan.get(uid)
         pos = _as_position(v.position)
 
-        # 治疗回城
+        # 治疗回城（允许短暂与 Core 同格 heal；下 tick 非 HEAL 会 leave_core）
         if assignment and assignment.role == Role.HEAL:
             if pos == core_position and hasattr(v, "heal"):
                 v.heal()
@@ -129,6 +172,20 @@ def command_vanguards(
                 if direction and hasattr(v, "move"):
                     v.move(_resolve_direction(direction))
                     logs.append(f"vanguard:{uid}:to_heal:{direction}")
+            continue
+
+        # 禁止与 Core 重叠：立即移开（优先朝防守环）
+        ring_pref = cells_toward_ring(pos, core_position, config.defense_radius)
+        if _leave_core_step(
+            v,
+            pos,
+            core_position,
+            obstacles,
+            preferred=ring_pref,
+            uid=uid,
+            kind="vanguard",
+            logs=logs,
+        ):
             continue
 
         # 邻格有敌人 → sweep
@@ -229,6 +286,20 @@ def command_rangers(
                 if direction and hasattr(r, "move"):
                     r.move(_resolve_direction(direction))
                     logs.append(f"ranger:{uid}:to_heal:{direction}")
+            continue
+
+        # 禁止与 Core 重叠：立即移开（优先朝 Ranger 环）
+        ring_pref = cells_toward_ring(pos, core_position, config.ranger_radius)
+        if _leave_core_step(
+            r,
+            pos,
+            core_position,
+            obstacles,
+            preferred=ring_pref,
+            uid=uid,
+            kind="ranger",
+            logs=logs,
+        ):
             continue
 
         # 射程内敌人 → shoot

@@ -320,6 +320,93 @@ def test_single_mine_not_all_workers_rush(config: TacticConfig) -> None:
     assert len(to_res2) == 1, f"tick2 expected 1 miner, got {to_res2}; all={logs2}"
 
 
+def test_near_worker_steals_far_claim(config: TacticConfig) -> None:
+    """近距空载 Worker 可抢走远方 claim，避免发现者继续 beacon 探索。
+
+    回归：claim TTL 内远方 owner 占着矿，近处 cargo=0 的发现者走 explore/beacon_push。
+    """
+    import bot.economy as eco
+
+    eco._claimed_targets.clear()
+    eco._pending_return_mines.clear()
+    eco._spiral_state.clear()
+    eco._last_move_dir.clear()
+    eco._loop_trackers.clear()
+    eco._worker_intents.clear()
+
+    mine = (20, 10)
+    far = StubUnit(position=(5, 10), cargo=0, unit_type="WORKER")   # dist 15
+    near = StubUnit(position=(18, 10), cargo=0, unit_type="WORKER")  # dist 2 ≤ steal
+    # 远方先 claim
+    eco._claimed_targets[mine] = (10, str(far.id))
+
+    turn = StubTurn(
+        tick=12,
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[far, near],
+        resource_cells={mine},
+        visible_enemies=[],
+    )
+    plan = assign_roles(turn, config=config)
+    logs = command_workers(turn, plan, config=config)
+    near_lines = [l for l in logs if str(near.id) in l]
+    assert any(
+        ":to_resource:" in l or l.endswith(":harvest") for l in near_lines
+    ), f"near worker should mine, logs={logs}"
+    # claim 应转给 near
+    assert eco._claimed_targets.get(mine, (None, None))[1] == str(near.id), eco._claimed_targets
+
+
+def test_empty_cargo_returns_to_remembered_mine_out_of_fov(config: TacticConfig) -> None:
+    """走出 FOV 后记忆仍 VISIBLE：空背包应 to_resource，而非 beacon 探索。"""
+    import bot.economy as eco
+    from bot.memory import VISIBLE, MemoryMap
+
+    eco._claimed_targets.clear()
+    eco._pending_return_mines.clear()
+    eco._spiral_state.clear()
+    eco._last_move_dir.clear()
+    eco._loop_trackers.clear()
+    eco._worker_intents.clear()
+
+    mem = MemoryMap(refresh_interval_ticks=4)
+    core_pos = (10, 10)
+    mine = (30, 10)
+    # 曾见矿
+    t_see = StubTurn(
+        tick=1,
+        core=StubCore(position=core_pos),
+        resource_cells={mine},
+        workers=[StubUnit(position=mine, unit_type="WORKER")],
+    )
+    mem.observe(t_see, 1)
+    # 离开 FOV：不应 DEPLETED
+    t_leave = StubTurn(
+        tick=2,
+        core=StubCore(position=core_pos),
+        resource_cells=set(),
+        workers=[StubUnit(position=(12, 10), unit_type="WORKER")],
+    )
+    mem.observe(t_leave, 2)
+    assert mem.resource_points[mine].state == VISIBLE
+
+    worker = StubUnit(position=(12, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        tick=3,
+        resources=5,
+        core=StubCore(position=core_pos),
+        workers=[worker],
+        resource_cells=set(),
+        visible_enemies=[],
+    )
+    plan = assign_roles(turn, config=config)
+    logs = command_workers(turn, plan, config=config, memory=mem)
+    assert any(":to_resource:" in line for line in logs), logs
+    assert not any("beacon_push" in line for line in logs), logs
+    assert worker.action == "move"
+
+
 def test_worker_deposit_when_cargo_at_core(config: TacticConfig) -> None:
     worker = StubUnit(position=(10, 10), cargo=1, unit_type="WORKER")
     turn = StubTurn(
@@ -667,6 +754,99 @@ def test_worker_return_deposit_repaths_on_spatial_loop(config: TacticConfig) -> 
     assert manhattan(new_pos, core_pos) < manhattan(start, core_pos), (
         f"repath did not approach core: dir={direction} logs={logs}"
     )
+
+
+def test_worker_return_deposit_escapes_on_stall(config: TacticConfig) -> None:
+    """满货回城 man 长期不降 → :escape:stall 强制换侧，不得永久 repath:loop 空转。
+
+    线上 fa7407d7 类：连续 return_deposit:repath:loop 但 d_core 不下降。
+    """
+    from bot.economy import (
+        _DEPOSIT_STALL_TICKS,
+        _deposit_progress,
+        _last_move_dir,
+        _loop_trackers,
+    )
+    from bot.pathing import LoopTracker, manhattan, observe_move
+
+    _last_move_dir.clear()
+    _loop_trackers.clear()
+    _deposit_progress.clear()
+
+    core_pos = (0, 0)
+    start = (20, 0)  # 右侧 20 格
+    worker = StubUnit(position=start, cargo=1, unit_type="WORKER")
+    wkey = str(worker.id)
+
+    # 预填 loop tracker 足迹（局部横跳），并标记 deposit 无进展已超时
+    tr = LoopTracker()
+    for p in [(20, 0), (20, 1), (20, 0), (20, -1), (20, 0), (19, 0), (20, 0)]:
+        observe_move(tr, p, window=12)
+    _loop_trackers[wkey] = tr
+    _last_move_dir[wkey] = "UP"
+    # best_man=20, last_improve 很早 → stall >= _DEPOSIT_STALL_TICKS
+    _deposit_progress[wkey] = (20, 1, 0)
+
+    turn = StubTurn(
+        tick=1 + _DEPOSIT_STALL_TICKS + 2,
+        resources=5,
+        core=StubCore(position=core_pos),
+        workers=[worker],
+        resource_cells=set(),
+        obstacle_cells=set(),
+    )
+    plan = assign_roles(turn, config=config)
+    logs = command_workers(turn, plan, config=config)
+
+    assert worker.action == "move", logs
+    assert any(":return_deposit:" in line for line in logs), logs
+    assert any(":escape:stall" in line for line in logs), logs
+    direction = str(worker.action_args)
+    dx, dy = _DIR_DELTA[direction]
+    new_pos = (start[0] + dx, start[1] + dy)
+    # 逃逸后不应更远离 Core
+    assert manhattan(new_pos, core_pos) <= manhattan(start, core_pos), (
+        f"escape moved farther: dir={direction} logs={logs}"
+    )
+
+
+def test_worker_return_deposit_escapes_on_repath_streak(config: TacticConfig) -> None:
+    """连续 repath:loop 达到阈值 → :escape:repath_streak。"""
+    from bot.economy import (
+        _DEPOSIT_REPATH_STREAK,
+        _deposit_progress,
+        _last_move_dir,
+        _loop_trackers,
+    )
+    from bot.pathing import manhattan
+
+    _last_move_dir.clear()
+    _loop_trackers.clear()
+    _deposit_progress.clear()
+
+    core_pos = (0, 0)
+    start = (12, 3)
+    worker = StubUnit(position=start, cargo=1, unit_type="WORKER")
+    wkey = str(worker.id)
+    _deposit_progress[wkey] = (
+        manhattan(start, core_pos),
+        100,
+        _DEPOSIT_REPATH_STREAK,
+    )
+    _last_move_dir[wkey] = "DOWN"
+
+    turn = StubTurn(
+        tick=100,
+        resources=5,
+        core=StubCore(position=core_pos),
+        workers=[worker],
+        resource_cells=set(),
+        obstacle_cells=set(),
+    )
+    plan = assign_roles(turn, config=config)
+    logs = command_workers(turn, plan, config=config)
+    assert any(":escape:repath_streak" in line for line in logs), logs
+    assert worker.action == "move"
 
 
 def test_worker_recall_boundary_no_oscillation(config: TacticConfig) -> None:
@@ -2905,10 +3085,11 @@ def test_TR_7_5_economy_stall_50_ticks() -> None:
 
 
 def test_TR_7_6_gc_256_ticks_cleanup_dead_workers() -> None:
-    """TR-7.6: tick=256，构造 2 worker，4 个字典塞 2 个 key，删 1 个 worker → 字典各剩 1 key。"""
+    """TR-7.6: tick=256，构造 2 worker，多字典塞 2 个 key，删 1 个 worker → 各剩 1 key。"""
     from bot.economy import (
         command_workers,
         health_tracker,
+        _deposit_progress,
         _spiral_state,
         _last_move_dir,
         _loop_trackers,
@@ -2926,11 +3107,12 @@ def test_TR_7_6_gc_256_ticks_cleanup_dead_workers() -> None:
     k1 = _worker_key(w1.id)
     k2 = _worker_key(w2.id)
 
-    # 在 4 个字典里塞入 2 个 key（每个 worker 对应 1 个）
+    # 在字典里塞入 2 个 key（每个 worker 对应 1 个）
     _spiral_state.clear()
     _last_move_dir.clear()
     _loop_trackers.clear()
     _pending_return_mines.clear()
+    _deposit_progress.clear()
 
     _spiral_state[k1] = SpiralState()
     _spiral_state[k2] = SpiralState()
@@ -2940,12 +3122,16 @@ def test_TR_7_6_gc_256_ticks_cleanup_dead_workers() -> None:
     _loop_trackers[k2] = LoopTracker()
     _pending_return_mines[k1] = ((14, 10), 250)
     _pending_return_mines[k2] = ((10, 14), 250)
+    # best_man, last_improve_tick, repath_streak
+    _deposit_progress[k1] = (5, 200, 1)
+    _deposit_progress[k2] = (8, 210, 2)
 
     # 先验证每个字典有 2 个 key
     assert len(_spiral_state) == 2
     assert len(_last_move_dir) == 2
     assert len(_loop_trackers) == 2
     assert len(_pending_return_mines) == 2
+    assert len(_deposit_progress) == 2
 
     # 构造 turn：workers 中只放 w1（w2 "死亡"）
     turn = StubTurn(
@@ -2958,7 +3144,7 @@ def test_TR_7_6_gc_256_ticks_cleanup_dead_workers() -> None:
     plan = assign_roles(turn)
     command_workers(turn, plan)
 
-    # GC 后：4 个字典都应该只剩下 1 个 key（k1）
+    # GC 后：字典都应该只剩下 1 个 key（k1）
     assert set(_spiral_state.keys()) == {k1}, (
         f"_spiral_state 应为 {{{k1!r}}}，实际 {list(_spiral_state.keys())}"
     )
@@ -2970,5 +3156,8 @@ def test_TR_7_6_gc_256_ticks_cleanup_dead_workers() -> None:
     )
     assert set(_pending_return_mines.keys()) == {k1}, (
         f"_pending_return_mines 应为 {{{k1!r}}}，实际 {list(_pending_return_mines.keys())}"
+    )
+    assert set(_deposit_progress.keys()) == {k1}, (
+        f"_deposit_progress 应为 {{{k1!r}}}，实际 {list(_deposit_progress.keys())}"
     )
 

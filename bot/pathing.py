@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from heapq import heappop, heappush
 from typing import Any, Deque, Iterable, Optional, Sequence
 
 # 位置类型：(x, y)
@@ -302,12 +303,25 @@ class LoopTracker:
     cooldown: int = 0
     repath_side: int = 0  # 0/1 交替左右绕行
     last_repath_tick: int = -1
+    # 短 BFS 航点队列（不含当前格）：破口袋后沿最短绕障路径推进，避免再贪心回钻
+    route_waypoints: list[Position] = field(default_factory=list)
+    route_dest: Optional[Position] = None
+    route_expires_tick: int = -1
 
     def reset(self) -> None:
         self.history.clear()
         self.static_ticks = 0
         self.last_pos = None
         self.cooldown = 0
+        self.route_waypoints.clear()
+        self.route_dest = None
+        self.route_expires_tick = -1
+
+    def clear_route(self) -> None:
+        """丢弃未走完的 BFS 航点（目标变更 / 过期 / 失败时）。"""
+        self.route_waypoints.clear()
+        self.route_dest = None
+        self.route_expires_tick = -1
 
 
 def bbox_diameter(positions: Sequence[Position]) -> int:
@@ -515,6 +529,249 @@ def wall_follow_step(
     return best
 
 
+def _prepare_accept(
+    start: Position,
+    goal: Position,
+    hard: set[Position],
+) -> Optional[set[Position]]:
+    """构建可接受终点集合；goal 在障上则用自由邻格。无解返回 None。"""
+    accept: set[Position] = set()
+    if goal not in hard:
+        accept.add(goal)
+    else:
+        for dlt in CARDINAL_DELTAS:
+            nb = add_pos(goal, dlt)
+            if nb not in hard:
+                accept.add(nb)
+        if not accept:
+            return None
+    return accept
+
+
+def _reconstruct_first_step(
+    start: Position,
+    found: Position,
+    parent: dict[Position, Optional[Position]],
+) -> Optional[str]:
+    """从 parent 链回溯 start→found 的第一步方向。"""
+    if found not in parent:
+        return None
+    node: Position = found
+    prev = parent[node]
+    if prev is None:
+        return None
+    while prev is not None and prev != start:
+        node = prev
+        prev = parent[node]
+    if prev != start:
+        return None
+    return direction_between(start, node)
+
+
+def _reconstruct_waypoints(
+    start: Position,
+    found: Position,
+    parent: dict[Position, Optional[Position]],
+) -> Optional[list[Position]]:
+    """还原 start 之后的航点列表（不含 start）。"""
+    node: Optional[Position] = found
+    rev: list[Position] = []
+    while node is not None and node != start:
+        rev.append(node)
+        node = parent.get(node)
+    if node != start:
+        return None
+    rev.reverse()
+    return rev if rev else None
+
+
+def _astar_route(
+    start: Position,
+    goal: Position,
+    hard: set[Position],
+    *,
+    max_expand: int = 480,
+    avoid: Optional[set[Position]] = None,
+) -> Optional[tuple[list[Position], dict[Position, Optional[Position]], Position]]:
+    """A* 四连通绕障；返回 (waypoints_from_start, parent, found) 或 None。
+
+    比纯 BFS 在迷宫/远距上 expand 少一个数量级（线上 man≈43 迷宫：
+    BFS 需 ~3700 expand，A* 通常 <800）。
+    """
+    accept = _prepare_accept(start, goal, hard)
+    if accept is None:
+        return None
+    if start in accept:
+        return None
+
+    soft_avoid = avoid or set()
+    # heap 项: (f, g, tie, pos)；tie 保稳定
+    tie = 0
+    open_heap: list[tuple[int, int, int, Position]] = []
+    g_score: dict[Position, int] = {start: 0}
+    parent: dict[Position, Optional[Position]] = {start: None}
+    heappush(open_heap, (manhattan(start, goal), 0, tie, start))
+    expanded = 0
+    found: Optional[Position] = None
+
+    while open_heap and expanded < max_expand:
+        _f, g, _t, cur = heappop(open_heap)
+        if g != g_score.get(cur, -1):
+            continue  # 过期条目
+        expanded += 1
+        if cur in accept:
+            found = cur
+            break
+        for dlt in CARDINAL_DELTAS:
+            nxt = add_pos(cur, dlt)
+            if nxt in hard and nxt != start:
+                continue
+            if nxt in soft_avoid and nxt not in accept and nxt != start:
+                continue
+            ng = g + 1
+            old = g_score.get(nxt)
+            if old is not None and ng >= old:
+                continue
+            g_score[nxt] = ng
+            parent[nxt] = cur
+            # h：到 goal 的曼哈顿（accept 邻格也用 goal 启发，足够）
+            h = min(manhattan(nxt, a) for a in accept) if len(accept) > 1 else manhattan(nxt, goal)
+            tie += 1
+            heappush(open_heap, (ng + h, ng, tie, nxt))
+
+    if found is None:
+        for a in accept:
+            if a in parent:
+                found = a
+                break
+    if found is None:
+        return None
+    wps = _reconstruct_waypoints(start, found, parent)
+    if not wps:
+        return None
+    return wps, parent, found
+
+
+def bfs_next_step(
+    origin: Position,
+    target: Position,
+    obstacles: Optional[Iterable[Position]] = None,
+    *,
+    max_expand: int = 480,
+    avoid: Optional[Iterable[Position]] = None,
+) -> Optional[str]:
+    """四连通最短绕障的**第一步**方向名；失败返回 None。
+
+    实现为 A*（接口名保留 bfs_next_step 以兼容旧调用/单测）。
+    - 硬障碍永不踏入；origin 叠障时仍允许从 origin 走出。
+    - 终点在障上：寻到与终点曼哈顿=1 的自由邻格即成功（deposit/站位）。
+    - ``avoid``：额外软禁格（近期足迹），但若导致无解会在调用方回退。
+    - ``max_expand`` 严格有界，供 runtime 每 tick 调用。
+    """
+    if origin == target:
+        return None
+    hard: set[Position] = set(obstacles) if obstacles is not None else set()
+    soft_avoid: set[Position] = set(avoid) if avoid is not None else set()
+    goal = (int(target[0]), int(target[1]))
+    start = (int(origin[0]), int(origin[1]))
+
+    result = _astar_route(
+        start, goal, hard, max_expand=max_expand, avoid=soft_avoid or None
+    )
+    if result is None and soft_avoid:
+        result = _astar_route(start, goal, hard, max_expand=max_expand, avoid=None)
+    if result is None:
+        return None
+    wps, _parent, _found = result
+    return direction_between(start, wps[0])
+
+
+def _follow_route_step(
+    origin: Position,
+    target: Position,
+    hard_obs: set[Position],
+    tracker: LoopTracker,
+    tick: int,
+) -> Optional[str]:
+    """沿 tracker.route_waypoints 走一步；失效则清 route 并返回 None。
+
+    航点在**到达**后才弹出：本 tick 只返回朝队首的方向，不预先消费。
+    这样服务端拒步时下一 tick 仍会重试同一格，避免 route 被掏空后回退贪心横跳。
+    """
+    if tracker.route_expires_tick >= 0 and tick > tracker.route_expires_tick:
+        tracker.clear_route()
+        return None
+    if tracker.route_dest is not None and tracker.route_dest != target:
+        tracker.clear_route()
+        return None
+    wps = tracker.route_waypoints
+    if not wps:
+        tracker.clear_route()
+        return None
+    # 已走到队首：弹出（到达确认）
+    while wps and wps[0] == origin:
+        wps.pop(0)
+    if not wps:
+        tracker.clear_route()
+        return None
+    nxt = wps[0]
+    if manhattan(origin, nxt) != 1:
+        # 脱队（被拒步/传送/ fortuitous 旁路）→ 重规划
+        tracker.clear_route()
+        return None
+    if nxt in hard_obs:
+        tracker.clear_route()
+        return None
+    direction = direction_between(origin, nxt)
+    if direction is None:
+        tracker.clear_route()
+        return None
+    # 不在这里 pop：等下一 tick origin==nxt 再 pop
+    return direction
+
+
+def _install_bfs_route(
+    origin: Position,
+    target: Position,
+    hard_obs: set[Position],
+    tracker: LoopTracker,
+    tick: int,
+    *,
+    max_expand: int = 480,
+    avoid: Optional[Iterable[Position]] = None,
+    ttl: int = 24,
+) -> Optional[str]:
+    """跑短 A* 绕障，把路径写入 tracker，并返回第一步。"""
+    hard = set(hard_obs)
+    soft_avoid: set[Position] = set(avoid) if avoid is not None else set()
+    goal = (int(target[0]), int(target[1]))
+    start = (int(origin[0]), int(origin[1]))
+    if start == goal:
+        tracker.clear_route()
+        return None
+
+    result = _astar_route(
+        start, goal, hard, max_expand=max_expand, avoid=soft_avoid or None
+    )
+    if result is None and soft_avoid:
+        result = _astar_route(start, goal, hard, max_expand=max_expand, avoid=None)
+    if result is None:
+        tracker.clear_route()
+        return None
+    rev, _parent, _found = result
+    # 缓存完整短路径（含第一步）。到达后由 _follow_route_step 弹出。
+    tracker.route_waypoints = rev[:96]
+    tracker.route_dest = goal
+    # TTL 至少覆盖路径长度，避免中途过期回退贪心
+    tracker.route_expires_tick = tick + max(12, ttl, len(rev) + 8)
+    first = rev[0]
+    direction = direction_between(start, first)
+    if direction is None or first in hard:
+        tracker.clear_route()
+        return None
+    return direction
+
+
 def guided_step_toward(
     origin: Position,
     target: Position,
@@ -529,6 +786,7 @@ def guided_step_toward(
     static_ticks: int = 4,
     repath_cooldown: int = 5,
     tick: int = 0,
+    prefer_bfs: bool = False,
 ) -> tuple[Optional[str], Optional[str], bool]:
     """朝 target 走一格；若检测到空间循环则强制重寻路。
 
@@ -536,6 +794,7 @@ def guided_step_toward(
     did_repath=True 时调用方应打日志（如 ``:repath:loop``）并清空旧 last_dir 粘性。
 
     重寻路 / 绕墙策略：
+    - **短 BFS 航点**（loop / prefer_bfs / 已有 route）优先，打破障边口袋空转；
     - 主轴被**硬障碍**挡住 → **贴墙绕行**（wall_follow_step），禁止墙下左右横跳；
     - 空间循环时用 soft trail，但**若主轴邻格在近期足迹中则不保护**（防口袋回钻）；
     - 主轴虽空闲但邻格刚走过（DOWN 撤退后再 UP）→ 强制侧向离开，禁止 2 格震荡；
@@ -545,6 +804,7 @@ def guided_step_toward(
         if tracker is not None:
             observe_move(tracker, origin, window=window)
             tracker.static_ticks = 0
+            tracker.clear_route()
         return None, None, False
 
     hard_obs: set[Position] = set(obstacles) if obstacles is not None else set()
@@ -556,6 +816,11 @@ def guided_step_toward(
 
     if tracker is not None:
         observe_move(tracker, origin, window=window)
+        # 已有 BFS 航点：优先跟随（目标未变且未过期）
+        routed = _follow_route_step(origin, target, hard_obs, tracker, tick)
+        if routed is not None:
+            return routed, routed, False
+
         looping = detect_spatial_loop(
             tracker,
             origin,
@@ -565,6 +830,49 @@ def guided_step_toward(
             bbox_diameter_max=bbox_diameter_max,
             static_ticks=static_ticks,
         )
+        # 回城 prefer_bfs 或已 loop：装短 BFS 航点（有 route 时上面已 follow）
+        # man>=3 才装 route；近距走下方 short-man 直达
+        man0 = manhattan(origin, target)
+        want_bfs = bool(looping or (prefer_bfs and man0 >= 3))
+        if want_bfs:
+            # 仅 loop 时用足迹 soft-avoid；prefer_bfs 常态不用，
+            # 否则每 tick 重规划会被自己的 trail 逼成左右横跳
+            avoid_set: Optional[set[Position]] = None
+            if looping:
+                recent = list(tracker.history)[-6:]
+                avoid_set = {p for p in recent if p != origin}
+                primary_pre, _pb = _primary_hard_blocked(origin, target, hard_obs)
+                if primary_pre and primary_pre in NAME_TO_DELTA:
+                    pc = add_pos(origin, NAME_TO_DELTA[primary_pre])
+                    if pc in tracker.history:
+                        avoid_set.add(pc)
+            # A* 远距迷宫：线上 man≈43 约需 path_len 47；cap 给足余量
+            # route 缓存后不每 tick 重算，单次成本可接受
+            if man0 <= 12:
+                cap = 600
+            elif man0 <= 40:
+                cap = 1800
+            else:
+                cap = 4500
+            bfs_dir = _install_bfs_route(
+                origin,
+                target,
+                hard_obs,
+                tracker,
+                tick,
+                max_expand=cap,
+                avoid=avoid_set,
+                ttl=36 if man0 <= 24 else 72,
+            )
+            if bfs_dir is not None:
+                if looping:
+                    did_repath = True
+                    tracker.cooldown = max(1, repath_cooldown)
+                    tracker.last_repath_tick = tick
+                    tracker.repath_side = 1 - tracker.repath_side
+                    tracker.static_ticks = 0
+                return bfs_dir, bfs_dir, did_repath
+
         if looping:
             did_repath = True
             tracker.cooldown = max(1, repath_cooldown)

@@ -16,11 +16,13 @@ import argparse
 import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from bot.config import DEFAULT_CONFIG, TacticConfig
+from bot.memory import load_world_memory, save_world_memory
 from bot.strategy import decide
 
 logger = logging.getLogger("arena_hero_tactic")
@@ -29,6 +31,41 @@ logger = logging.getLogger("arena_hero_tactic")
 _BACKOFF_INITIAL = 1.0
 _BACKOFF_FACTOR = 2.0
 _BACKOFF_MAX = 30.0
+
+# 自愈：连续 TICK_MISMATCH / 会话无 tick 进度 → 强制结束会话并重连
+STALE_STREAK_RECONNECT = 3  # 连续提交过期次数
+SESSION_IDLE_RECONNECT_SEC = 60.0  # 未收到/处理新 turn 的墙钟秒数
+WATCHDOG_POLL_SEC = 5.0
+EMPTY_SESSION_PROCESS_EXIT = 2  # 连续空会话次数 → 进程退出，交外部 watchdog 重启
+
+
+class SessionNeedsReconnect(Exception):
+    """可恢复：当前 WS 会话假活/过期风暴，应退出 run_session 并重连。"""
+
+
+def _try_close_game(game: Any, reason: str) -> None:
+    """尽力关闭 SDK 客户端 / 底层 WS，打断阻塞的 turns() 迭代。"""
+    logger.warning("force_close_game reason=%s", reason)
+    for name in ("close", "disconnect", "stop", "shutdown"):
+        fn = getattr(game, name, None)
+        if callable(fn):
+            try:
+                fn()
+                return
+            except Exception:  # noqa: BLE001
+                pass
+    for attr in ("_ws", "ws", "_websocket", "websocket", "connection", "_connection"):
+        obj = getattr(game, attr, None)
+        if obj is None:
+            continue
+        for name in ("close", "disconnect", "cancel"):
+            fn = getattr(obj, name, None)
+            if callable(fn):
+                try:
+                    fn()
+                    return
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 def mask_api_key(key: str) -> str:
@@ -181,6 +218,19 @@ def _is_stale_tick_error(exc: BaseException) -> bool:
     return False
 
 
+def _is_client_closed_error(exc: BaseException) -> bool:
+    """WS/客户端已关闭（常见于 force_close 后 turns 迭代残留）。"""
+    msg = str(exc).lower()
+    name = type(exc).__name__.lower()
+    if "configurationerror" in name and "closed" in msg:
+        return True
+    if "client is closed" in msg or "the client is closed" in msg:
+        return True
+    if "websocket" in msg and ("closed" in msg or "close" in msg):
+        return True
+    return False
+
+
 def run_session(
     api_key: str,
     config: TacticConfig,
@@ -205,75 +255,195 @@ def run_session(
         client_kwargs["base_url"] = base_url
 
     stop_for_max = False
+    stale_streak = 0
+    turns_this_session = 0
+    idle_forced = False
+    # 会话进度墙钟：每收到 turn / 完成一轮处理就刷新；看门狗据此检测假活
+    progress_lock = threading.Lock()
+    last_progress_mono = time.monotonic()
+    watchdog_stop = threading.Event()
+    game_holder: dict[str, Any] = {"game": None}
+
+    def _touch_progress() -> None:
+        nonlocal last_progress_mono
+        with progress_lock:
+            last_progress_mono = time.monotonic()
+
+    def _idle_sec() -> float:
+        with progress_lock:
+            return time.monotonic() - last_progress_mono
+
+    def _session_watchdog() -> None:
+        """后台线程：超过 SESSION_IDLE_RECONNECT_SEC 无 turn 进度则强关 WS。"""
+        while not watchdog_stop.wait(WATCHDOG_POLL_SEC):
+            idle = _idle_sec()
+            if idle < SESSION_IDLE_RECONNECT_SEC:
+                continue
+            g = game_holder.get("game")
+            logger.error(
+                "session_watchdog: idle=%.1fs >= %.1fs — force close WS to reconnect",
+                idle,
+                SESSION_IDLE_RECONNECT_SEC,
+            )
+            nonlocal idle_forced
+            idle_forced = True
+            if g is not None:
+                _try_close_game(g, f"idle_{idle:.0f}s")
+            # 关闭后 turns() 应抛错/结束；若仍卡死由进程外 watchdog 兜底
+            return
+
     with ArenaHeroClient(**client_kwargs) as game:
-        logger.info("WebSocket 已连接，开始接收 turns")
-        for turn in game.turns():
-            t0 = time.perf_counter()
-            tick = getattr(turn, "tick", "?")
-            try:
-                result = decide(turn, config=config)
-                # --- Dashboard 快照钩子（零兜底伪造；dashboard_push 由 run_loop 直接注入）---
-                if dashboard_push is not None:
+        game_holder["game"] = game
+        _touch_progress()
+        wd = threading.Thread(
+            target=_session_watchdog,
+            name="session-watchdog",
+            daemon=True,
+        )
+        wd.start()
+        try:
+            logger.info(
+                "WebSocket 已连接，开始接收 turns "
+                "(stale_streak_limit=%s idle_reconnect=%.0fs)",
+                STALE_STREAK_RECONNECT,
+                SESSION_IDLE_RECONNECT_SEC,
+            )
+            for turn in game.turns():
+                _touch_progress()
+                t0 = time.perf_counter()
+                tick = getattr(turn, "tick", "?")
+                try:
+                    result = decide(turn, config=config)
+                    # 先 submit：Dashboard path dry-run 不得占用 turn 提交窗口
+                    try:
+                        turn.submit()
+                    except Exception as submit_exc:
+                        if _is_stale_tick_error(submit_exc):
+                            stale_streak += 1
+                            logger.warning(
+                                "tick=%s 提交过期已跳过: %s (stale_streak=%s/%s)",
+                                tick,
+                                submit_exc,
+                                stale_streak,
+                                STALE_STREAK_RECONNECT,
+                            )
+                            if stale_streak >= STALE_STREAK_RECONNECT:
+                                _try_close_game(
+                                    game, f"stale_streak_{stale_streak}"
+                                )
+                                raise SessionNeedsReconnect(
+                                    f"连续 {stale_streak} 次 TICK_MISMATCH/"
+                                    f"过期提交 (last_tick={tick})"
+                                ) from submit_exc
+                        else:
+                            raise
+                    else:
+                        stale_streak = 0
+                        elapsed_ms = (time.perf_counter() - t0) * 1000
+                        logger.info("%s (%.0fms)", result.summary(), elapsed_ms)
+                        if logger.isEnabledFor(logging.DEBUG):
+                            for line in result.logs:
+                                logger.debug("  %s", line)
+
+                    # --- Dashboard 快照钩子（submit 之后；零兜底伪造）---
+                    if dashboard_push is not None:
+                        try:
+                            from bot.memory import WORLD_MEMORY
+                            econ_states: Any = None
+                            try:
+                                import importlib as _dash_il
+                                _eco_mod = _dash_il.import_module("bot.economy")
+                                for _name in (
+                                    "WORKER_STATES",
+                                    "worker_states",
+                                    "ECONOMY_STATES",
+                                    "_worker_states",
+                                    "get_worker_states",
+                                ):
+                                    _obj = getattr(_eco_mod, _name, None)
+                                    if _obj is None:
+                                        continue
+                                    if callable(_obj):
+                                        try:
+                                            econ_states = _obj()
+                                        except Exception:
+                                            econ_states = None
+                                    elif isinstance(_obj, dict):
+                                        econ_states = _obj
+                                    if econ_states is not None:
+                                        break
+                            except Exception:
+                                econ_states = None
+                            dashboard_push(
+                                turn, result, WORLD_MEMORY, econ_states
+                            )
+                        except Exception:  # noqa: BLE001
+                            import logging as _log
+                            _log.getLogger("arena_hero_tactic").warning(
+                                "dashboard:hook_failed", exc_info=True
+                            )
+
+                    # 周期性落盘已探/障碍（每 N tick；失败不阻断决策）
                     try:
                         from bot.memory import WORLD_MEMORY
-                        econ_states: Any = None
-                        # 真实 Worker 状态字典：仅当 bot.economy 显式导出时读取
-                        # （禁止自己发明 ECONOMY_STATES 这样的模块名；不存在则传 None）
-                        try:
-                            import importlib as _dash_il
-                            _eco_mod = _dash_il.import_module("bot.economy")
-                            # 按优先级尝试官方可能的导出名（都没有则 None，绝不兜底伪造）
-                            for _name in ("WORKER_STATES", "worker_states", "ECONOMY_STATES",
-                                          "_worker_states", "get_worker_states"):
-                                _obj = getattr(_eco_mod, _name, None)
-                                if _obj is None:
-                                    continue
-                                if callable(_obj):
-                                    try:
-                                        econ_states = _obj()
-                                    except Exception:
-                                        econ_states = None
-                                elif isinstance(_obj, dict):
-                                    econ_states = _obj
-                                if econ_states is not None:
-                                    break
-                        except Exception:
-                            econ_states = None
-                        dashboard_push(turn, result, WORLD_MEMORY, econ_states)
-                    except Exception:  # noqa: BLE001
-                        import logging as _log
-                        _log.getLogger("arena_hero_tactic").warning("dashboard:hook_failed", exc_info=True)
-                # ---------------------------------------------------------
-                try:
-                    turn.submit()
-                except Exception as submit_exc:
-                    # 窗口已关 / tick 过期：跳过本 tick，等下一份 state
-                    if _is_stale_tick_error(submit_exc):
-                        logger.warning(
-                            "tick=%s 提交过期已跳过: %s",
-                            tick,
-                            submit_exc,
-                        )
-                    else:
-                        raise
-                else:
-                    elapsed_ms = (time.perf_counter() - t0) * 1000
-                    logger.info("%s (%.0fms)", result.summary(), elapsed_ms)
-                    if logger.isEnabledFor(logging.DEBUG):
-                        for line in result.logs:
-                            logger.debug("  %s", line)
-            except Exception as exc:
-                if _is_stale_tick_error(exc):
-                    logger.warning("tick=%s 已过期: %s", tick, exc)
-                else:
-                    logger.exception("tick=%s 决策/提交失败", tick)
-                # 不再盲目补提交：过期 tick 上再 submit 只会再次 409
 
-            turns_done += 1
-            if max_turns is not None and turns_done >= max_turns:
-                logger.info("达到 max_turns=%s，退出", max_turns)
-                stop_for_max = True
-                break
+                        WORLD_MEMORY.maybe_autosave(
+                            int(tick) if str(tick).isdigit() else 0
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                except SessionNeedsReconnect:
+                    raise
+                except Exception as exc:
+                    if _is_stale_tick_error(exc):
+                        stale_streak += 1
+                        logger.warning(
+                            "tick=%s 已过期: %s (stale_streak=%s/%s)",
+                            tick,
+                            exc,
+                            stale_streak,
+                            STALE_STREAK_RECONNECT,
+                        )
+                        if stale_streak >= STALE_STREAK_RECONNECT:
+                            _try_close_game(
+                                game, f"stale_streak_{stale_streak}"
+                            )
+                            raise SessionNeedsReconnect(
+                                f"连续 {stale_streak} 次过期 "
+                                f"(last_tick={tick})"
+                            ) from exc
+                    elif _is_client_closed_error(exc) or idle_forced:
+                        # force_close / idle 后 turns 残留：升为重连，不刷 ERROR 堆栈
+                        logger.warning(
+                            "tick=%s 客户端已关闭，结束会话重连: %s",
+                            tick,
+                            exc,
+                        )
+                        raise SessionNeedsReconnect(
+                            f"client_closed after tick={tick}"
+                        ) from exc
+                    else:
+                        logger.exception("tick=%s 决策/提交失败", tick)
+
+                turns_done += 1
+                turns_this_session += 1
+                _touch_progress()
+                if max_turns is not None and turns_done >= max_turns:
+                    logger.info("达到 max_turns=%s，退出", max_turns)
+                    stop_for_max = True
+                    break
+        finally:
+            watchdog_stop.set()
+            game_holder["game"] = None
+
+    # 空会话（连上但 0 turn，常见于重连后服务端不推 turn / 假活）→ 外层加速重连
+    if turns_this_session == 0 and not stop_for_max:
+        reason = (
+            f"empty_session idle_forced={idle_forced} "
+            f"(no turns received)"
+        )
+        logger.warning("run_session: %s", reason)
+        raise SessionNeedsReconnect(reason)
 
     return turns_done, stop_for_max
 
@@ -301,6 +471,13 @@ def run_loop(
     turn_count = 0
     backoff = _BACKOFF_INITIAL
     session = 0
+    empty_session_streak = 0
+
+    # 启动时加载跨进程地图记忆（已探/障碍/资源）；无文件则空开局
+    try:
+        load_world_memory()
+    except Exception:  # noqa: BLE001
+        logger.warning("memory:load_failed", exc_info=True)
 
     logger.info(
         "启动战术「资源优先+均衡防守」 %s max_pop=%s workers=%s vanguards=%s rangers=%s max_turns=%s",
@@ -362,6 +539,8 @@ def run_loop(
             )
             if stop_for_max:
                 break
+            # 本会话有 turn 则清空空会话连击
+            empty_session_streak = 0
             logger.warning(
                 "会话 #%s 结束（已处理 %s turns），准备重连",
                 session,
@@ -370,9 +549,55 @@ def run_loop(
             backoff = _BACKOFF_INITIAL
         except KeyboardInterrupt:
             logger.info("收到 Ctrl+C，停止")
+            try:
+                save_world_memory()
+            except Exception:  # noqa: BLE001
+                logger.warning("memory:save_on_interrupt_failed", exc_info=True)
             raise
         except SystemExit:
+            try:
+                save_world_memory()
+            except Exception:  # noqa: BLE001
+                pass
             raise
+        except SessionNeedsReconnect as snr:
+            # 连续 409 / 会话假活 / 空会话：短退避后重连；空会话连击则进程退出
+            msg = str(snr)
+            is_empty = "empty_session" in msg
+            if is_empty:
+                empty_session_streak += 1
+            else:
+                empty_session_streak = 0
+            wait_s = min(backoff, _BACKOFF_INITIAL)
+            if is_empty:
+                # 空会话逐步拉长退避，给服务端释放旧连接的时间
+                wait_s = min(2.0 * empty_session_streak, 8.0)
+            logger.warning(
+                "会话 #%s 需要重连: %s — %.1fs 后重连 "
+                "(empty_streak=%s/%s)",
+                session,
+                snr,
+                wait_s,
+                empty_session_streak,
+                EMPTY_SESSION_PROCESS_EXIT,
+            )
+            if empty_session_streak >= EMPTY_SESSION_PROCESS_EXIT:
+                logger.error(
+                    "连续 %s 次空会话，进程退出交外部 watchdog 重启",
+                    empty_session_streak,
+                )
+                try:
+                    save_world_memory()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise SystemExit(42) from snr
+            try:
+                time.sleep(wait_s)
+            except KeyboardInterrupt:
+                logger.info("收到 Ctrl+C，停止")
+                raise
+            backoff = _BACKOFF_INITIAL
+            continue
         except Exception as exc:
             if _is_fatal_error(exc, fatal_types):
                 logger.error(
@@ -413,6 +638,10 @@ def run_loop(
         backoff = _BACKOFF_INITIAL
 
     logger.info("循环结束，共处理 %s 个 turn", turn_count)
+    try:
+        save_world_memory()
+    except Exception:  # noqa: BLE001
+        logger.warning("memory:save_on_exit_failed", exc_info=True)
     return turn_count
 
 
@@ -472,7 +701,16 @@ def main(argv: Optional[list[str]] = None) -> None:
         )
     except KeyboardInterrupt:
         logger.info("用户中断，退出码 0")
+        try:
+            save_world_memory()
+        except Exception:  # noqa: BLE001
+            pass
         sys.exit(0)
+    else:
+        try:
+            save_world_memory()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 if __name__ == "__main__":

@@ -1,20 +1,25 @@
 """地图记忆模块：资源点状态机 / 障碍缓存 / 掉落 cargo / 视野已探（P1-1 / P2-2）。
 
-单局进程内状态，跨 tick 累积。设计约定：
-- 资源点状态机：`VISIBLE →（从 resource_cells 消失）→ DEPLETED →
+跨 tick 累积；可选落盘跨进程重启恢复。设计约定：
+- 资源点状态机：`VISIBLE →（在 FOV 内且 resource_cells 无此格）→ DEPLETED →
   （tick >= depleted_tick + refresh_interval_ticks）→ REVISIT_DUE →（再次可见）→ VISIBLE`。
-- SDK 每 tick 的 `resource_cells` 只含**当前可见** RESOURCE 格；某格从可见集合
-  消失且记忆为 VISIBLE → 判定已消耗（depleted_tick = tick）。
+- SDK 每 tick 的 `resource_cells` 只含**当前可见** RESOURCE 格。
+  **仅当该格本 tick 仍在己方单位/Core 视野内、却不在 resource_cells 时**，
+  才把 VISIBLE 判为已消耗（DEPLETED）。离开 FOV 不等于采空——否则空背包
+  Worker 刚发现矿、下一步走出视距后记忆立刻丢失，会继续 beacon 探索不回头采。
 - 回补节拍：`refresh_interval_ticks`（默认 4，近似「每 4 resolved tick」）。
 - **REVISIT_DUE 仅是「该 chunk 可能已刷新」的信息提示，不是可采集目标**：
   官方规则回补可能发生在**新位置**（确定性随机选槽），旧格位置在重新可见之前
-  不能作为 harvest 目标。`revisit_candidates` 只返回 VISIBLE（当前确认存在）点。
+  不能作为 harvest 目标。`revisit_candidates` 只返回 VISIBLE（含「曾见、仍未在 FOV
+  确认消失」的点，供空载 Worker 导航回去采）。
 - 障碍永久累积（地形）；掉落 cargo 来自 `WORKER_CARGO_DROPPED` 事件。
 - **已探格子 = 官方视野**：服务端每 tick 只发当前 FOV，Agent 自存。
   视距（曼哈顿）：Core=5 / Worker=3 / Vanguard=4 / Ranger=5；
   障碍挡视线（可见墙格本身，不穿透）；单位/Core/资源不挡。
   `explored_cells` 记录曾进入任意己方单位视野的格子（非仅落脚点）。
 - 模块级 `WORLD_MEMORY` 单例供线上 `decide()` 默认使用；测试注入新实例。
+- **持久化**：`to_dict` / `from_dict` / `save` / `load`；默认路径
+  `.arena_hero_state.json`（gitignore）。服务端不回放历史 FOV，重启必须自载。
 
 CRUD 说明：`observe` 负责 Create/Update（资源/障碍/掉落/视野已探）；`mark_harvested`
   负责状态迁移（Update）；`revisit_candidates` 负责 Read；掉落仅软删除
@@ -23,8 +28,12 @@ CRUD 说明：`observe` 负责 Create/Update（资源/障碍/掉落/视野已探
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 from dataclasses import dataclass
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Optional, Union
 
 from bot.pathing import (
     CHUNK_SIZE,
@@ -207,16 +216,7 @@ class MemoryMap:
             except Exception:
                 pass
 
-        visible: set[Position] = set()
-        cells = getattr(turn, "resource_cells", None)
-        if cells is not None:
-            for c in cells:
-                try:
-                    visible.add(_as_position(c))
-                except Exception:
-                    pass
-
-        # 障碍永久累积 + obstacle_cache 时间戳更新（P2-2；保持 obstacles set API）
+        # 先算障碍（视线判定依赖）
         obs = getattr(turn, "obstacle_cells", None)
         if obs is not None:
             for o in obs:
@@ -236,11 +236,27 @@ class MemoryMap:
                 else:
                     ost.last_seen_tick = int(tick)
 
-        # 状态迁移：VISIBLE 且当前不可见 → DEPLETED；DEPLETED 到期 → REVISIT_DUE
+        visible: set[Position] = set()
+        cells = getattr(turn, "resource_cells", None)
+        if cells is not None:
+            for c in cells:
+                try:
+                    visible.add(_as_position(c))
+                except Exception:
+                    pass
+
+        # 本 tick 己方实际 FOV（Core/W/V/R 视距 ∩ 视线），用于「确认采空」
+        fov_cells = self._current_vision_cells(turn)
+
+        # 状态迁移：
+        # - 在 resource_cells → VISIBLE
+        # - VISIBLE 且在 FOV 内但不在 resource_cells → DEPLETED（真采空/消失）
+        # - VISIBLE 但不在 FOV → 保持 VISIBLE（走出视距，矿可能仍在）
+        # - DEPLETED 到期 → REVISIT_DUE
         for pos, rp in list(self.resource_points.items()):
             if pos in visible:
                 rp.mark_visible(tick)
-            elif rp.state == VISIBLE:
+            elif rp.state == VISIBLE and pos in fov_cells:
                 rp.mark_depleted(tick, self.refresh_interval_ticks)
             elif (
                 rp.state == DEPLETED
@@ -285,18 +301,8 @@ class MemoryMap:
         # （能看见的格子 = 已探索区域；障碍挡视线，墙格本身可见）
         self._mark_unit_visions(turn, tick)
 
-
-    def _mark_unit_visions(self, turn: Any, tick: int) -> None:
-        """按官方视距把己方 Core/Worker/Vanguard/Ranger 视野盘标为已探。"""
-        blockers: set[Position] = set(self.obstacles)
-        obs = getattr(turn, "obstacle_cells", None)
-        if obs is not None:
-            for o in obs:
-                try:
-                    blockers.add(_as_position(o))
-                except Exception:
-                    pass
-
+    def _vision_sources(self, turn: Any) -> list[tuple[Position, int]]:
+        """收集己方 Core/Worker/Vanguard/Ranger 的 (原点, 视距)。"""
         sources: list[tuple[Position, int]] = []
         core = getattr(turn, "core", None)
         if core is not None:
@@ -306,7 +312,6 @@ class MemoryMap:
                     sources.append((_as_position(cpos), VISION_RADIUS["CORE"]))
                 except Exception:
                     pass
-
         for attr, key in (
             ("workers", "WORKER"),
             ("vanguards", "VANGUARD"),
@@ -320,8 +325,38 @@ class MemoryMap:
                     sources.append((_as_position(upos), VISION_RADIUS[key]))
                 except Exception:
                     continue
+        return sources
 
-        for origin, radius in sources:
+    def _current_vision_cells(self, turn: Any) -> set[Position]:
+        """本 tick 己方单位/Core 视线可达的全部格子（曼哈顿视距 + 障碍挡视线）。"""
+        blockers: set[Position] = set(self.obstacles)
+        obs = getattr(turn, "obstacle_cells", None)
+        if obs is not None:
+            for o in obs:
+                try:
+                    blockers.add(_as_position(o))
+                except Exception:
+                    pass
+        seen: set[Position] = set()
+        for origin, radius in self._vision_sources(turn):
+            for cell in vision_disk(origin, radius):
+                if cell == origin or has_line_of_sight(origin, cell, blockers):
+                    seen.add(cell)
+        return seen
+
+
+    def _mark_unit_visions(self, turn: Any, tick: int) -> None:
+        """按官方视距把己方 Core/Worker/Vanguard/Ranger 视野盘标为已探。"""
+        blockers: set[Position] = set(self.obstacles)
+        obs = getattr(turn, "obstacle_cells", None)
+        if obs is not None:
+            for o in obs:
+                try:
+                    blockers.add(_as_position(o))
+                except Exception:
+                    pass
+
+        for origin, radius in self._vision_sources(turn):
             self.mark_vision_disk(origin, radius, tick, blockers)
             self.mark_chunk_seen(origin, tick)
 
@@ -561,6 +596,351 @@ class MemoryMap:
 
     def _chunk_ring_of(self, pos: Position) -> int:
         return chunk_ring(chunk_of(_as_position(pos)), self.center_chunk)
+
+    # ---- 持久化（跨 agent 重启）----
+
+    def to_dict(self) -> dict[str, Any]:
+        """序列化为可 JSON 的 dict（坐标用 [x,y]）。"""
+        def _pos_key(p: Position) -> list[int]:
+            return [int(p[0]), int(p[1])]
+
+        def _chunk_key(c: tuple[int, int]) -> list[int]:
+            return [int(c[0]), int(c[1])]
+
+        resources: list[dict[str, Any]] = []
+        for pos, rp in self.resource_points.items():
+            resources.append(
+                {
+                    "pos": _pos_key(pos),
+                    "state": rp.state,
+                    "seen_tick": int(rp.seen_tick),
+                    "depleted_tick": int(rp.depleted_tick),
+                    "refresh_due_tick": int(rp.refresh_due_tick),
+                    "chunk_ring": int(rp.chunk_ring),
+                }
+            )
+
+        obstacles = [_pos_key(p) for p in sorted(self.obstacles)]
+        obstacle_cache: list[dict[str, Any]] = []
+        for pos, ost in self.obstacle_cache.items():
+            obstacle_cache.append(
+                {
+                    "pos": _pos_key(pos),
+                    "first_seen_tick": int(ost.first_seen_tick),
+                    "last_seen_tick": int(ost.last_seen_tick),
+                    "block_count": int(ost.block_count),
+                }
+            )
+
+        dropped: list[dict[str, Any]] = []
+        for pos, dc in self.dropped_cargo.items():
+            dropped.append(
+                {
+                    "pos": _pos_key(pos),
+                    "amount": int(dc.amount),
+                    "drop_tick": int(dc.drop_tick),
+                    "collected": bool(dc.collected),
+                }
+            )
+
+        explored_chunks = [
+            _chunk_key(c) for c in sorted(self.explored_chunks)
+        ]
+        explored_chunk_ticks = [
+            {"chunk": _chunk_key(c), "tick": int(t)}
+            for c, t in sorted(self.explored_chunk_ticks.items())
+        ]
+        chunk_last_seen = [
+            {"chunk": _chunk_key(c), "tick": int(t)}
+            for c, t in sorted(self.chunk_last_seen_ticks.items())
+        ]
+        # 格子级已探可能很大：只保留 first_seen + last_seen 合并列表
+        explored_cells = [
+            {
+                "pos": _pos_key(p),
+                "first": int(t),
+                "last": int(self.explored_cell_last_seen.get(p, t)),
+            }
+            for p, t in sorted(self.explored_cells.items())
+        ]
+
+        return {
+            "version": MEMORY_PERSIST_VERSION,
+            "refresh_interval_ticks": int(self.refresh_interval_ticks),
+            "revisit_max_distance": int(self.revisit_max_distance),
+            "sector_count": int(self.sector_count),
+            "center_chunk": _chunk_key(self.center_chunk),
+            "resource_points": resources,
+            "obstacles": obstacles,
+            "obstacle_cache": obstacle_cache,
+            "dropped_cargo": dropped,
+            "explored_chunks": explored_chunks,
+            "explored_chunk_ticks": explored_chunk_ticks,
+            "chunk_last_seen_ticks": chunk_last_seen,
+            "explored_cells": explored_cells,
+        }
+
+    def load_dict(self, data: dict[str, Any]) -> None:
+        """用 dict 覆盖当前实例字段（就地更新，保留 self 身份）。"""
+        if not isinstance(data, dict):
+            return
+
+        def _as_pos(raw: Any) -> Optional[Position]:
+            try:
+                if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+                    return (int(raw[0]), int(raw[1]))
+            except (TypeError, ValueError):
+                return None
+            return None
+
+        def _as_chunk(raw: Any) -> Optional[tuple[int, int]]:
+            return _as_pos(raw)
+
+        try:
+            self.refresh_interval_ticks = max(
+                1, int(data.get("refresh_interval_ticks", self.refresh_interval_ticks))
+            )
+            self.revisit_max_distance = int(
+                data.get("revisit_max_distance", self.revisit_max_distance)
+            )
+            self.sector_count = max(
+                1, int(data.get("sector_count", self.sector_count))
+            )
+        except (TypeError, ValueError):
+            pass
+
+        cc = _as_chunk(data.get("center_chunk"))
+        if cc is not None:
+            self.center_chunk = cc
+
+        # 资源点
+        self.resource_points.clear()
+        for item in data.get("resource_points") or ():
+            if not isinstance(item, dict):
+                continue
+            p = _as_pos(item.get("pos"))
+            if p is None:
+                continue
+            try:
+                self.resource_points[p] = ResourcePointState(
+                    pos=p,
+                    state=str(item.get("state", VISIBLE)),
+                    seen_tick=int(item.get("seen_tick", 0) or 0),
+                    depleted_tick=int(item.get("depleted_tick", 0) or 0),
+                    refresh_due_tick=int(item.get("refresh_due_tick", 0) or 0),
+                    chunk_ring=int(item.get("chunk_ring", 0) or 0),
+                )
+            except (TypeError, ValueError):
+                continue
+
+        # 障碍
+        self.obstacles.clear()
+        for raw in data.get("obstacles") or ():
+            p = _as_pos(raw)
+            if p is not None:
+                self.obstacles.add(p)
+
+        self.obstacle_cache.clear()
+        for item in data.get("obstacle_cache") or ():
+            if not isinstance(item, dict):
+                continue
+            p = _as_pos(item.get("pos"))
+            if p is None:
+                continue
+            try:
+                self.obstacle_cache[p] = ObstacleState(
+                    pos=p,
+                    first_seen_tick=int(item.get("first_seen_tick", 0) or 0),
+                    last_seen_tick=int(item.get("last_seen_tick", 0) or 0),
+                    block_count=int(item.get("block_count", 0) or 0),
+                )
+                self.obstacles.add(p)
+            except (TypeError, ValueError):
+                continue
+
+        # 掉落 cargo
+        self.dropped_cargo.clear()
+        for item in data.get("dropped_cargo") or ():
+            if not isinstance(item, dict):
+                continue
+            p = _as_pos(item.get("pos"))
+            if p is None:
+                continue
+            try:
+                self.dropped_cargo[p] = DroppedCargoState(
+                    pos=p,
+                    amount=int(item.get("amount", 0) or 0),
+                    drop_tick=int(item.get("drop_tick", 0) or 0),
+                    collected=bool(item.get("collected", False)),
+                )
+            except (TypeError, ValueError):
+                continue
+
+        # chunk 已探
+        self.explored_chunks.clear()
+        for raw in data.get("explored_chunks") or ():
+            c = _as_chunk(raw)
+            if c is not None:
+                self.explored_chunks.add(c)
+
+        self.explored_chunk_ticks.clear()
+        for item in data.get("explored_chunk_ticks") or ():
+            if not isinstance(item, dict):
+                continue
+            c = _as_chunk(item.get("chunk"))
+            if c is None:
+                continue
+            try:
+                self.explored_chunk_ticks[c] = int(item.get("tick", 0) or 0)
+                self.explored_chunks.add(c)
+            except (TypeError, ValueError):
+                continue
+
+        self.chunk_last_seen_ticks.clear()
+        for item in data.get("chunk_last_seen_ticks") or ():
+            if not isinstance(item, dict):
+                continue
+            c = _as_chunk(item.get("chunk"))
+            if c is None:
+                continue
+            try:
+                self.chunk_last_seen_ticks[c] = int(item.get("tick", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+
+        # 格子级已探
+        self.explored_cells.clear()
+        self.explored_cell_last_seen.clear()
+        for item in data.get("explored_cells") or ():
+            if not isinstance(item, dict):
+                continue
+            p = _as_pos(item.get("pos"))
+            if p is None:
+                continue
+            try:
+                first = int(item.get("first", item.get("tick", 0)) or 0)
+                last = int(item.get("last", first) or first)
+            except (TypeError, ValueError):
+                continue
+            self.explored_cells[p] = first
+            self.explored_cell_last_seen[p] = last
+
+        # 超限裁剪（与 mark_cell_visited 一致）
+        if len(self.explored_cells) > self.MAX_EXPLORED_CELLS:
+            drop_n = max(1, len(self.explored_cells) - self.MAX_EXPLORED_CELLS)
+            oldest = sorted(
+                self.explored_cells.items(), key=lambda kv: (kv[1], kv[0])
+            )[:drop_n]
+            for op, _ in oldest:
+                self.explored_cells.pop(op, None)
+                self.explored_cell_last_seen.pop(op, None)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MemoryMap":
+        """从 dict 构造新实例。"""
+        mem = cls()
+        mem.load_dict(data)
+        return mem
+
+    def save(self, path: Union[str, Path, None] = None) -> Path:
+        """原子写 JSON 到 path（默认 DEFAULT_MEMORY_PATH）。"""
+        target = Path(path) if path is not None else default_memory_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = self.to_dict()
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, target)
+        return target
+
+    def load(self, path: Union[str, Path, None] = None) -> bool:
+        """从 path 加载到 self；文件不存在返回 False，损坏则记日志并返回 False。"""
+        target = Path(path) if path is not None else default_memory_path()
+        if not target.is_file():
+            return False
+        try:
+            raw = target.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            _log.warning("memory load failed path=%s: %s", target, exc)
+            return False
+        if not isinstance(data, dict):
+            _log.warning("memory load invalid root type path=%s", target)
+            return False
+        self.load_dict(data)
+        return True
+
+    def maybe_autosave(self, tick: int, path: Union[str, Path, None] = None) -> bool:
+        """每 MEMORY_AUTOSAVE_EVERY_TICKS 个 tick 落盘一次；成功返回 True。"""
+        t = int(tick)
+        every = max(1, int(MEMORY_AUTOSAVE_EVERY_TICKS))
+        if t <= 0 or (t % every) != 0:
+            return False
+        try:
+            self.save(path)
+            return True
+        except OSError as exc:
+            _log.warning("memory autosave failed tick=%s: %s", t, exc)
+            return False
+
+
+# 持久化版本号（破坏性变更时递增，load 可做迁移）
+MEMORY_PERSIST_VERSION = 1
+# 默认落盘路径（相对 cwd / 仓库根；已在 .gitignore）
+DEFAULT_MEMORY_FILENAME = ".arena_hero_state.json"
+# 自动保存间隔（tick）
+MEMORY_AUTOSAVE_EVERY_TICKS = 25
+
+_log = logging.getLogger("arena_hero_tactic.memory")
+
+
+def default_memory_path() -> Path:
+    """解析默认记忆文件路径：优先仓库根（bot/ 上级），否则 cwd。"""
+    env = os.environ.get("ARENA_HERO_MEMORY_PATH", "").strip()
+    if env:
+        return Path(env)
+    here = Path(__file__).resolve().parent
+    root = here.parent
+    return root / DEFAULT_MEMORY_FILENAME
+
+
+def load_world_memory(path: Union[str, Path, None] = None) -> bool:
+    """加载到 WORLD_MEMORY 单例；返回是否成功读到文件。"""
+    ok = WORLD_MEMORY.load(path)
+    if ok:
+        n_chunk = len(WORLD_MEMORY.explored_chunks)
+        n_cell = len(WORLD_MEMORY.explored_cells)
+        n_obs = len(WORLD_MEMORY.obstacles)
+        _log.info(
+            "memory loaded chunks=%s cells=%s obstacles=%s path=%s",
+            n_chunk,
+            n_cell,
+            n_obs,
+            path if path is not None else default_memory_path(),
+        )
+    else:
+        _log.info(
+            "memory start empty (no file or load failed) path=%s",
+            path if path is not None else default_memory_path(),
+        )
+    return ok
+
+
+def save_world_memory(path: Union[str, Path, None] = None) -> Optional[Path]:
+    """保存 WORLD_MEMORY；失败返回 None。"""
+    try:
+        p = WORLD_MEMORY.save(path)
+        _log.info(
+            "memory saved chunks=%s cells=%s obstacles=%s path=%s",
+            len(WORLD_MEMORY.explored_chunks),
+            len(WORLD_MEMORY.explored_cells),
+            len(WORLD_MEMORY.obstacles),
+            p,
+        )
+        return p
+    except OSError as exc:
+        _log.warning("memory save failed: %s", exc)
+        return None
 
 
 # 线上默认单例：decide(turn, config, memory=None) 时使用
