@@ -2,9 +2,9 @@
 
 所有可调阈值集中在此，便于离线调参与单测注入。
 
-混合高效版（本仓库逻辑 × Drew-Z 资源优先，非照搬）：
-- 保留：螺旋扫掠 / MemoryMap / 防抖寻路 / VISIBLE 采集 / 软回撤外扩
-- 吸收：基础价满编 12/4/4=20、远距 Beacon 不追、早期全员采
+混合高效版（资源优先 + 均衡防守）：
+- 螺旋扫掠 / MemoryMap / 防抖寻路 / VISIBLE 采集 / 软回撤外扩
+- 基础价满编 12/4/4=20、远距 Beacon 不追、早期全员采
 - 目标：本地经济正循环优先，近距 Beacon 才派 1 名 dedicated
 """
 
@@ -22,7 +22,7 @@ class TacticConfig:
 
     Attributes:
         max_population: 硬人口上限（默认 20 = 基础价满编，不自动冲动态涨价）。
-        target_workers / target_vanguards / target_rangers: 编制目标（Drew-Z 12/4/4）。
+        target_workers / target_vanguards / target_rangers: 编制目标（默认 12/4/4）。
         defense_radius / ranger_radius / threat_radius: 防守与威胁半径。
         retreat_adjacent / retreat_radius: Worker 遇敌撤退阈值。
         core_heal_hp_threshold / core_shield_threshold / unit_heal_hp_threshold: 治疗阈值。
@@ -36,6 +36,8 @@ class TacticConfig:
         beacon_step_radius: Beacon 阶段单步目标距离。
         beacon_max_chase: Core→Beacon 曼哈顿超过此值则**全体不追**（防 d≈1000 空跑）。
         beacon_min_workers: 至少 N 名 Worker 才允许 1 人 dedicated（否则全员 local）。
+        beacon_push_population: 总人口 ≥ 此值时允许/推动向 Beacon 推进。
+        beacon_push_explore_ratio: 本地（Core 周围 spiral_max_ring）探索度 ≥ 此比例时推动向 Beacon。
         beacon_position: 运行期由 decide() 写入；economy 只读。
     """
 
@@ -89,6 +91,9 @@ class TacticConfig:
     beacon_max_chase: int = 64
     # 至少这么多 Worker 才允许 widx==0 dedicated；早期 1～2 人全采
     beacon_min_workers: int = 3
+    # 中后期推进：本地探索度 ≥ 比例 **或** 总人口 ≥ 阈值 → 向信标推进
+    beacon_push_population: int = 10
+    beacon_push_explore_ratio: float = 0.8
     # 运行期 Beacon 位置：**仅 decide() 每 tick 写入**，economy 只读。
     # GROUND / None → 写位置；CARRIED → 清 None。
     beacon_position: Optional[Position] = None

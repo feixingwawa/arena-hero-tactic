@@ -3,7 +3,6 @@
 - 版本：v0.14 规则 / API v0.1 / SDK ≥0.2.9
 - 日期：2026-08-07
 - 来源：[官方文档](https://doc.arenahero.io/zh-Hans/) · [规则速查](https://doc.arenahero.io/zh-Hans/reference/numbers) · [世界与 Tick](https://doc.arenahero.io/zh-Hans/rules/world-and-ticks)
-- 参考策略：[Drew-Z/arena-hero-agent](https://github.com/Drew-Z/arena-hero-agent)
 
 ---
 
@@ -63,9 +62,7 @@ k = max(0, floor((pop - 20) / 5) + 1)
 price = round_half_up(base × (13/10)^k)
 ```
 
-**Drew-Z 默认编制**：12W + 4V + 4R = **20**（用满基础价区间，不自动冲 21+）。
-
-本仓库当前默认：`target_workers=14, vanguards=3, rangers=2, max_pop=30`（偏激进，建议对齐 12/4/4/20，见 `STRATEGY.md`）。
+**本仓库默认编制**：12W + 4V + 4R = **20**（用满基础价区间，不自动冲 21+；见 `STRATEGY.md` / `bot/config.py`）。
 
 ### 2.3 战斗与结算顺序（摘要）
 
@@ -93,7 +90,7 @@ price = round_half_up(base × (13/10)^k)
 | 信息边界 | 坐标始终公开；`status`/`carrier_id` 仅在可见时完整 |
 | SDK 注意 | `status=None` ≡ 地面未携带，**可写 position**；仅 `CARRIED` 应清空推进目标 |
 
-**战略取舍（Drew-Z 默认 `beacon-policy=retreat`）**：
+**战略取舍（默认偏 retreat）**：
 
 - 远距离 Beacon（常 d≈数百～上千）**不值得**全员冲刺
 - Core 应**远离** Beacon 与可见威胁，优先本地采集与生存
@@ -139,7 +136,7 @@ price = round_half_up(base × (13/10)^k)
 | `pathing` | 曼哈顿步进 + 方向记忆防抖；螺旋/Beacon 目标 |
 | `main` | I/O、日志、重连；**不**写战术 |
 
-### 4.3 决策优先级（建议，对齐 Drew-Z）
+### 4.3 决策优先级（建议）
 
 ```
 1. Core 危急 → heal / repair_shield / 迁徙远离威胁与 Beacon
@@ -155,8 +152,8 @@ price = round_half_up(base × (13/10)^k)
 
 ## 5. 与本仓库实现的对照
 
-| 官方/Drew-Z 原则 | 本仓库现状 (2026-08-07) | 状态 |
-|------------------|-------------------------|------|
+| 原则 | 本仓库实现 | 状态 |
+|------|------------|------|
 | 无维护费 v0.14 | 经济已去 upkeep；`population_upkeep` 仅 deprecated | ✅ |
 | 动态单位价 | `bot/rules.py` + SDK `unit_cost` | ✅ |
 | 资源记忆 + 视线耗尽 | `MemoryMap` VISIBLE-only harvest | ✅ |
@@ -164,15 +161,15 @@ price = round_half_up(base × (13/10)^k)
 | 螺旋本地探索 | `SpiralState` local phase | ✅ |
 | 软回撤外扩 ring+1 | 已修（禁止 stall ring-1 陷阱） | ✅ |
 | Beacon status=None 可写 | `strategy` 同步已修 | ✅ |
-| 非 dedicated 不冲 Beacon | soft-recall 仅 dedicated；仍有残相 beacon 风险 | ⚠️ |
-| 编制 12/4/4=20 | 现 14/3/2 max30 | ⚠️ 建议改 |
-| Core 远离 Beacon | 默认静止，未实现 retreat 迁徙 | ❌ 待做 |
-| 分层威胁状态机 | 基础 threat + 撤退，深度弱于 Drew-Z | ⚠️ |
-| 资源优先于 Beacon 推进 | dedicated 仍可 d_beacon≈900+ 空跑 | ⚠️ 瓶颈 |
-| 阈值型 12W/4V/4R 爬坡节奏                     | choose_spawn v2                                | ✅ |
-| 负载 Worker 发现矿→调度择优自采 vs 派工        | dispatch_mine + estimate_path_steps            | ✅ |
-| 双中心螺旋（内环 Core / 外环 Beacon）         | dual_spiral_target + beacon_oriented_spiral    | ✅ |
-| 历史障碍 ≥3 次主动降权避障                     | clamp_score 降权 + obstacle_cache              | ✅ |
+| 非 dedicated 不冲 Beacon | soft-recall 仅 dedicated；探索度/人口达标可集体推进 | ✅ |
+| 编制 12/4/4=20 | `TacticConfig` 默认 12/4/4 max20 | ✅ |
+| Core 远离 Beacon | 评估日志-only，默认不真正迁徙 | ⚠️ |
+| 分层威胁状态机 | 基础 threat + 撤退 | ⚠️ |
+| 资源优先于 Beacon 推进 | `beacon_max_chase` + min_workers + push 门控 | ✅ |
+| 台阶型 12W/4V/4R 爬坡节奏 | `choose_spawn` v2 | ✅ |
+| 负载 Worker 发现矿→调度择优自采 vs 派工 | dispatch_mine + estimate_path_steps | ✅ |
+| 双中心螺旋（内环 Core / 外环 Beacon） | dual_spiral_target + beacon_oriented_spiral | ✅ |
+| 历史障碍 ≥3 次主动降权避障 | clamp_score 降权 + obstacle_cache | ✅ |
 
 线上典型病态（日志）：`pop=2 res=1~2`，一名 Worker `dedicated_beacon` 远征，另一名偶发 `phase=beacon` 或遇威胁 retreat，**本地 harvest 饥饿**。
 
@@ -183,7 +180,7 @@ price = round_half_up(base × (13/10)^k)
 | 文档 | 内容 |
 |------|------|
 | 本文 | 游戏怎么运行、怎么玩、目标、Agent 职责 |
-| `docs/STRATEGY.md` | 本仓库战术原则 + 与 Drew-Z 差异 + 改造路线 |
+| `docs/STRATEGY.md` | 本仓库战术原则与改造路线 |
 | `docs/system_design.md` | 优化完善架构与任务分解 |
 | `docs/system_design-explore.md` | Beacon 导向探索设计 |
 | `README.md` | 安装、启动、默认参数（须保持 v0.14 同步） |

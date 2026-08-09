@@ -1,7 +1,7 @@
-# 混合高效战术落地（参考 ≠ 照搬）
+# 混合高效战术落地
 
 - 日期：2026-08-08
-- 原则：保留本仓库螺旋 / MemoryMap / 防抖 / VISIBLE 采集；吸收 Drew-Z 资源优先与远距不追 Beacon
+- 原则：螺旋 / MemoryMap / 防抖 / VISIBLE 采集；资源优先；远距不追 Beacon
 
 ## 代码变更
 
@@ -12,14 +12,16 @@
 | `tests/*` | 新用例 far abort / min_workers / drop dedicated；默认断言对齐 |
 | `README.md` / `docs/STRATEGY.md` | 参数与 P0 勾选更新 |
 
-## 取长补短对照
+## 能力对照
 
-| 保留（本仓库） | 吸收（Drew-Z 思路） | 未照搬 |
-|----------------|---------------------|--------|
-| 螺旋扫掠 + 软回撤 ring+1 | 编制 12/4/4=20 基础价满编 | 完整威胁状态机 / Core 迁徙 |
-| MemoryMap VISIBLE harvest | 远距 Beacon 放弃 | Docker/systemd 部署 |
-| clamp_step_toward_memo 防抖 | 早期资源爬坡优先于战斗 | 模型监督 |
-| dedicated 单人通道 | min_workers 后才侦察 | 最小费用全局匹配（P2） |
+| 已落地 | 说明 | 未做 / 可选 |
+|--------|------|-------------|
+| 螺旋扫掠 + 软回撤 ring+1 | 本地探索不贴 Core 空转 | 完整威胁状态机 / Core 真迁徙 |
+| MemoryMap VISIBLE harvest | 只采可见资源 | Docker/systemd 部署 |
+| clamp_step_toward_memo 防抖 | 路径对抖抑制 | 模型监督 |
+| 编制 12/4/4=20 | 基础价满编 | 最小费用全局匹配（P2） |
+| 远距 Beacon 放弃 | `beacon_max_chase` | — |
+| 早期全员采 | `beacon_min_workers` 后才 dedicated | — |
 
 ## 验证
 

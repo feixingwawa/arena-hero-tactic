@@ -259,6 +259,67 @@ def test_worker_harvest_on_resource(config: TacticConfig) -> None:
     assert any("harvest" in line for line in logs)
 
 
+def test_single_mine_not_all_workers_rush(config: TacticConfig) -> None:
+    """发现 1 个矿时：仅 1 名 Worker to_resource/harvest，其余继续探索。
+
+    回归：旧逻辑在 available 为空时 `nearest(candidates)` 回退到已占用矿，
+    导致全员 to_resource 扎堆；跨 tick `_claimed_targets` 此前也未真正写入。
+    """
+    import bot.economy as eco
+
+    eco._claimed_targets.clear()
+    eco._pending_return_mines.clear()
+    eco._spiral_state.clear()
+    eco._last_move_dir.clear()
+    eco._loop_trackers.clear()
+    eco._worker_intents.clear()
+
+    mine = (20, 10)
+    # 4 名空载工人，同一侧朝矿，仅 1 矿可见
+    workers = [
+        StubUnit(position=(11, 10), cargo=0, unit_type="WORKER"),
+        StubUnit(position=(12, 10), cargo=0, unit_type="WORKER"),
+        StubUnit(position=(13, 10), cargo=0, unit_type="WORKER"),
+        StubUnit(position=(14, 10), cargo=0, unit_type="WORKER"),
+    ]
+    turn = StubTurn(
+        tick=10,
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=workers,
+        resource_cells={mine},
+        visible_enemies=[],
+    )
+    plan = assign_roles(turn, config=config)
+    logs = command_workers(turn, plan, config=config)
+
+    to_res = [line for line in logs if ":to_resource:" in line or line.endswith(":harvest")]
+    explore = [line for line in logs if ":explore:" in line or "explore" in line]
+    # 至多 1 人去该矿
+    assert len(to_res) == 1, f"expected exactly 1 to_resource/harvest, got {to_res}; all={logs}"
+    # 其余应探索（至少 2 人，避免偶发 wait）
+    assert len(explore) >= 2, f"expected others explore, logs={logs}"
+    # 跨 tick claim 已写入该矿
+    assert mine in eco._claimed_targets, eco._claimed_targets
+
+    # 下一 tick 仍只有 claim 主人可续约，其他人继续探索
+    turn2 = StubTurn(
+        tick=11,
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[
+            StubUnit(id=w.id, position=w.position, cargo=0, unit_type="WORKER")
+            for w in workers
+        ],
+        resource_cells={mine},
+        visible_enemies=[],
+    )
+    plan2 = assign_roles(turn2, config=config)
+    logs2 = command_workers(turn2, plan2, config=config)
+    to_res2 = [line for line in logs2 if ":to_resource:" in line or line.endswith(":harvest")]
+    assert len(to_res2) == 1, f"tick2 expected 1 miner, got {to_res2}; all={logs2}"
+
+
 def test_worker_deposit_when_cargo_at_core(config: TacticConfig) -> None:
     worker = StubUnit(position=(10, 10), cargo=1, unit_type="WORKER")
     turn = StubTurn(
@@ -1643,6 +1704,185 @@ def test_beacon_far_drops_existing_dedicated(config: TacticConfig) -> None:
     assert any("beacon_abort" in line for line in logs), logs
 
 
+def test_beacon_push_by_population(config: TacticConfig) -> None:
+    """总人口 ≥ beacon_push_population → 允许 chase；非 dedicated 集体 beacon_push。
+
+    用 beacon_min_workers 抬高，确保不是「人数够 dedicated」旧路径，
+    而是靠人口阈值打开推进。
+    """
+    from bot.config import set_beacon_position
+    from bot.economy import _spiral_state
+    from tests.stubs import StubBeacon
+
+    cfg = _beacon_cfg(
+        beacon_min_workers=99,
+        beacon_max_chase=200,
+        beacon_push_population=10,
+        beacon_push_explore_ratio=0.99,
+        spiral_max_ring=8,
+    )
+    set_beacon_position(cfg, (40, 10))  # d=30 < max_chase
+    _spiral_state.clear()
+    wa = StubUnit(position=(12, 10), cargo=0, unit_type="WORKER")
+    wb = StubUnit(position=(13, 10), cargo=0, unit_type="WORKER")
+    vanguards = [
+        StubUnit(position=(10, 10), cargo=0, unit_type="VANGUARD") for _ in range(4)
+    ]
+    rangers = [
+        StubUnit(position=(10, 11), cargo=0, unit_type="RANGER") for _ in range(4)
+    ]
+    # pop = 2W + 4V + 4R = 10
+    turn = StubTurn(
+        tick=1,
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[wa, wb],
+        vanguards=vanguards,
+        rangers=rangers,
+        resource_cells=set(),
+        visible_enemies=[],
+        beacon=StubBeacon(position=(40, 10), status="GROUND", carrier_id=None),
+    )
+    plan = assign_roles(turn, config=cfg)
+    logs = command_workers(turn, plan, config=cfg)
+    st0 = _spiral_state[str(wa.id)]
+    st1 = _spiral_state[str(wb.id)]
+    assert st0.dedicated is True
+    assert st0.phase == "beacon"
+    assert st1.dedicated is False
+    assert st1.phase == "beacon", f"expected collective push, phase={st1.phase}, logs={logs}"
+    assert any(
+        f"worker:{wb.id}:beacon_push:pop=10" in line for line in logs
+    ), logs
+    assert any(
+        f"worker:{wb.id}:" in line and ":phase=beacon" in line for line in logs
+    ), logs
+
+
+def test_beacon_push_by_local_explore(config: TacticConfig) -> None:
+    """本地探索度 ≥ beacon_push_explore_ratio → 向信标推进（人口不足也可）。"""
+    from bot.config import set_beacon_position
+    from bot.economy import _local_explore_ratio, _spiral_state
+    from bot.memory import MemoryMap
+    from tests.stubs import StubBeacon
+
+    ring = 4
+    cfg = _beacon_cfg(
+        beacon_min_workers=99,
+        beacon_max_chase=200,
+        beacon_push_population=50,  # 人口路径关闭
+        beacon_push_explore_ratio=0.8,
+        spiral_max_ring=ring,
+    )
+    set_beacon_position(cfg, (30, 10))
+    _spiral_state.clear()
+    mem = MemoryMap()
+    core = (10, 10)
+    # 填满 Core 曼哈顿 ring 内几乎全部格 → 探索度 ≥ 0.8
+    cx, cy = core
+    for dx in range(-ring, ring + 1):
+        max_dy = ring - abs(dx)
+        for dy in range(-max_dy, max_dy + 1):
+            mem.explored_cells[(cx + dx, cy + dy)] = 1
+    ratio = _local_explore_ratio(mem, core, ring)
+    assert ratio >= 0.8, ratio
+
+    wa = StubUnit(position=(12, 10), cargo=0, unit_type="WORKER")
+    wb = StubUnit(position=(13, 11), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        tick=1,
+        resources=5,
+        core=StubCore(position=core),
+        workers=[wa, wb],
+        resource_cells=set(),
+        visible_enemies=[],
+        beacon=StubBeacon(position=(30, 10), status="GROUND", carrier_id=None),
+    )
+    plan = assign_roles(turn, config=cfg)
+    logs = command_workers(turn, plan, config=cfg, memory=mem)
+    st0 = _spiral_state[str(wa.id)]
+    st1 = _spiral_state[str(wb.id)]
+    assert st0.phase == "beacon"
+    assert st1.phase == "beacon", f"explore push failed phase={st1.phase} logs={logs}"
+    assert any("beacon_push" in line and "explore=" in line for line in logs), logs
+
+
+def test_beacon_push_not_ready_stays_local(config: TacticConfig) -> None:
+    """人口与探索度均未达标且 Worker 不足 min_workers → 保持 local。"""
+    from bot.config import set_beacon_position
+    from bot.economy import _spiral_state
+    from bot.memory import MemoryMap
+    from tests.stubs import StubBeacon
+
+    cfg = _beacon_cfg(
+        beacon_min_workers=3,
+        beacon_max_chase=200,
+        beacon_push_population=10,
+        beacon_push_explore_ratio=0.8,
+        spiral_max_ring=8,
+    )
+    set_beacon_position(cfg, (40, 10))
+    _spiral_state.clear()
+    mem = MemoryMap()  # 探索度 ≈ 0
+    wa = StubUnit(position=(12, 10), cargo=0, unit_type="WORKER")
+    wb = StubUnit(position=(13, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        tick=1,
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[wa, wb],  # pop=2 < 10，workers < min 3
+        resource_cells=set(),
+        visible_enemies=[],
+        beacon=StubBeacon(position=(40, 10), status="GROUND", carrier_id=None),
+    )
+    plan = assign_roles(turn, config=cfg)
+    logs = command_workers(turn, plan, config=cfg, memory=mem)
+    assert not any("beacon_push" in line for line in logs), logs
+    assert not any(":dedicated_beacon" in line for line in logs), logs
+    assert _spiral_state[str(wa.id)].phase == "local"
+    assert _spiral_state[str(wb.id)].phase == "local"
+
+
+def test_beacon_push_still_respects_max_chase(config: TacticConfig) -> None:
+    """人口再高，Core→Beacon 超 max_chase 仍不追。"""
+    from bot.config import set_beacon_position
+    from bot.economy import _spiral_state
+    from tests.stubs import StubBeacon
+
+    cfg = _beacon_cfg(
+        beacon_min_workers=1,
+        beacon_max_chase=64,
+        beacon_push_population=10,
+    )
+    set_beacon_position(cfg, (1000, 10))
+    _spiral_state.clear()
+    workers = [
+        StubUnit(position=(10, 10), cargo=0, unit_type="WORKER") for _ in range(6)
+    ]
+    vanguards = [
+        StubUnit(position=(10, 10), cargo=0, unit_type="VANGUARD") for _ in range(4)
+    ]
+    turn = StubTurn(
+        tick=1,
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=workers,
+        vanguards=vanguards,
+        resource_cells=set(),
+        visible_enemies=[],
+        beacon=StubBeacon(position=(1000, 10), status="GROUND", carrier_id=None),
+    )
+    plan = assign_roles(turn, config=cfg)
+    logs = command_workers(turn, plan, config=cfg)
+    assert not any("beacon_push" in line for line in logs), logs
+    assert not any(":phase=beacon" in line for line in logs), logs
+    for w in workers:
+        st = _spiral_state.get(str(w.id))
+        if st is not None:
+            assert st.phase == "local"
+            assert st.dedicated is False
+
+
 def test_TR1_5_A_set_pending_return() -> None:
     """TR-1.5 test_A: 向 _pending_return_mines 塞 1 个 key（test_B 验证被清理）。"""
     from bot.economy import _pending_return_mines
@@ -2245,7 +2485,7 @@ def test_TR_6_1_self_option_when_wi_blocked() -> None:
     Wi=(13,12) cargo=0 到 P=(18,10) 被 (15,12)(16,12)(17,12) 三堵横向墙挡住需绕。
     预期：_pending_return_mines 含 Wd，日志含 dispatch:option=self。
     """
-    from bot.economy import _pending_return_mines, _worker_key
+    from bot.economy import _claimed_targets, _pending_return_mines, _worker_key
 
     core = (10, 10)
     wd_pos = (15, 10)
@@ -2269,6 +2509,7 @@ def test_TR_6_1_self_option_when_wi_blocked() -> None:
     mem = MemoryMap()
 
     _pending_return_mines.clear()
+    _claimed_targets.clear()
     logs = command_workers(
         turn, role_plan, config=config, core_position=core, memory=mem
     )
@@ -2292,7 +2533,7 @@ def test_TR_6_2_pending_return_priority_next_tick() -> None:
       1) logs 含 worker:Wd_key:to_pending_return_mine:pos=P
       2) Wd 的 action = move 朝 P 方向（或若同格则 harvest）
     """
-    from bot.economy import _pending_return_mines, _worker_key
+    from bot.economy import _claimed_targets, _pending_return_mines, _worker_key
 
     core = (10, 10)
     wd_pos = (12, 10)
@@ -2315,6 +2556,7 @@ def test_TR_6_2_pending_return_priority_next_tick() -> None:
 
     wd_key = _worker_key("wd_dispatch")
     _pending_return_mines.clear()
+    _claimed_targets.clear()
     _pending_return_mines[wd_key] = (P, 5)
 
     logs = command_workers(
@@ -2364,8 +2606,9 @@ def test_TR_6_3_other_option_when_wd_blocked() -> None:
     role_plan = assign_roles(turn, config=config, core_position=core)
     mem = MemoryMap()
 
-    from bot.economy import _pending_return_mines
+    from bot.economy import _claimed_targets, _pending_return_mines
     _pending_return_mines.clear()
+    _claimed_targets.clear()
     logs = command_workers(
         turn, role_plan, config=config, core_position=core, memory=mem
     )

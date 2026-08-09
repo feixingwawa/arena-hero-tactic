@@ -1,8 +1,8 @@
 # Arena Hero Tactic — 项目总结报告
 
-> 交付日期：2026-08-08  
-> 规则版本：Arena Hero v0.14 / API v0.1 / SDK `arena-hero` ≥0.2.9  
-> 战术定位：资源优先 + 均衡防守（对齐 Drew-Z 思路，本仓库自研实现）
+> 交付日期：2026-08-08
+> 规则版本：Arena Hero v0.14 / API v0.1 / SDK `arena-hero` ≥0.2.9
+> 战术定位：资源优先 + 均衡防守（本仓库自研实现）
 
 ---
 

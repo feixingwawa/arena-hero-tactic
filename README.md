@@ -11,8 +11,8 @@
 共享永久网格世界；Agent 每 Tick 看私有视野、交一份 15 秒窗口内的计划。  
 **没有官方通关**——有效目标是 Core 存活、资源正循环、编制扩张；Champion Beacon 是可选双倍采集乘数。
 
-详细理解见：[`docs/GAME_UNDERSTANDING.md`](docs/GAME_UNDERSTANDING.md)  
-战术原则（对齐 [Drew-Z](https://github.com/Drew-Z/arena-hero-agent)）见：[`docs/STRATEGY.md`](docs/STRATEGY.md)
+详细理解见：[`docs/GAME_UNDERSTANDING.md`](docs/GAME_UNDERSTANDING.md)
+战术原则见：[`docs/STRATEGY.md`](docs/STRATEGY.md)
 
 ### v2 升级速览
 
@@ -48,7 +48,7 @@ arena-hero-tactic/
   deploy.bat / deploy.sh # 一键部署入口（Windows 双击 / Unix）
   docs/
     GAME_UNDERSTANDING.md   # 游戏怎么运行 / 目标 / Agent 职责
-    STRATEGY.md             # 战术原则与 Drew-Z 对照
+    STRATEGY.md             # 战术原则与改造路线
     system_design*.md       # 架构与探索设计
   bot/
     main.py              # 入口：Key → 连接 → turns 循环（可选 --dashboard）
@@ -201,7 +201,7 @@ python -m bot.main --dashboard --dashboard-host 127.0.0.1 --dashboard-port 8765
 - HP/盾过低 → `heal` / `repair_shield`（战斗后结算，可预排）
 - 否则按**台阶型生产节奏（v2）** `spawn`：W=3→V；W=6→V+R；W=9→V+R；W=12→V+R+R；达到 12/4/4 停扩
 - **Core 迁徙评估（v2 P1-1 日志-only）**：邻格敌且 Core HP≤3 / Beacon 距 Core≤4 时，写入评估日志但**不真正 start_move**（避免移动 bug）
-- 默认不主动追 Beacon；未来可对齐 Drew-Z「远离信标迁徙」
+- 默认不主动追 Beacon；后续可实现「Core 远离信标」迁徙
 
 ### 地图记忆与官方视野
 
@@ -224,6 +224,8 @@ python -m bot.main --dashboard --dashboard-host 127.0.0.1 --dashboard-port 8765
 | `sector_count` | **4** | Worker 扇区分散 |
 | `beacon_max_chase` | **64** | 超距不追 Beacon |
 | `beacon_min_workers` | **3** | 早期全员采，够人再 1 人侦察 |
+| `beacon_push_population` | **10** | 总人口 ≥ 此值 → 向信标推进 |
+| `beacon_push_explore_ratio` | **0.8** | 本地（spiral_max_ring）探索度 ≥ 此比例 → 向信标推进 |
 | `recall_stall_ticks` | 6 | 无进展软回撤 |
 | `retreat_adjacent` | 1 | 空货贴身才撤 |
 | `retreat_radius` | 3 | 满货保护半径 |

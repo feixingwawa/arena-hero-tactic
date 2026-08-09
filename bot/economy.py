@@ -158,6 +158,94 @@ _claimed_targets: dict[Position, tuple[int, str]] = {}
 _CLAIM_TTL_TICKS: int = 8
 
 
+def _purge_expired_resource_claims(tick: int) -> None:
+    """清理过期的跨 tick 资源 claim。
+
+    含 tick 回退（单测 tick 不单调）时 claim_tick > tick 的脏数据。
+    """
+    expired = [
+        pos
+        for pos, (claim_tick, _) in _claimed_targets.items()
+        if claim_tick > tick or tick - claim_tick > _CLAIM_TTL_TICKS
+    ]
+    for pos in expired:
+        _claimed_targets.pop(pos, None)
+
+
+def _claim_resource_target(
+    pos: Position,
+    wkey: str,
+    tick: int,
+    claimed: set[Position],
+) -> None:
+    """本 tick + 跨 tick 占用同一资源点（一矿一人，防全员扎堆）。"""
+    claimed.add(pos)
+    _claimed_targets[pos] = (tick, wkey)
+
+
+def _resource_claimed_by_other(
+    pos: Position,
+    wkey: str,
+    tick: int,
+    claimed: set[Position],
+) -> bool:
+    """资源点是否已被其他 Worker 占用（本 tick claimed 或未过期跨 tick claim）。"""
+    entry = _claimed_targets.get(pos)
+    if entry is not None:
+        claim_tick, owner = entry
+        if claim_tick > tick or tick - claim_tick > _CLAIM_TTL_TICKS:
+            _claimed_targets.pop(pos, None)
+        elif owner != wkey:
+            return True
+    # 本 tick 已被更早处理的 Worker 写入 claimed，且不是自己跨 tick 续约的目标
+    if pos in claimed:
+        if entry is not None and entry[1] == wkey and tick - entry[0] <= _CLAIM_TTL_TICKS:
+            return False
+        # 无主记录但已在本 tick claimed → 他人占用
+        if entry is None or entry[1] != wkey:
+            return True
+    return False
+
+
+def _pick_resource_target(
+    pos: Position,
+    wkey: str,
+    tick: int,
+    candidates: list[Position],
+    claimed: set[Position],
+) -> Optional[Position]:
+    """为 Worker 选矿：优先续约自己的 claim；否则最近未占用矿。
+
+    **绝不**在无空闲矿时回退到已占用矿（旧逻辑 `nearest(candidates)` 会导致
+    发现 1 个矿后全员 `to_resource` 扎堆）。
+    """
+    # 1) 续约：自己未过期 claim 且仍在候选中
+    own_pos: Optional[Position] = None
+    own_dist = 10**9
+    for c in candidates:
+        entry = _claimed_targets.get(c)
+        if entry is None:
+            continue
+        claim_tick, owner = entry
+        if owner != wkey or claim_tick > tick or tick - claim_tick > _CLAIM_TTL_TICKS:
+            continue
+        d = manhattan(pos, c)
+        if d < own_dist:
+            own_dist = d
+            own_pos = c
+    if own_pos is not None and not _resource_claimed_by_other(own_pos, wkey, tick, claimed):
+        return own_pos
+
+    # 2) 最近空闲矿
+    available = [
+        c for c in candidates
+        if not _resource_claimed_by_other(c, wkey, tick, claimed)
+    ]
+    if not available:
+        return None
+    return nearest(pos, available)
+
+
 def _get_loop_tracker(wkey: str) -> LoopTracker:
     st = _loop_trackers.get(wkey)
     if st is None:
@@ -511,12 +599,25 @@ def command_workers(
     obstacles = _obstacle_cells(turn)
     # Core 格通常不可作为障碍，但移动时不要踩未知；此处仅避 obstacle_cells
     workers = list(getattr(turn, "workers", None) or ())
+    # 总人口（W+V+R）：本地探索度/人口阈值向信标推进用
+    population = total_population(turn)
     # 探索避敌：使用角色计划中的威胁位置（可见敌人）
     enemy_positions: list[Position] = list(role_plan.threat_positions or [])
     tick = int(getattr(turn, "tick", 0) or 0)
 
-    # 资源目标去重：多个 worker 尽量分配不同资源点
+    # 资源目标去重：多个 worker 尽量分配不同资源点（本 tick）
+    # 并与跨 tick `_claimed_targets` 合并，避免「一矿全员 to_resource」。
     claimed: set[Position] = set()
+    _purge_expired_resource_claims(tick)
+    alive_keys = {_worker_key(w.id) for w in workers}
+    for cpos, (ctick, owner) in list(_claimed_targets.items()):
+        if owner not in alive_keys:
+            _claimed_targets.pop(cpos, None)
+            continue
+        if ctick > tick or tick - ctick > _CLAIM_TTL_TICKS:
+            _claimed_targets.pop(cpos, None)
+            continue
+        claimed.add(cpos)
 
     # Beacon 提取（P2-1）：持有者优先采集；GROUND 同格可拾取。
     # SDK 0.2.9：beacon.status 为 BeaconStatus(StrEnum) | None：
@@ -660,7 +761,7 @@ def command_workers(
             if mh_other_min * AMBIGUOUS_RATIO < mh_self:
                 # other 明显更优 → 直接指派曼哈顿最优 idle Worker
                 akey = _worker_key(mh_argmin_wx.id)
-                claimed.add(P)
+                _claim_resource_target(P, akey, tick, claimed)
                 pre_assigned_targets[akey] = P
                 logs.append(
                     f"worker:{wd_wkey}:dispatch:option=other:to={akey}"
@@ -706,7 +807,7 @@ def command_workers(
             else:
                 # other 更优：立即指派空闲 Worker 去 P
                 akey = _worker_key(argmin_wx.id)
-                claimed.add(P)
+                _claim_resource_target(P, akey, tick, claimed)
                 pre_assigned_targets[akey] = P
                 logs.append(
                     f"worker:{wd_wkey}:dispatch:option=other:to={akey}"
@@ -806,6 +907,7 @@ def command_workers(
                                 config=config,
                                 memory=memory,
                                 tick=tick,
+                                population=population,
                             )
                         )
             else:
@@ -863,8 +965,9 @@ def command_workers(
             logs.append(f"worker:{uid}:pickup_beacon")
             continue
 
-        # 站在资源格 → harvest（记忆标记已消耗）
+        # 站在资源格 → harvest（记忆标记已消耗；占用该矿防他人同 tick 再抢）
         if pos in set(resources_cells):
+            _claim_resource_target(pos, wkey, tick, claimed)
             if hasattr(w, "harvest"):
                 w.harvest()
                 logs.append(f"worker:{uid}:harvest")
@@ -880,7 +983,7 @@ def command_workers(
         # ===== Task 6: 阶段 B — 预约优先（_pending_return_mines 优先执行）=====
         if wkey in _pending_return_mines and cargo == 0:
             P, _ = _pending_return_mines[wkey]
-            claimed.add(P)
+            _claim_resource_target(P, wkey, tick, claimed)
             _set_intent(wkey, target=P, phase="to_resource", role=str(role))
             logs.append(f"worker:{wkey}:to_pending_return_mine:pos={P}")
             if pos == P:
@@ -908,6 +1011,7 @@ def command_workers(
         # 预指派目标（阶段 C other 选项的立即执行）优先级高于普通 candidates
         if wkey in pre_assigned_targets:
             P = pre_assigned_targets[wkey]
+            _claim_resource_target(P, wkey, tick, claimed)
             _set_intent(wkey, target=P, phase="to_resource", role=str(role))
             if pos == P:
                 if pos in set(resources_cells) and hasattr(w, "harvest"):
@@ -959,11 +1063,10 @@ def command_workers(
                 if c not in candidates:
                     candidates.append(c)
 
-        # 走向最近未声称候选资源
-        available = [c for c in candidates if c not in claimed]
-        target = nearest(pos, available) if available else nearest(pos, candidates)
+        # 走向最近未声称候选资源（无空闲矿时绝不回退到已占用矿 → 其余人继续探索）
+        target = _pick_resource_target(pos, wkey, tick, candidates, claimed)
         if target is not None:
-            claimed.add(target)
+            _claim_resource_target(target, wkey, tick, claimed)
             _set_intent(wkey, target=target, phase="to_resource", role=str(role))
             if pos == target:
                 if pos in set(resources_cells) and hasattr(w, "harvest"):
@@ -990,7 +1093,9 @@ def command_workers(
                 elif hasattr(w, "wait"):
                     w.wait()
                     logs.append(f"worker:{uid}:wait")
-        elif memory is not None and cargo == 0:
+            continue
+
+        if memory is not None and cargo == 0:
             # cargo 回收（P2-2）：空载 worker 优先前往未回收掉落 cargo
             cargo_target: Optional[Position] = None
             for cpos, cst in memory.dropped_cargo.items():
@@ -1038,6 +1143,7 @@ def command_workers(
                     config=config,
                     memory=memory,
                     tick=tick,
+                    population=population,
                 )
             )
             _st = _spiral_state.get(wkey)
@@ -1052,7 +1158,7 @@ def command_workers(
                     dedicated=_st.dedicated,
                 )
         else:
-            # 无可见资源：螺旋扫掠 + 目标点导航 + 软回撤（替代旧 recall 硬边界）
+            # 无可见/可用资源：螺旋扫掠 + 目标点导航 + 软回撤
             logs.extend(
                 _explore_spiral_step(
                     w=w,
@@ -1066,8 +1172,9 @@ def command_workers(
                     config=config,
                     memory=memory,
                     tick=tick,
-                 )
-             )
+                    population=population,
+                )
+            )
             _st = _spiral_state.get(wkey)
             if _st is not None:
                 _set_intent(
@@ -1094,29 +1201,89 @@ def command_workers(
             for k in list(d.keys()):
                 if k not in alive:
                     d.pop(k, None)
+        # 清理已死 Worker 的跨 tick 资源 claim
+        for cpos, (ctick, owner) in list(_claimed_targets.items()):
+            if owner not in alive:
+                _claimed_targets.pop(cpos, None)
 
     return logs
+
+
+def _local_explore_ratio(
+    memory: Optional[MemoryMap],
+    core_position: Position,
+    radius: int,
+) -> float:
+    """Core 周围曼哈顿半径内的本地探索度 ∈ [0, 1]。
+
+    分母：半径内全部格。分子：explored_cells 中的格 + 已知障碍格（障碍视为已完成）。
+    `memory is None` → 0.0。
+    """
+    if memory is None:
+        return 0.0
+    r = max(0, int(radius))
+    cx, cy = _as_position(core_position)
+    obstacles = getattr(memory, "obstacles", set()) or set()
+    explored_cells = getattr(memory, "explored_cells", {}) or {}
+    total = 0
+    done = 0
+    for dx in range(-r, r + 1):
+        max_dy = r - abs(dx)
+        for dy in range(-max_dy, max_dy + 1):
+            total += 1
+            p = (cx + dx, cy + dy)
+            if p in obstacles or p in explored_cells:
+                done += 1
+                continue
+            if hasattr(memory, "is_explored") and memory.is_explored(p):
+                done += 1
+    if total <= 0:
+        return 0.0
+    return done / float(total)
+
+
+def _beacon_push_ready(
+    config: TacticConfig,
+    core_position: Position,
+    memory: Optional[MemoryMap],
+    population: int,
+) -> bool:
+    """本地探索度 ≥ 阈值 **或** 人口 ≥ 阈值 → 应向信标推进。"""
+    pop_th = int(getattr(config, "beacon_push_population", 10) or 10)
+    if int(population) >= pop_th:
+        return True
+    ratio_th = float(getattr(config, "beacon_push_explore_ratio", 0.8) or 0.8)
+    radius = max(1, int(getattr(config, "spiral_max_ring", 24) or 24))
+    return _local_explore_ratio(memory, core_position, radius) >= ratio_th
 
 
 def _beacon_chase_allowed(
     config: TacticConfig,
     core_position: Position,
     worker_count: int,
+    *,
+    memory: Optional[MemoryMap] = None,
+    population: int = 0,
 ) -> bool:
-    """是否允许派 dedicated 追 Beacon（混合高效：近距 + 够人）。
+    """是否允许追 Beacon / 向信标推进。
 
     - Beacon 缺失 → False
-    - worker_count < beacon_min_workers → False（早期全员 local 采）
-    - Core→Beacon 曼哈顿 > beacon_max_chase → False（防 d≈900+ 空跑饿死经济）
+    - Core→Beacon 曼哈顿 > beacon_max_chase → False（防 d≈900+ 空跑）
+    - 允许条件（满足其一即可）：
+      1) 总人口 ≥ beacon_push_population（默认 10）
+      2) 本地探索度 ≥ beacon_push_explore_ratio（默认 0.8）
+      3) worker_count ≥ beacon_min_workers（早期 dedicated 兼容）
     """
     beacon = config.beacon_position
     if beacon is None:
         return False
-    min_w = max(1, int(getattr(config, "beacon_min_workers", 3) or 3))
-    if worker_count < min_w:
-        return False
     max_chase = max(1, int(getattr(config, "beacon_max_chase", 64) or 64))
-    return manhattan(core_position, beacon) <= max_chase
+    if manhattan(core_position, beacon) > max_chase:
+        return False
+    if _beacon_push_ready(config, core_position, memory, population):
+        return True
+    min_w = max(1, int(getattr(config, "beacon_min_workers", 3) or 3))
+    return worker_count >= min_w
 
 
 def _drop_to_local(st: SpiralState, reason_log: Optional[list[str]] = None,
@@ -1436,6 +1603,7 @@ def _explore_spiral_step(
     config: TacticConfig,
     memory: Optional[MemoryMap] = None,
     tick: int = 0,
+    population: int = 0,
 ) -> list[str]:
     """无可见资源时的螺旋扫掠一步（两阶段状态机 + 目标点导航 + 软回撤）。
 
@@ -1476,7 +1644,19 @@ def _explore_spiral_step(
 
     dist_core = manhattan(pos, core_position)
     n_workers = len(workers)
-    chase_ok = _beacon_chase_allowed(config, core_position, n_workers)
+    pop_now = int(population) if population else n_workers
+    chase_ok = _beacon_chase_allowed(
+        config,
+        core_position,
+        n_workers,
+        memory=memory,
+        population=pop_now,
+    )
+    push_ready = bool(
+        chase_ok
+        and config.beacon_position is not None
+        and _beacon_push_ready(config, core_position, memory, pop_now)
+    )
 
     # 到达标记：记录已探 chunk（新 chunk → new_chunk 日志）
     if memory is not None and memory.mark_explored(pos, tick):
@@ -1495,13 +1675,16 @@ def _explore_spiral_step(
             st.target = None
             st.stalled_ticks = 0
 
-    # ---- Beacon 策略（混合高效，非照搬）----
-    # 1) 远距 / 人少：禁止 dedicated，已 dedicated 也降级 local
-    # 2) 近距 + 够人 + widx==0：才专职 beacon
-    # 3) 非 dedicated 残留 phase=beacon 每 tick 强制清回 local
+    # ---- Beacon 策略（混合高效 + 探索度/人口推进）----
+    # 1) 远距 / 未满足 chase：禁止 dedicated，已 dedicated 也降级 local
+    # 2) chase_ok + widx==0：专职 dedicated beacon
+    # 3) 本地探索度≥阈值 或 人口≥阈值：空闲探索 Worker 集体 phase=beacon
+    # 4) 非 dedicated 残留 beacon：仅 chase 不允许时强制回 local；push_ready 保留
     if st.dedicated and not chase_ok:
         tag = "beacon_abort:far" if config.beacon_position is not None else "beacon_abort:gone"
-        if n_workers < max(1, int(getattr(config, "beacon_min_workers", 3) or 3)):
+        min_w = max(1, int(getattr(config, "beacon_min_workers", 3) or 3))
+        if (not _beacon_push_ready(config, core_position, memory, pop_now)
+                and n_workers < min_w):
             tag = "beacon_abort:min_workers"
         _drop_to_local(st, logs, uid, tag)
     elif chase_ok and widx == 0 and not st.dedicated:
@@ -1510,9 +1693,18 @@ def _explore_spiral_step(
         logs.append(f"worker:{uid}:dedicated_beacon")
     elif st.dedicated and chase_ok and config.beacon_position is not None:
         st.phase = "beacon"
-    # 非 dedicated 残留 beacon 相位清理（每 tick 强制）
+    elif push_ready and not st.dedicated and st.phase != "beacon":
+        # 中后期：探索度/人口达标 → 非 dedicated 也向信标推进
+        st.phase = "beacon"
+        st.target = None
+        st.stalled_ticks = 0
+        _r = max(1, int(getattr(config, "spiral_max_ring", 24) or 24))
+        _ratio = _local_explore_ratio(memory, core_position, _r)
+        logs.append(
+            f"worker:{uid}:beacon_push:pop={pop_now}:explore={_ratio:.2f}"
+        )
+    # 非 dedicated 残留 beacon：chase 不允许时回 local；push_ready 时保持推进
     if not st.dedicated and st.phase == "beacon":
-        chase_ok = _beacon_chase_allowed(config, core_position, n_workers)
         if not chase_ok:
             _drop_to_local(st, logs, uid, "beacon_force_local:chase_not_ok")
 
@@ -1540,9 +1732,10 @@ def _explore_spiral_step(
     if st.phase == "beacon":
         beacon = config.beacon_position
         step_radius = max(1, int(getattr(config, "beacon_step_radius", 8) or 8))
-        # 非 dedicated 到达 Beacon 近旁 → 回 local（决策 1）
+        # 非 dedicated 到达 Beacon 近旁：默认回 local；push_ready 时继续推进
         if (
             not st.dedicated
+            and not push_ready
             and beacon is not None
             and manhattan(pos, beacon) <= step_radius
         ):
@@ -1636,7 +1829,9 @@ def _explore_spiral_step(
         st.stalled_ticks = 0
         soft_recall = True
         # 仅「允许 chase 的 dedicated」可 soft-recall 切 beacon；否则 ring+1 外扩
-        if st.dedicated and _beacon_chase_allowed(config, core_position, n_workers):
+        if st.dedicated and _beacon_chase_allowed(
+            config, core_position, n_workers, memory=memory, population=pop_now
+        ):
             st.phase = "beacon"
             logs.extend(
                 _beacon_explore_step(

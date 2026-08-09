@@ -1,7 +1,6 @@
-# 本仓库战术原则（对齐 Drew-Z + 官方 v0.14）
+# 本仓库战术原则（官方 v0.14）
 
 - 日期：2026-08-07
-- 参考：[Drew-Z strategy](https://github.com/Drew-Z/arena-hero-agent/blob/main/docs/strategy.md)
 - 游戏理解：`docs/GAME_UNDERSTANDING.md`
 
 ---
@@ -18,17 +17,16 @@
 
 ---
 
-## 2. 与 Drew-Z 对照
+## 2. 实现要点
 
-| 主题 | Drew-Z | 本仓库 | 改造优先级 |
-|------|--------|--------|------------|
-| 编制 | 12/4/4=20 | 14/3/2 max30 | **P0** 改 config 默认 |
-| Core vs Beacon | 迁徙远离 Beacon | 默认静止 | **P1** 可选 `start_move` 远离 |
-| 探索 | 陈旧 chunk 侦察 + 最小费用匹配 | 螺旋 + MemoryMap + 可选 beacon phase | 保留螺旋；**限制 beacon** |
-| 威胁 | 分层：警戒/预撤/交战/多轴突围 | threat_radius + retreat | P2 增强 |
-| 经济 stall | 专项诊断与释放路由 | 软回撤 stall | 已有；加强 local 优先 |
-| 版本兼容 | 监控 hold | 无 | P3 |
-| 部署 | Docker/systemd | 本地 `python -m bot.main` | 按需 |
+| 主题 | 本仓库策略 |
+|------|------------|
+| 编制 | 默认 **12/4/4**，`max_population=20`（基础价满编） |
+| Core vs Beacon | 默认可静止；可选评估 `start_move` 远离威胁/信标 |
+| 探索 | 螺旋 + MemoryMap；Beacon phase 受远距/人口/探索度门控 |
+| 威胁 | `threat_radius` + Worker 撤退；可继续增强分层状态机 |
+| 经济 stall | 软回撤 stall + 结构化诊断日志 |
+| 部署 | 本地 `python -m bot.main` / 一键 `deploy` |
 
 ---
 
@@ -36,7 +34,7 @@
 
 1. **Local harvest > Beacon march**  
    - `widx==0` 才可 `dedicated` beacon。  
-   - 非 dedicated 禁止 soft-recall 切入 beacon；残相 `phase=beacon` 强制回 local。  
+   - 非 dedicated 禁止 soft-recall 切入 beacon；残相 `phase=beacon` 强制回 local（探索度/人口达标的集体推进除外）。  
    - `d_beacon` 过大（建议 > 64 或 > `spiral_max_ring*2`）时 dedicated 也应降级 local。
 
 2. **只采 VISIBLE 资源**  
@@ -63,14 +61,16 @@
 ## 4. 建议默认参数（目标态）
 
 ```python
-# bot/config.py — 目标默认（对齐 Drew-Z 基础价满编）
+# bot/config.py — 目标默认（基础价满编）
 max_population: int = 20
 target_workers: int = 12
 target_vanguards: int = 4
-target_rangers: int = 2   # 或 4；本仓库可先 2→4 分阶段
-# Beacon（已落地）
+target_rangers: int = 4
+# Beacon
 beacon_max_chase: int = 64          # Core→Beacon 超距放弃
 beacon_min_workers: int = 3         # 早期全员采
+beacon_push_population: int = 10    # 人口达标向信标推进
+beacon_push_explore_ratio: float = 0.8  # 本地探索度达标向信标推进
 # 探索
 spiral_base_ring: int = 3
 spiral_max_ring: int = 24
@@ -97,11 +97,11 @@ retreat_radius: int = 3
 - [x] soft-recall 进 beacon 仅 dedicated  
 - [x] **远距 Beacon 放弃**：`beacon_max_chase=64`（Core→Beacon），超限降级 local  
 - [x] **早期不追**：`beacon_min_workers=3`，人少全员 local 采  
-- [x] **强制非 dedicated 清 beacon 相**（每 tick `_drop_to_local`）  
+- [x] **强制非 dedicated 清 beacon 相**（每 tick `_drop_to_local`；探索度/人口推进路径除外）  
 - [x] 编制默认 **12/4/4**，`max_population=20`  
 - [x] spawn 爬坡：先凑 6 Worker 再补战斗单位
 
-### P1 — Core 安全（Drew-Z retreat）
+### P1 — Core 安全（远离威胁 / 信标）
 
 - [x] 可见威胁或 Beacon 在 Core 近侧时，评估 `start_move` 向**远离**方向  
 - [ ] 迁徙中暂停非必要 spawn；Worker 仍向 Core 预测位置交付  
