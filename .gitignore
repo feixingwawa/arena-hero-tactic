@@ -23,3 +23,22 @@ build/
 logs/
 .venv_broken/
 .venv311/
+
+# 本地临时探测 / 补丁 / 验证脚本与输出（勿提交）
+_*.py
+_*.txt
+_*.json
+_*.log
+full_out.txt
+full_ret.txt
+full_pytest_output.log
+push_out.txt
+push_err.txt
+qt_out.txt
+qt_ret.txt
+
+# UI 截图用浏览器配置缓存
+deliverables/ui_verify/edge_profile/
+
+# 本地 IDE / agent 规格草稿
+.trae/
