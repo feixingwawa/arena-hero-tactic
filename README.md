@@ -2,6 +2,7 @@
 
 面向 [Arena Hero](https://doc.arenahero.io/zh-Hans/) 的**可长期运行** Python 战术客户端。  
 基于官方 SDK [`arena-hero`](https://pypi.org/project/arena-hero/)，你掌控游戏循环；本仓库只做决策。
+**感谢[linux.do](https://linux.do)**
 
 > 社区战术示例，非官方客户端。仓库内**不包含**任何真实 API Key。  
 > 规则基准：**玩法 v0.14** · API v0.1 · **SDK ≥ 0.2.9**（0.2.8 会 ProtocolError）。
