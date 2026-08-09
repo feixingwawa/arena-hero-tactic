@@ -454,6 +454,7 @@ def run_loop(
     base_url: Optional[str] = None,
     max_turns: Optional[int] = None,
     dashboard_enabled: bool = False,
+    dashboard_host: str = "0.0.0.0",
     dashboard_port: int = 8765,
     dashboard_logger=None,
 ) -> int:
@@ -515,7 +516,7 @@ def run_loop(
         start_dashboard_server = _db.start_dashboard_server
         DashboardLogHandler = _db.DashboardLogHandler
         start_dashboard_server(
-            host='127.0.0.1', port=dashboard_port,
+            host=dashboard_host, port=dashboard_port,
             store=get_store(),
             logger=dashboard_logger or logger
         )
@@ -672,7 +673,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="同时写入文件日志，例如 logs/agent.log",
     )
     parser.add_argument('--dashboard', action='store_true', default=False,
-                        help='启动本地 Dashboard Web UI (localhost)，需 pip install flask>=3.0')
+                        help='启动 Dashboard Web UI（默认 0.0.0.0 对公网开放），需 pip install flask>=3.0')
+    parser.add_argument('--dashboard-host', type=str, default='0.0.0.0',
+                        help='Dashboard 监听地址（默认 0.0.0.0 公网；仅本机用 127.0.0.1）')
     parser.add_argument('--dashboard-port', type=int, default=8765,
                         help='Dashboard 监听端口（默认 8765）')
     return parser.parse_args(argv)
@@ -696,6 +699,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             base_url=base_url,
             max_turns=args.max_turns,
             dashboard_enabled=args.dashboard,
+            dashboard_host=args.dashboard_host,
             dashboard_port=args.dashboard_port,
             dashboard_logger=logger,
         )

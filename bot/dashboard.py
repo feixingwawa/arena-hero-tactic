@@ -1161,7 +1161,7 @@ def create_app(store: "DashboardStore"):
 
 # ============ Module G: start_dashboard_server ============
 
-def start_dashboard_server(host: str = "127.0.0.1", port: int = 8765,
+def start_dashboard_server(host: str = "0.0.0.0", port: int = 8765,
                            store: Optional["DashboardStore"] = None,
                            logger: Optional[logging.Logger] = None) -> threading.Thread:
     import importlib
@@ -1191,7 +1191,8 @@ def start_dashboard_server(host: str = "127.0.0.1", port: int = 8765,
     server_thread.start()
     time.sleep(0.2)
 
-    banner = f"Dashboard 已启动 http://{host}:{port}"
+    display_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    banner = f"Dashboard 已启动 http://{display_host}:{port} （监听 {host}:{port}，公网可访问）"
     if logger is not None:
         logger.info(banner)
     else:

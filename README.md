@@ -80,7 +80,27 @@ arena-hero-tactic/
 
 ## 一键部署（推荐）
 
-克隆仓库后，用根目录脚本自动完成：检查 Python ≥ 3.11 → 创建/复用 `.venv` → 安装 `requirements.txt` + Flask（Dashboard）+ psutil → 初始化 `.env` →（可选）结束旧 `bot.main` → 后台启动 `python -m bot.main -v --dashboard` → 探测 `GET /health`。
+**只要一行命令**：提示输入 API Key 后，自动装依赖、写 `.env`、启动 Agent + **对公网开放**的 Dashboard。
+
+```bash
+# 已克隆仓库时
+cd arena-hero-tactic && bash install.sh
+
+# 或远程一行拉起（会下载源码到当前目录下的 arena-hero-tactic/）
+bash <(curl -fsSL https://raw.githubusercontent.com/feixingwawa/arena-hero-tactic/main/install.sh)
+```
+
+非交互 / CI：
+
+```bash
+bash install.sh --api-key '你的_API_KEY'
+ARENA_HERO_API_KEY='你的_API_KEY' bash install.sh
+```
+
+`install.sh` 会完成：检查/安装 Python ≥ 3.11 → 拉取或复用源码 → **交互输入 API Key** → 创建 `.venv` → pip 安装 → 写 `.env` → 杀旧进程 → 后台启动  
+`python -m bot.main -v --dashboard --dashboard-host 0.0.0.0 --dashboard-port 8765` → 探测 `GET /health`。
+
+也可用原有入口（同样默认公网 Dashboard）：
 
 ```bash
 # Windows（也可资源管理器双击 deploy.bat）
@@ -92,18 +112,26 @@ deploy.bat --no-kill           # 不结束已在跑的 agent
 deploy.bat --port 8765
 
 # Linux / macOS
-chmod +x deploy.sh
+chmod +x deploy.sh install.sh
 ./deploy.sh
 ./deploy.sh --api-key 你的_API_KEY
+./deploy.sh --host 0.0.0.0 --port 8765
 
 # 等价直接调用
 python scripts/deploy.py
 python scripts/deploy.py --foreground   # 前台跑，Ctrl+C 停
 python scripts/deploy.py --quiet        # 启动不加 -v
+python scripts/deploy.py --host 127.0.0.1   # 仅本机访问
 ```
 
-成功后打开 **http://127.0.0.1:8765/**；PID 写在 `logs/agent.pid`，日志在 `logs/agent.log`。
-**不要**把 `.env` 或真实 Key 提交到 Git；`--api-key` 只写入本地 `.env` 且不会在终端打印明文。
+成功后：
+
+- 本机：**http://127.0.0.1:8765/**
+- 公网：**http://\<服务器公网IP\>:8765/**（需放行防火墙/安全组 **TCP 8765**）
+- PID：`logs/agent.pid`；日志：`logs/agent.log`
+
+**不要**把 `.env` 或真实 Key 提交到 Git；`--api-key` 只写入本地 `.env` 且不会在终端打印明文。  
+更多说明见 [`ONE_CLICK_DEPLOY.md`](ONE_CLICK_DEPLOY.md)。
 
 仅重启（环境已就绪）：`python scripts/restart_agent.py`。
 
@@ -145,8 +173,10 @@ python -m bot.main
 python -m bot.main -v --log-file logs/agent.log
 python -m bot.main --max-turns 50
 
-# 本地实时地图 / 日志面板（默认 http://127.0.0.1:8765）
+# Dashboard 默认 0.0.0.0:8765（对公网开放）
 python -m bot.main --dashboard
+python -m bot.main --dashboard --dashboard-host 0.0.0.0 --dashboard-port 8765
+# 仅本机：
 python -m bot.main --dashboard --dashboard-host 127.0.0.1 --dashboard-port 8765
 ```
 
@@ -155,13 +185,14 @@ python -m bot.main --dashboard --dashboard-host 127.0.0.1 --dashboard-port 8765
 ### Dashboard（可选观测，零污染主循环）
 
 - **默认关闭**：不加 `--dashboard` 时不导入 Flask、不启 HTTP 线程，决策路径与线上一致。
+- **公网开放**：加 `--dashboard` 后默认监听 **`0.0.0.0:8765`**，可用公网 IP 访问；仅本机请加 `--dashboard-host 127.0.0.1`。请自行在防火墙/云安全组放行 **TCP 8765**。
 - **启后能力**：
   - 地图：Core / Worker / Vanguard / Ranger / 敌人 / 资源 / 障碍 / **官方 FOV 已探格子** / 路径 dry-run 路点
   - 顶栏：tick、资源、编制、live/paused/stale 模式、距上次成功拉取的年龄
   - 历史趋势：`/api/state/history` 返回 `{ok, frames, count}`；前端 `normalizeHistory` 解包
   - 日志：SSE `/api/logs/stream` + 轮询兜底
 - **实时性**：前端约 **500ms** 轮询 `latest`+`history`，请求带 `cache: no-store` 与 bust query；后端对页面与状态 API 写 `Cache-Control: no-store`。
-- **健康检查**：`GET /health` → `{ok, tick, ...}`。
+- **健康检查**：`GET /health` → `{ok, ...}`；静态资源在 `/static/assets/`。
 
 ## 战术逻辑摘要
 

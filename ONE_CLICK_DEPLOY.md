@@ -6,7 +6,10 @@
 cd arena-hero-tactic && bash install.sh
 ```
 
-会提示输入 API Key，然后自动装依赖、写 `.env`、启动 Agent + Dashboard（http://127.0.0.1:8765/）。
+会提示输入 API Key，然后自动装依赖、写 `.env`、启动 Agent + **公网 Dashboard**（`0.0.0.0:8765`）。
+
+- 本机：http://127.0.0.1:8765/
+- 公网：http://<服务器公网IP>:8765/（需放行 TCP 8765）
 
 ## 远程一行（curl）
 

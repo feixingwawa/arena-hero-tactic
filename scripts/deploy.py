@@ -295,6 +295,7 @@ def kill_old_agents() -> None:
 def start_agent(
     *,
     port: int,
+    host: str = "0.0.0.0",
     foreground: bool,
     verbose: bool,
 ) -> int | None:
@@ -306,6 +307,8 @@ def start_agent(
         "-m",
         "bot.main",
         "--dashboard",
+        "--dashboard-host",
+        host,
         "--dashboard-port",
         str(port),
         "--log-file",
@@ -401,6 +404,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--foreground", action="store_true", help="前台运行 agent")
     p.add_argument("--skip-pip", action="store_true", help="跳过 pip 安装")
     p.add_argument("--port", type=int, default=8765, help="Dashboard 端口（默认 8765）")
+    p.add_argument(
+        "--host",
+        type=str,
+        default="0.0.0.0",
+        help="Dashboard 监听地址（默认 0.0.0.0 对公网开放；仅本机用 127.0.0.1）",
+    )
     p.add_argument("--api-key", type=str, default=None, help="写入 .env 的 ARENA_HERO_API_KEY")
     p.add_argument("--quiet", action="store_true", help="启动时不加 -v")
     p.add_argument("--no-kill", action="store_true", help="不结束旧 bot.main")
@@ -445,7 +454,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.no_start:
         _info("环境就绪（--no-start）。启动示例：")
-        print(f"  {_venv_python()} -m bot.main -v --dashboard --log-file logs/agent.log")
+        print(
+            f"  {_venv_python()} -m bot.main -v --dashboard "
+            f"--dashboard-host {args.host} --dashboard-port {args.port} "
+            f"--log-file logs/agent.log"
+        )
         return 0
 
     if not args.no_kill:
@@ -453,6 +466,7 @@ def main(argv: list[str] | None = None) -> int:
 
     start_agent(
         port=args.port,
+        host=args.host,
         foreground=args.foreground,
         verbose=not args.quiet,
     )
@@ -462,15 +476,17 @@ def main(argv: list[str] | None = None) -> int:
     ok = wait_health(args.port, timeout=18.0)
     tail_logs()
     print()
+    local_url = f"http://127.0.0.1:{args.port}/"
     if ok:
         _info("部署成功")
-        _info(f"Dashboard: http://127.0.0.1:{args.port}/")
+        _info(f"Dashboard 本机: {local_url}")
+        _info(f"Dashboard 监听: {args.host}:{args.port}（0.0.0.0 表示对公网开放）")
         _info("日志: logs/agent.log  |  PID: logs/agent.pid")
         _info("停止: 结束 bot.main 进程，或再运行本脚本（会先 kill 旧进程）")
         return 0
 
     _warn("Agent 可能仍在连接游戏服务器；若日志持续无 tick，检查 API Key / 网络")
-    _info(f"Dashboard（若已起）: http://127.0.0.1:{args.port}/")
+    _info(f"Dashboard（若已起）: {local_url}  监听 {args.host}:{args.port}")
     return 0
 
 
