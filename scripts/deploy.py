@@ -41,6 +41,11 @@ ENV_PATH = ROOT / ".env"
 ENV_EXAMPLE = ROOT / ".env.example"
 REQ = ROOT / "requirements.txt"
 MIN_PY = (3, 11)
+# 国内网络更稳的默认源；可用环境变量 PIP_INDEX_URL 覆盖
+DEFAULT_PIP_INDEX = os.environ.get(
+    "PIP_INDEX_URL", "https://pypi.tuna.tsinghua.edu.cn/simple"
+)
+PIP_TIMEOUT = os.environ.get("PIP_DEFAULT_TIMEOUT", "120")
 
 
 def _info(msg: str) -> None:
@@ -85,27 +90,42 @@ def ensure_venv() -> Path:
     return py
 
 
+def _pip_base(py: Path) -> list[str]:
+    """构造带镜像与超时的 pip 命令，缓解 files.pythonhosted.org 超时。"""
+    return [
+        str(py),
+        "-m",
+        "pip",
+        "install",
+        "-i",
+        DEFAULT_PIP_INDEX,
+        "--default-timeout",
+        str(PIP_TIMEOUT),
+    ]
+
+
 def pip_install(skip: bool) -> None:
     if skip:
         _info("跳过 pip install (--skip-pip)")
         return
     py = _venv_python()
+    _info(f"使用 pip 源: {DEFAULT_PIP_INDEX} (timeout={PIP_TIMEOUT}s)")
     _info("升级 pip")
     subprocess.check_call(
-        [str(py), "-m", "pip", "install", "--upgrade", "pip", "-q"],
+        _pip_base(py) + ["--upgrade", "pip", "-q"],
         cwd=str(ROOT),
     )
     if not REQ.exists():
         _die(f"缺少 {REQ}")
     _info(f"安装 {REQ.name}")
     subprocess.check_call(
-        [str(py), "-m", "pip", "install", "-r", str(REQ), "-q"],
+        _pip_base(py) + ["-r", str(REQ), "-q"],
         cwd=str(ROOT),
     )
     # Dashboard + 进程管理（restart/deploy 用）
     _info("安装 flask>=3.0 与 psutil（Dashboard / 进程清理）")
     subprocess.check_call(
-        [str(py), "-m", "pip", "install", "flask>=3.0", "psutil", "-q"],
+        _pip_base(py) + ["flask>=3.0", "psutil", "-q"],
         cwd=str(ROOT),
     )
     # 版本自检
@@ -119,6 +139,67 @@ def pip_install(skip: bool) -> None:
         _info(f"package: {line}")
 
 
+_PLACEHOLDER_KEYS = {
+    "",
+    "your_api_key_here",
+    "你的_API_KEY",
+    "changeme",
+    "REPLACE_WITH_REAL_KEY",
+}
+
+
+def _read_env_key(text: str) -> str:
+    m = re.search(r"(?m)^ARENA_HERO_API_KEY\s*=\s*(.*)$", text)
+    if not m:
+        return ""
+    return m.group(1).strip().strip('"').strip("'")
+
+
+def _write_env_key(text: str, key: str) -> str:
+    if re.search(r"(?m)^ARENA_HERO_API_KEY\s*=", text):
+        text = re.sub(
+            r"(?m)^ARENA_HERO_API_KEY\s*=.*$",
+            f"ARENA_HERO_API_KEY={key}",
+            text,
+        )
+    else:
+        text = text.rstrip() + f"\nARENA_HERO_API_KEY={key}\n"
+    ENV_PATH.write_text(text, encoding="utf-8")
+    return text
+
+
+def _prompt_api_key() -> str:
+    """交互输入 API Key（优先 getpass，失败则回退 input）。"""
+    print()
+    print("=" * 56)
+    print("  需要 Arena Hero API Key 才能连接游戏服务器")
+    print("  获取地址: https://doc.arenahero.io/")
+    print("=" * 56)
+    env_key = os.environ.get("ARENA_HERO_API_KEY", "").strip()
+    if env_key and env_key not in _PLACEHOLDER_KEYS:
+        _info("检测到环境变量 ARENA_HERO_API_KEY，将使用它")
+        return env_key
+
+    if not sys.stdin.isatty():
+        _die(
+            "当前非交互终端且未提供 API Key。\n"
+            "请使用: ./deploy.sh --api-key <KEY>\n"
+            "或: ARENA_HERO_API_KEY=<KEY> ./deploy.sh\n"
+            "或在交互式终端直接运行以手动输入。"
+        )
+
+    try:
+        import getpass
+
+        key = getpass.getpass("请输入 ARENA_HERO_API_KEY（输入时不回显）: ").strip()
+    except Exception:
+        key = input("请输入 ARENA_HERO_API_KEY: ").strip()
+
+    if not key or key in _PLACEHOLDER_KEYS:
+        _die("API Key 不能为空或占位符，请重新运行并输入真实 Key")
+    return key
+
+
 def ensure_env(api_key: str | None) -> None:
     if not ENV_PATH.exists():
         if not ENV_EXAMPLE.exists():
@@ -126,56 +207,84 @@ def ensure_env(api_key: str | None) -> None:
         shutil.copyfile(ENV_EXAMPLE, ENV_PATH)
         _info(f"已从 .env.example 创建 {ENV_PATH.name}")
     text = ENV_PATH.read_text(encoding="utf-8", errors="replace")
+
     if api_key:
         key = api_key.strip()
-        if not key:
-            _die("--api-key 为空")
-        if re.search(r"(?m)^ARENA_HERO_API_KEY\s*=", text):
-            text = re.sub(
-                r"(?m)^ARENA_HERO_API_KEY\s*=.*$",
-                f"ARENA_HERO_API_KEY={key}",
-                text,
-            )
-        else:
-            text = text.rstrip() + f"\nARENA_HERO_API_KEY={key}\n"
-        ENV_PATH.write_text(text, encoding="utf-8")
+        if not key or key in _PLACEHOLDER_KEYS:
+            _die("--api-key 为空或仍是占位符")
+        text = _write_env_key(text, key)
         _info("已写入 ARENA_HERO_API_KEY 到 .env（明文不打印）")
-        text = ENV_PATH.read_text(encoding="utf-8", errors="replace")
+    else:
+        raw = _read_env_key(text)
+        if not raw or raw in _PLACEHOLDER_KEYS:
+            key = _prompt_api_key()
+            text = _write_env_key(text, key)
+            _info("已写入 ARENA_HERO_API_KEY 到 .env（明文不打印）")
 
-    m = re.search(r"(?m)^ARENA_HERO_API_KEY\s*=\s*(.*)$", text)
-    raw = (m.group(1).strip().strip('"').strip("'") if m else "")
-    if not raw or raw in {"your_api_key_here", "你的_API_KEY", "changeme"}:
-        _die(
-            "请先配置 API Key：编辑 .env 设置 ARENA_HERO_API_KEY=... "
-            "或运行 python scripts/deploy.py --api-key <KEY>"
-        )
+    raw = _read_env_key(ENV_PATH.read_text(encoding="utf-8", errors="replace"))
+    if not raw or raw in _PLACEHOLDER_KEYS:
+        _die("API Key 仍未配置成功")
     masked = raw[:3] + "***" + raw[-4:] if len(raw) > 8 else "***"
     _info(f"API Key 已配置 ({masked})")
 
 
 def kill_old_agents() -> None:
-    try:
-        import psutil  # type: ignore
-    except ImportError:
-        subprocess.check_call(
-            _venv_pip() + ["install", "psutil", "-q"],
-            cwd=str(ROOT),
-        )
-        import psutil  # type: ignore
-
+    """结束旧 bot.main。在 venv 内用 psutil；失败则 pkill。"""
+    py = _venv_python()
     killed: list[int] = []
-    for p in psutil.process_iter(["pid", "cmdline"]):
+    code = (
+        "import os, sys\n"
+        "try:\n"
+        "    import psutil\n"
+        "except ImportError:\n"
+        "    sys.exit(2)\n"
+        "me = os.getpid()\n"
+        "killed = []\n"
+        "for p in psutil.process_iter(['pid', 'cmdline']):\n"
+        "    try:\n"
+        "        cl = p.info.get('cmdline') or []\n"
+        "        joined = ' '.join(str(x) for x in cl)\n"
+        "        if ('bot.main' in joined or '-m bot.main' in joined) and 'deploy.py' not in joined:\n"
+        "            pid = int(p.info['pid'])\n"
+        "            if pid != me:\n"
+        "                p.kill()\n"
+        "                killed.append(pid)\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "print(','.join(str(x) for x in killed))\n"
+    )
+    try:
+        out = subprocess.check_output(
+            [str(py), "-c", code],
+            cwd=str(ROOT),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        killed = [int(x) for x in out.strip().split(",") if x.strip().isdigit()]
+    except subprocess.CalledProcessError:
         try:
-            cl = p.info.get("cmdline") or []
-            joined = " ".join(str(x) for x in cl)
-            if "bot.main" in joined or "-m bot.main" in joined:
-                # 避免误杀当前 deploy 自己
-                if "deploy.py" in joined:
-                    continue
-                p.kill()
-                killed.append(int(p.info["pid"]))
-        except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
-            continue
+            subprocess.check_call(_pip_base(py) + ["psutil", "-q"], cwd=str(ROOT))
+            out = subprocess.check_output([str(py), "-c", code], cwd=str(ROOT), text=True)
+            killed = [int(x) for x in out.strip().split(",") if x.strip().isdigit()]
+        except Exception:
+            killed = []
+    except Exception:
+        killed = []
+
+    if not killed:
+        try:
+            subprocess.run(
+                ["pkill", "-f", r"python.*-m bot\.main"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            _info("已尝试 pkill 旧 bot.main")
+            time.sleep(1.0)
+            return
+        except Exception:
+            pass
+
     if killed:
         _info(f"已结束旧 agent 进程: {killed}")
         time.sleep(1.5)
@@ -231,7 +340,7 @@ def start_agent(
     return proc.pid
 
 
-def wait_health(port: int, timeout: float = 45.0) -> bool:
+def wait_health(port: int, timeout: float = 20.0) -> bool:
     url = f"http://127.0.0.1:{port}/health"
     _info(f"等待 Dashboard {url} …")
     deadline = time.time() + timeout
@@ -298,6 +407,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _reexec_in_venv_if_needed(argv: list[str] | None) -> None:
+    """若当前解释器不是项目 venv，则切换到 venv 再跑（保证 psutil 可 import）。
+
+    注意：不能用 Path.resolve() 比较——venv/bin/python 常是指向系统 python 的符号链接，
+    resolve 后会误判为“已在 venv”。
+    """
+    py = _venv_python()
+    if not py.exists():
+        return
+    if os.environ.get("ARENA_DEPLOY_IN_VENV") == "1":
+        return
+    exe = Path(sys.executable)
+    # 仅当可执行文件路径落在 .venv 目录树内才视为已在 venv
+    try:
+        exe.absolute().relative_to(VENV_DIR.absolute())
+        return
+    except ValueError:
+        pass
+    env = os.environ.copy()
+    env["ARENA_DEPLOY_IN_VENV"] = "1"
+    cmd = [str(py), str(Path(__file__).resolve()), *(argv if argv is not None else sys.argv[1:])]
+    _info(f"切换到 venv 解释器: {py}")
+    os.execve(str(py), cmd, env)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     os.chdir(ROOT)
@@ -306,6 +440,7 @@ def main(argv: list[str] | None = None) -> int:
     check_python()
     ensure_venv()
     pip_install(skip=args.skip_pip)
+    _reexec_in_venv_if_needed(argv)
     ensure_env(args.api_key)
 
     if args.no_start:
@@ -322,9 +457,9 @@ def main(argv: list[str] | None = None) -> int:
         verbose=not args.quiet,
     )
 
-    # 后台：等 health
-    time.sleep(3)
-    ok = wait_health(args.port, timeout=50.0)
+    # 后台：等 health（假 Key 会很快 401 退出，不宜等太久）
+    time.sleep(2)
+    ok = wait_health(args.port, timeout=18.0)
     tail_logs()
     print()
     if ok:
