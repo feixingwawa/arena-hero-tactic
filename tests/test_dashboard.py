@@ -416,6 +416,18 @@ def test_api_history_WRAPPED_FRAMES_MECHANISM() -> None:
     # data_source 标识每个帧存在
     for f in frames:
         assert "data_source" in f and "provider" in f
+    # 默认 compact：去掉 memory/obstacles 等重字段，避免前端卡死
+    assert body.get("compact") is True
+    for f in frames:
+        assert f.get("compact") is True
+        assert "memory" not in f
+        assert "obstacles" not in f
+
+    # full=1 返回完整帧
+    resp_full = client.get("/api/state/history?n=120&full=1")
+    body_full = resp_full.get_json()
+    assert body_full.get("compact") is False
+    assert body_full["count"] == 5
 
 
 @skip_no_flask

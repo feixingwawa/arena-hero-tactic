@@ -47,6 +47,69 @@ def _as_position(pos: Any) -> tuple[int, int]:
         return (0, 0)
 
 
+def _compact_history_frame(snap: dict) -> dict:
+    """压缩历史帧：趋势图/回放索引只需轻量字段。
+
+    完整快照含 explored_cells / obstacles / path_estimate，120 帧可达数十 MB，
+    前端每 500ms 全量拉取会卡死，地图 canvas 无法绘制。
+    """
+    if not isinstance(snap, dict):
+        return {}
+    core = snap.get("core") or {}
+    beacon = snap.get("beacon") or {}
+    units_out: list[dict] = []
+    for u in snap.get("units") or []:
+        if not isinstance(u, dict):
+            continue
+        econ = u.get("econ") if isinstance(u.get("econ"), dict) else {}
+        units_out.append({
+            "id": u.get("id"),
+            "type": u.get("type"),
+            "x": u.get("x"),
+            "y": u.get("y"),
+            "hp": u.get("hp"),
+            "cargo": u.get("cargo"),
+            "phase": econ.get("phase") or u.get("phase"),
+            "role": econ.get("role") or u.get("role"),
+        })
+    # decision_logs 仅保留字符串摘要，供趋势图 deposit 标记
+    dlogs_raw = snap.get("decision_logs") or []
+    dlogs: list[str] = []
+    for item in dlogs_raw[:20]:
+        if isinstance(item, str):
+            dlogs.append(item[:120])
+        elif isinstance(item, dict):
+            msg = item.get("msg") or item.get("message") or item.get("text") or ""
+            if msg:
+                dlogs.append(str(msg)[:120])
+    return {
+        "tick": snap.get("tick"),
+        "ts_ms": snap.get("ts_ms"),
+        "resources": snap.get("resources"),
+        "population": snap.get("population"),
+        "counts": snap.get("counts") or {},
+        "has_near_threat": bool(snap.get("has_near_threat")),
+        "core": {
+            "x": core.get("x"),
+            "y": core.get("y"),
+            "hp": core.get("hp"),
+            "shield": core.get("shield"),
+            "action": core.get("action"),
+        } if core else None,
+        "beacon": {
+            "status": beacon.get("status"),
+            "x": beacon.get("x"),
+            "y": beacon.get("y"),
+            "carrier_id": beacon.get("carrier_id"),
+        } if beacon else None,
+        "units": units_out,
+        "decision_logs": dlogs,
+        "data_source": snap.get("data_source", "arena_hero_sdk_turn"),
+        "provider": snap.get("provider", "official SDK pipeline"),
+        "compact": True,
+    }
+
+
 class DashboardStore:
     def __init__(self, capacity: int = 120, log_capacity: int = 5000) -> None:
         self._snapshots: collections.deque = collections.deque(maxlen=capacity)
@@ -67,6 +130,11 @@ class DashboardStore:
     def get_history(self, n: int) -> list[dict]:
         with self._write_lock:
             return list(self._snapshots)[-min(n, len(self._snapshots)):] if self._snapshots else []
+
+    def get_history_compact(self, n: int) -> list[dict]:
+        """历史帧轻量投影：供趋势图/回放索引，避免 40MB+ JSON 卡死前端地图。"""
+        frames = self.get_history(n)
+        return [_compact_history_frame(f) for f in frames]
 
     def push_log_entry(self, entry: dict) -> None:
         with self._write_lock:
@@ -1078,19 +1146,29 @@ def create_app(store: "DashboardStore"):
     def api_state_history():
         n = request.args.get("n", 60, type=int)
         n = max(1, min(120, n))
-        frames = store.get_history(n)
-        # 为历史帧也补全 data_source meta（历史数据可能来自老版本 build_snapshot）
-        wrapped = []
-        for f in frames:
-            w = dict(f)
-            w.setdefault("data_source", f.get("data_source", "arena_hero_sdk_turn"))
-            w.setdefault("provider", f.get("provider", "official SDK pipeline"))
-            wrapped.append(w)
+        # 默认 compact=1：去掉 explored_cells/obstacles/path 等重字段，避免 40MB+ 卡死地图
+        # full=1 或 compact=0 时返回完整帧（调试用）
+        full = request.args.get("full", "0")
+        compact_arg = request.args.get("compact", "1")
+        use_full = str(full).lower() in ("1", "true", "yes") or str(compact_arg).lower() in (
+            "0", "false", "no"
+        )
+        if use_full:
+            frames = store.get_history(n)
+            wrapped = []
+            for f in frames:
+                w = dict(f)
+                w.setdefault("data_source", f.get("data_source", "arena_hero_sdk_turn"))
+                w.setdefault("provider", f.get("provider", "official SDK pipeline"))
+                wrapped.append(w)
+        else:
+            wrapped = store.get_history_compact(n)
         return _no_store(jsonify({
             "ok": True,
             "data_source": ("arena_hero_sdk_turn" if wrapped else "none (empty)"),
             "frames": wrapped,
             "count": len(wrapped),
+            "compact": (not use_full),
         }))
 
     @app.route("/api/logs")

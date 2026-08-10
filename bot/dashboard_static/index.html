@@ -271,6 +271,8 @@ window.STATE = {
   lastSnapTick:null,
   lastPollError:null,
   pollMs:500,
+  historyMax:120,
+  historyFetchedAt:0,
 };
 
 const CHUNK_SIZE=16;
@@ -1143,33 +1145,63 @@ function renderLogs(force=false){
   if(atBottom)logContainer.scrollTop=logContainer.scrollHeight;
 }
 
+function pushLocalHistory(snap){
+  // 实时模式用 latest 本地累积趋势，避免每 500ms 拉 40MB history
+  if(!snap||typeof snap.tick!=='number')return;
+  const hist=Array.isArray(STATE.history)?STATE.history:[];
+  const last=hist.length?hist[hist.length-1]:null;
+  if(last&&last.tick===snap.tick){
+    hist[hist.length-1]={
+      tick:snap.tick,
+      resources:snap.resources||0,
+      population:snap.population||0,
+      counts:snap.counts||{},
+      decision_logs:snap.decision_logs||[],
+      has_near_threat:!!snap.has_near_threat,
+      ts_ms:snap.ts_ms,
+    };
+  }else{
+    hist.push({
+      tick:snap.tick,
+      resources:snap.resources||0,
+      population:snap.population||0,
+      counts:snap.counts||{},
+      decision_logs:snap.decision_logs||[],
+      has_near_threat:!!snap.has_near_threat,
+      ts_ms:snap.ts_ms,
+    });
+  }
+  const max=STATE.historyMax||120;
+  if(hist.length>max)hist.splice(0,hist.length-max);
+  STATE.history=hist;
+}
+
 async function tickOnce(){
   try{
     const bust=()=>`_ts=${Date.now()}`;
     if(STATE.mode==='live'){
-      const [latestResp,histResp]=await Promise.all([
-        fetch(`/api/state/latest?${bust()}`,{cache:'no-store'}),
-        fetch(`/api/state/history?n=120&${bust()}`,{cache:'no-store'}),
-      ]);
-      let latest=null,histRaw=null;
+      // 关键修复：live 只拉 latest（~300KB），不每帧全量 history（曾达 40MB+ 导致地图空白）
+      const latestResp=await fetch(`/api/state/latest?${bust()}`,{cache:'no-store'});
+      let latest=null;
       try{latest=await latestResp.json();}catch(_){latest=null;}
-      try{histRaw=await histResp.json();}catch(_){histRaw=null;}
-      STATE.history=normalizeHistory(histRaw);
       if(latestResp.ok&&latest&&typeof latest.tick==='number'&&latest.tick>=0){
         STATE.latestSnap=latest;
         STATE.lastFetchOkAt=Date.now();
         STATE.lastSnapTick=latest.tick;
         STATE.lastPollError=null;
+        pushLocalHistory(latest);
       }else if(!latestResp.ok){
         STATE.lastPollError=`latest HTTP ${latestResp.status}`;
       }else if(latest&&latest.ok===false){
         STATE.lastPollError=latest.message||'暂无快照';
       }
     }else{
-      const histResp=await fetch(`/api/state/history?n=120&${bust()}`,{cache:'no-store'});
+      // 暂停回放：拉 compact history（默认后端已压缩）
+      const histResp=await fetch(`/api/state/history?n=120&compact=1&${bust()}`,{cache:'no-store'});
       let histRaw=null;
       try{histRaw=await histResp.json();}catch(_){histRaw=null;}
       STATE.history=normalizeHistory(histRaw);
+      STATE.historyFetchedAt=Date.now();
       if(histResp.ok){
         STATE.lastFetchOkAt=Date.now();
         STATE.lastPollError=null;
