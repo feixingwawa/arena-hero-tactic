@@ -78,33 +78,46 @@ arena-hero-tactic/
 - **可选 Dashboard**：`flask>=3.0`（`requirements.txt` 中默认注释；仅 `--dashboard` 时需要）
 - **SDK 版本自检（v2 P3-1）**：启动时 `main.run_loop` 会强制校验 arena-hero 版本 ≥ 0.2.9 且 < 0.3；不满足直接 `SystemExit(1)`，避免 `ProtocolError` 到线上才报错
 
-## 一键部署（推荐）
+## 一键部署（推荐）— Windows / macOS / Linux 通用
 
-**只要一行命令**：提示输入 API Key 后，自动装依赖、写 `.env`、启动 Agent + **对公网开放**的 Dashboard。
+**统一入口 `install.py`**（纯 Python）：提示输入 API Key 后，自动装依赖、写 `.env`、启动 Agent + **对公网开放**的 Dashboard。
 
 ```bash
-# 已克隆仓库时
-cd arena-hero-tactic && bash install.sh
+# 已克隆仓库（三系统通用）
+cd arena-hero-tactic
+python install.py                 # Windows 也可用: py install.py
+# 或双击 / 脚本包装
+#   Windows:  install.bat
+#   Unix:     bash install.sh
+```
 
-# 或远程一行拉起（会下载源码到当前目录下的 arena-hero-tactic/）
-bash <(curl -fsSL https://raw.githubusercontent.com/feixingwawa/arena-hero-tactic/main/install.sh)
+远程一行拉起（下载源码到当前目录 `arena-hero-tactic/`）：
+
+```bash
+# Linux / macOS
+python3 <(curl -fsSL https://raw.githubusercontent.com/feixingwawa/arena-hero-tactic/main/install.py)
+
+# Windows PowerShell
+# irm https://raw.githubusercontent.com/feixingwawa/arena-hero-tactic/main/install.py -OutFile install.py
+# py install.py
 ```
 
 非交互 / CI：
 
 ```bash
-bash install.sh --api-key '你的_API_KEY'
-ARENA_HERO_API_KEY='你的_API_KEY' bash install.sh
+python install.py --api-key '你的_API_KEY'
+ARENA_HERO_API_KEY='你的_API_KEY' python install.py
+python install.py --api-key '你的_API_KEY' --no-start
 ```
 
-`install.sh` 会完成：检查/安装 Python ≥ 3.11 → 拉取或复用源码 → **交互输入 API Key** → 创建 `.venv` → pip 安装 → 写 `.env` → 杀旧进程 → 后台启动  
+`install.py` 会完成：检查 Python ≥ 3.11 → 拉取或复用源码 → **交互输入 API Key** → 创建 `.venv` → pip 安装 → 写 `.env` → 杀旧进程 → 后台启动  
 `python -m bot.main -v --dashboard --dashboard-host 0.0.0.0 --dashboard-port 8765` → 探测 `GET /health`。
 
-也可用原有入口（同样默认公网 Dashboard）：
+仓库内仅部署（不拉源码，同样默认公网 Dashboard）：
 
 ```bash
-# Windows（也可资源管理器双击 deploy.bat）
-deploy.bat
+# Windows（也可资源管理器双击 deploy.bat / install.bat）
+install.bat
 deploy.bat --api-key 你的_API_KEY
 deploy.bat --no-start          # 只装环境不启动
 deploy.bat --skip-pip          # 已装好依赖时跳过 pip
@@ -112,8 +125,8 @@ deploy.bat --no-kill           # 不结束已在跑的 agent
 deploy.bat --port 8765
 
 # Linux / macOS
-chmod +x deploy.sh install.sh
-./deploy.sh
+chmod +x deploy.sh install.sh install.py
+./install.sh
 ./deploy.sh --api-key 你的_API_KEY
 ./deploy.sh --host 0.0.0.0 --port 8765
 
