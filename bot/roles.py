@@ -23,6 +23,7 @@ class Role(str, Enum):
     SCOUT = "scout"  # 轻探（本战术几乎不用，预留）
     RETREAT = "retreat"  # 紧急回撤 Core
     HEAL = "heal"  # 回 Core 治疗
+    STRIKE = "strike"  # 突击敌方 Core（2V+2R 编制）
 
 
 @dataclass
@@ -61,6 +62,8 @@ class RolePlan:
     threat_positions: list[Position] = field(default_factory=list)
     has_near_threat: bool = False
     has_far_threat: bool = False
+    # 敌方 Core 位置（可见时）；供 combat 派 2V+2R 突击
+    enemy_core_position: Optional[Position] = None
 
     def by_role(self, role: Role) -> list[RoleAssignment]:
         return [a for a in self.assignments if a.role == role]
@@ -99,15 +102,51 @@ def snapshot_from_unit(unit: Any, unit_type: str, max_hp: int) -> UnitSnapshot:
     )
 
 
-def collect_enemy_positions(turn: Any) -> list[Position]:
-    """从 turn.visible_enemies 提取敌方位置。"""
+def _enemy_unit_type(enemy: Any) -> str:
+    """规范化敌方 unit_type / type 字段为大写字符串。"""
+    raw = getattr(enemy, "unit_type", None)
+    if raw is None:
+        raw = getattr(enemy, "type", None)
+    if raw is None:
+        return ""
+    return str(getattr(raw, "value", raw) or "").upper()
+
+
+def collect_enemy_positions(
+    turn: Any,
+    *,
+    exclude_workers: bool = False,
+    combat_only: bool = False,
+) -> list[Position]:
+    """从 turn.visible_enemies 提取敌方位置。
+
+    Args:
+        exclude_workers: True 时忽略敌方 WORKER（不触发撤退/威胁）。
+        combat_only: True 时仅保留战斗威胁（VANGUARD/RANGER/CORE 等非工人）。
+    """
     enemies = getattr(turn, "visible_enemies", None) or ()
     result: list[Position] = []
     for e in enemies:
+        et = _enemy_unit_type(e)
+        if exclude_workers or combat_only:
+            if et == "WORKER":
+                continue
         pos = getattr(e, "position", None)
         if pos is not None:
             result.append(_as_position(pos))
     return result
+
+
+def find_enemy_core_position(turn: Any) -> Optional[Position]:
+    """可见敌方 Core 的位置（unit_type/type 含 CORE）。"""
+    enemies = getattr(turn, "visible_enemies", None) or ()
+    for e in enemies:
+        et = _enemy_unit_type(e)
+        if "CORE" in et:
+            pos = getattr(e, "position", None)
+            if pos is not None:
+                return _as_position(pos)
+    return None
 
 
 def assign_roles(
@@ -121,6 +160,10 @@ def assign_roles(
         turn: 真实 Turn 或测试 stub（需有 workers/vanguards/rangers）。
         config: 战术参数。
         core_position: 若已知 Core 位置可直接传入，否则从 turn.core 读取。
+
+    战术约定：
+    - 敌方 WORKER 不触发 Worker RETREAT；战斗敌人仍触发撤退/绕路。
+    - 发现敌方 Core 时，最多 2 Vanguard + 2 Ranger 标记 STRIKE 突击。
     """
     core = getattr(turn, "core", None)
     if core_position is None:
@@ -129,21 +172,27 @@ def assign_roles(
         else:
             core_position = _as_position(core.position)
 
-    enemies = collect_enemy_positions(turn)
+    # 撤退/威胁：忽略敌方工人，只对战斗单位（及 CORE）敏感
+    combat_enemies = collect_enemy_positions(turn, combat_only=True)
+    # 兼容：全部敌人位置（含工人）仍可用于「全图敌情」；threat 用战斗敌人
+    all_enemy_positions = collect_enemy_positions(turn)
     near_threats = [
-        p for p in enemies if manhattan(p, core_position) <= config.threat_radius
+        p for p in combat_enemies if manhattan(p, core_position) <= config.threat_radius
     ]
     far_threats = [
-        p for p in enemies if manhattan(p, core_position) > config.threat_radius
+        p for p in combat_enemies if manhattan(p, core_position) > config.threat_radius
     ]
     has_near = len(near_threats) > 0
     has_far = len(far_threats) > 0
+    # threat_positions：战斗威胁（供 explore 绕路 / 战斗模块）；工人不列入
     all_threats = near_threats + far_threats
+    enemy_core_pos = find_enemy_core_position(turn)
 
     plan = RolePlan(
         threat_positions=all_threats,
         has_near_threat=has_near,
         has_far_threat=has_far,
+        enemy_core_position=enemy_core_pos,
     )
 
     # --- Workers ---
@@ -171,18 +220,19 @@ def assign_roles(
             #    —— 空货中距离敌人改由 explore 避让，不打断外扩
             # 4) 满货已逼近 Core（man≤4）时禁止因敌人改 RETREAT：
             #    线上敌工贴 Core 导致 deposit 工人 man≈2 来回拉扯，资源永远 ≤8
+            # 5) 敌方 WORKER 不计入撤退威胁（combat_enemies 已过滤）
             dist_core = manhattan(snap.position, core_position)
             near_core_deposit = snap.cargo > 0 and dist_core <= 4
             adjacent_danger = any(
                 manhattan(snap.position, ep) <= config.retreat_adjacent
-                for ep in enemies
+                for ep in combat_enemies
             )
             cargo_danger = (
                 snap.cargo > 0
                 and not near_core_deposit
                 and any(
                     manhattan(snap.position, ep) <= config.retreat_radius
-                    for ep in enemies
+                    for ep in combat_enemies
                 )
             )
             core_melee_danger = (
@@ -190,7 +240,7 @@ def assign_roles(
                 and any(
                     manhattan(ep, core_position) <= config.threat_radius
                     and manhattan(snap.position, ep) <= config.retreat_adjacent
-                    for ep in enemies
+                    for ep in combat_enemies
                 )
             )
             # 满货冲 Core 时仅邻格贴身才被迫撤（真正被打）；否则继续 deposit
@@ -217,7 +267,7 @@ def assign_roles(
             )
         )
 
-    # --- Vanguards：默认 GUARD ---
+    # --- Vanguards：默认 GUARD；可见敌 Core 时最多 2 个 STRIKE ---
     # 治疗阈值：至少 unit_heal_hp_threshold，且不低于 max_hp//2（V 满血 4 → ≤2 回城）
     # 避免「只剩 1 血才撤」导致路上撞墙/阵亡；无邻格敌人时才 HEAL，贴身继续扫。
     vanguards = list(getattr(turn, "vanguards", None) or ())
@@ -225,17 +275,23 @@ def assign_roles(
         int(config.unit_heal_hp_threshold),
         max(1, int(config.vanguard_max_hp) // 2),
     )
+    strike_v_budget = 2 if enemy_core_pos is not None else 0
+    strike_v_assigned = 0
     for i, v in enumerate(vanguards):
         snap = snapshot_from_unit(v, "VANGUARD", config.vanguard_max_hp)
         role = Role.GUARD
         hint = None
         if snap.hp <= v_heal_th and snap.hp < snap.max_hp:
             adjacent_enemy = any(
-                manhattan(snap.position, ep) <= 1 for ep in enemies
+                manhattan(snap.position, ep) <= 1 for ep in combat_enemies
             )
             if not adjacent_enemy:
                 role = Role.HEAL
                 hint = core_position
+        elif strike_v_assigned < strike_v_budget and enemy_core_pos is not None:
+            role = Role.STRIKE
+            hint = enemy_core_pos
+            strike_v_assigned += 1
         plan.assignments.append(
             RoleAssignment(
                 unit_id=snap.id,
@@ -248,13 +304,15 @@ def assign_roles(
             )
         )
 
-    # --- Rangers：默认 GUARD ---
+    # --- Rangers：默认 GUARD；可见敌 Core 时最多 2 个 STRIKE ---
     # Ranger max_hp=2 → 阈值 max(1, 1)=1，半血即回城
     rangers = list(getattr(turn, "rangers", None) or ())
     r_heal_th = max(
         int(config.unit_heal_hp_threshold),
         max(1, int(config.ranger_max_hp) // 2),
     )
+    strike_r_budget = 2 if enemy_core_pos is not None else 0
+    strike_r_assigned = 0
     for r in rangers:
         snap = snapshot_from_unit(r, "RANGER", config.ranger_max_hp)
         role = Role.GUARD
@@ -262,6 +320,10 @@ def assign_roles(
         if snap.hp <= r_heal_th and snap.hp < snap.max_hp:
             role = Role.HEAL
             hint = core_position
+        elif strike_r_assigned < strike_r_budget and enemy_core_pos is not None:
+            role = Role.STRIKE
+            hint = enemy_core_pos
+            strike_r_assigned += 1
         plan.assignments.append(
             RoleAssignment(
                 unit_id=snap.id,
@@ -274,6 +336,8 @@ def assign_roles(
             )
         )
 
+    # all_enemy_positions 保留引用避免 unused（诊断/扩展）
+    _ = all_enemy_positions
     return plan
 
 

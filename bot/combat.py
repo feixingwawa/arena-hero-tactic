@@ -184,23 +184,52 @@ def _enemies(turn: Any) -> list[Any]:
     return list(getattr(turn, "visible_enemies", None) or ())
 
 
+def _enemy_type(enemy: Any) -> str:
+    raw = getattr(enemy, "unit_type", None)
+    if raw is None:
+        raw = getattr(enemy, "type", None)
+    if raw is None:
+        return ""
+    return str(getattr(raw, "value", raw) or "").upper()
+
+
 def assess_threats(
     turn: Any,
     core_position: Position,
     config: TacticConfig = DEFAULT_CONFIG,
 ) -> dict[str, Any]:
-    """威胁评估摘要。"""
+    """威胁评估摘要。
+
+    敌方 WORKER 不计入 near_threat / core_under_fire（与 roles 撤退规则一致）；
+    仍出现在 positions 列表中便于调试。
+    """
     enemies = _enemies(turn)
     positions = [_as_position(e.position) for e in enemies]
-    near = [p for p in positions if manhattan(p, core_position) <= config.threat_radius]
-    adjacent_to_core = [p for p in positions if manhattan(p, core_position) <= 1]
+    combat_positions = [
+        _as_position(e.position)
+        for e in enemies
+        if _enemy_type(e) != "WORKER"
+    ]
+    near = [
+        p for p in combat_positions if manhattan(p, core_position) <= config.threat_radius
+    ]
+    adjacent_to_core = [
+        p for p in combat_positions if manhattan(p, core_position) <= 1
+    ]
+    enemy_core = None
+    for e in enemies:
+        if "CORE" in _enemy_type(e):
+            enemy_core = _as_position(e.position)
+            break
     return {
         "count": len(positions),
         "positions": positions,
+        "combat_positions": combat_positions,
         "near": near,
         "adjacent_to_core": adjacent_to_core,
         "has_near_threat": len(near) > 0,
         "core_under_fire": len(adjacent_to_core) > 0,
+        "enemy_core": enemy_core,
     }
 
 
@@ -294,7 +323,7 @@ def command_vanguards(
             _combat_last_move_dir.pop(ckey, None)
             continue
 
-        # 邻格有敌人 → sweep
+        # 邻格有敌人 → sweep（突击/守环均优先）
         adjacent_enemies = [
             e for e in enemies if is_adjacent(pos, _as_position(e.position))
         ]
@@ -308,11 +337,46 @@ def command_vanguards(
                     logs.append(f"vanguard:{uid}:sweep:{direction}")
                     continue
 
+        # STRIKE：朝敌方 Core 推进（不受本方 threat_radius 限制）
+        if assignment and assignment.role == Role.STRIKE:
+            strike_target = assignment.hint_target or getattr(
+                role_plan, "enemy_core_position", None
+            )
+            if strike_target is not None:
+                if is_adjacent(pos, strike_target):
+                    direction = direction_between(pos, strike_target)
+                    if direction and hasattr(v, "sweep"):
+                        v.sweep(_resolve_direction(direction))
+                        logs.append(f"vanguard:{uid}:strike_sweep:{direction}")
+                        continue
+                direction, repath = _guided_combat_step(
+                    pos,
+                    strike_target,
+                    obstacles,
+                    ckey,
+                    config,
+                    tick=tick,
+                    memory=memory,
+                    prefer_bfs=True,
+                )
+                if direction and hasattr(v, "move"):
+                    v.move(_resolve_direction(direction))
+                    tag = f"vanguard:{uid}:strike:{direction}"
+                    if repath:
+                        tag += ":repath"
+                    logs.append(tag)
+                    continue
+                if hasattr(v, "wait"):
+                    v.wait()
+                    logs.append(f"vanguard:{uid}:strike:wait")
+                    continue
+
         # 有近威胁：朝最近威胁移动（但不过度远离 Core）
         near_enemies = [
             e
             for e in enemies
-            if manhattan(_as_position(e.position), core_position) <= config.threat_radius
+            if _enemy_type(e) != "WORKER"
+            and manhattan(_as_position(e.position), core_position) <= config.threat_radius
         ]
         if near_enemies:
             target = _nearest_enemy_to(pos, near_enemies)
@@ -453,17 +517,31 @@ def command_rangers(
             _combat_last_move_dir.pop(ckey, None)
             continue
 
-        # 射程内敌人 → shoot
+        # 射程内敌人 → shoot（含突击途中）
         shootable = [
             e
             for e in enemies
             if is_in_range_cardinal_or_diag(pos, _as_position(e.position))
         ]
         if shootable:
-            # 优先打离 Core 近、HP 低的
+            # STRIKE 时优先敌 Core；否则优先打离己方 Core 近、HP 低的
+            strike_pos = None
+            if assignment and assignment.role == Role.STRIKE:
+                strike_pos = assignment.hint_target or getattr(
+                    role_plan, "enemy_core_position", None
+                )
+
             def shoot_key(e: Any) -> tuple:
                 ep = _as_position(e.position)
                 hp = int(getattr(e, "hp", 99) or 99)
+                is_core = 0 if "CORE" in _enemy_type(e) else 1
+                if strike_pos is not None:
+                    return (
+                        is_core,
+                        manhattan(ep, strike_pos),
+                        hp,
+                        str(getattr(e, "id", "")),
+                    )
                 return (manhattan(ep, core_position), hp, str(getattr(e, "id", "")))
 
             sorted_enemies = sorted(shootable, key=shoot_key)
@@ -497,9 +575,38 @@ def command_rangers(
                     logs.append(f"ranger:{uid}:shoot_cell:{_as_position(target.position)}")
                     continue
 
+        # STRIKE：朝敌方 Core 推进（可远离本方 Core）
+        if assignment and assignment.role == Role.STRIKE:
+            strike_target = assignment.hint_target or getattr(
+                role_plan, "enemy_core_position", None
+            )
+            if strike_target is not None:
+                direction, repath = _guided_combat_step(
+                    pos,
+                    strike_target,
+                    obstacles,
+                    ckey,
+                    config,
+                    tick=tick,
+                    memory=memory,
+                    prefer_bfs=True,
+                )
+                if direction and hasattr(r, "move"):
+                    r.move(_resolve_direction(direction))
+                    tag = f"ranger:{uid}:strike:{direction}"
+                    if repath:
+                        tag += ":repath"
+                    logs.append(tag)
+                    continue
+                if hasattr(r, "wait"):
+                    r.wait()
+                    logs.append(f"ranger:{uid}:strike:wait")
+                    continue
+
         # 可见威胁但不在射程：微调位置（仍靠近防守环）
-        if enemies:
-            target_e = _nearest_enemy_to(pos, enemies)
+        combat_enemies = [e for e in enemies if _enemy_type(e) != "WORKER"]
+        if combat_enemies:
+            target_e = _nearest_enemy_to(pos, combat_enemies)
             if target_e is not None:
                 tpos = _as_position(target_e.position)
                 # 尝试走到能射击的位置：先向威胁靠近一格，但不远离 Core 太多

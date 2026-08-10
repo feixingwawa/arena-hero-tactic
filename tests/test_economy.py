@@ -3161,3 +3161,118 @@ def test_TR_7_6_gc_256_ticks_cleanup_dead_workers() -> None:
         f"_deposit_progress 应为 {{{k1!r}}}，实际 {list(_deposit_progress.keys())}"
     )
 
+
+# ---------------------------------------------------------------------------
+# 战术规则：敌方工人不撤 / 资源满按比例生产
+# ---------------------------------------------------------------------------
+
+
+def test_worker_ignores_enemy_worker_no_retreat(config: TacticConfig) -> None:
+    """邻格敌方 WORKER 不触发 RETREAT，保持 harvester。"""
+    worker = StubUnit(position=(14, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[worker],
+        resource_cells={(20, 10)},
+        visible_enemies=[StubEnemy(position=(15, 10), unit_type="WORKER")],
+    )
+    plan = assign_roles(turn, config=config)
+    assert plan.assignments[0].role.value == "harvester"
+    assert plan.threat_positions == []
+    assert plan.has_near_threat is False
+
+
+def test_worker_still_retreats_from_combat_enemy(config: TacticConfig) -> None:
+    """邻格敌方 VANGUARD 仍触发 RETREAT。"""
+    worker = StubUnit(position=(14, 10), cargo=0, unit_type="WORKER")
+    turn = StubTurn(
+        resources=5,
+        core=StubCore(position=(10, 10)),
+        workers=[worker],
+        resource_cells={(20, 10)},
+        visible_enemies=[StubEnemy(position=(15, 10), unit_type="VANGUARD")],
+    )
+    plan = assign_roles(turn, config=config)
+    assert plan.assignments[0].role.value == "retreat"
+
+
+def test_choose_spawn_proportional_when_resources_full_beyond_targets() -> None:
+    """目标 12/4/4 已满但 max_population 更大且资源充裕 → 按比例继续生产。"""
+    cfg = TacticConfig(
+        max_population=30,
+        target_workers=12,
+        target_vanguards=4,
+        target_rangers=4,
+        reserve_resources=2,
+        early_game_pop=6,
+    )
+    workers = [
+        StubUnit(id=str(uuid4()), position=(10, 10), hp=2, cargo=0, unit_type="WORKER")
+        for _ in range(12)
+    ]
+    vanguards = [
+        StubUnit(id=str(uuid4()), position=(10, 10), hp=4, cargo=0, unit_type="VANGUARD")
+        for _ in range(4)
+    ]
+    rangers = [
+        StubUnit(id=str(uuid4()), position=(10, 10), hp=2, cargo=0, unit_type="RANGER")
+        for _ in range(4)
+    ]
+    core = StubCore(position=(10, 10), resources=1000, hp=5, shield=5)
+    turn = StubTurn(
+        tick=1,
+        resources=1000,
+        core=core,
+        workers=workers,
+        vanguards=vanguards,
+        rangers=rangers,
+    )
+    choice = choose_spawn(turn, cfg)
+    assert choice == "WORKER", f"equal ratio prefers WORKER, got {choice}"
+
+    # 工人偏多 → 优先补战斗单位
+    workers15 = [
+        StubUnit(id=str(uuid4()), position=(10, 10), hp=2, cargo=0, unit_type="WORKER")
+        for _ in range(15)
+    ]
+    turn2 = StubTurn(
+        tick=1,
+        resources=1000,
+        core=StubCore(position=(10, 10), resources=1000, hp=5, shield=5),
+        workers=workers15,
+        vanguards=vanguards,
+        rangers=rangers,
+    )
+    choice2 = choose_spawn(turn2, cfg)
+    assert choice2 in ("VANGUARD", "RANGER"), f"skew should fill combat, got {choice2}"
+
+
+def test_choose_spawn_full_complement_still_none_at_max_pop() -> None:
+    """max_population 硬顶：12/4/4=20 资源再多也不生产。"""
+    cfg = TacticConfig(
+        max_population=20,
+        target_workers=12,
+        target_vanguards=4,
+        target_rangers=4,
+    )
+    workers = [
+        StubUnit(id=str(uuid4()), position=(10, 10), hp=2, unit_type="WORKER")
+        for _ in range(12)
+    ]
+    vanguards = [
+        StubUnit(id=str(uuid4()), position=(10, 10), hp=4, unit_type="VANGUARD")
+        for _ in range(4)
+    ]
+    rangers = [
+        StubUnit(id=str(uuid4()), position=(10, 10), hp=2, unit_type="RANGER")
+        for _ in range(4)
+    ]
+    turn = StubTurn(
+        resources=1000,
+        core=StubCore(position=(10, 10), resources=1000),
+        workers=workers,
+        vanguards=vanguards,
+        rangers=rangers,
+    )
+    assert choose_spawn(turn, cfg) is None

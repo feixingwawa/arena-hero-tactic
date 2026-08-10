@@ -348,3 +348,58 @@ def test_vanguard_half_hp_triggers_heal_without_adjacent_enemy(
     assert a is not None
     assert a.role.value == "heal"
     assert a.hint_target == core_pos
+
+
+def test_strike_team_two_v_two_r_toward_enemy_core(config: TacticConfig) -> None:
+    """可见敌方 CORE 时分配 2 Vanguard + 2 Ranger 为 STRIKE 并朝其移动。"""
+    from bot.roles import Role, assign_roles
+
+    core_pos = (10, 10)
+    enemy_core = (20, 10)
+    vs = [
+        StubUnit(position=(11 + i, 10), hp=4, unit_type="VANGUARD") for i in range(3)
+    ]
+    rs = [
+        StubUnit(position=(11 + i, 12), hp=2, unit_type="RANGER") for i in range(3)
+    ]
+    turn = StubTurn(
+        core=StubCore(position=core_pos),
+        vanguards=vs,
+        rangers=rs,
+        visible_enemies=[StubEnemy(position=enemy_core, unit_type="CORE", hp=5)],
+    )
+    plan = assign_roles(turn, config=config)
+    assert plan.enemy_core_position == enemy_core
+    strike_v = [a for a in plan.assignments if a.role == Role.STRIKE and a.unit_type == "VANGUARD"]
+    strike_r = [a for a in plan.assignments if a.role == Role.STRIKE and a.unit_type == "RANGER"]
+    assert len(strike_v) == 2
+    assert len(strike_r) == 2
+    assert all(a.hint_target == enemy_core for a in strike_v + strike_r)
+    # 第 3 个仍 GUARD
+    guards = [a for a in plan.assignments if a.role == Role.GUARD]
+    assert len(guards) == 2  # 1V + 1R
+
+    v_logs = command_vanguards(turn, plan, config=config, core_position=core_pos)
+    r_logs = command_rangers(turn, plan, config=config, core_position=core_pos)
+    assert any(":strike:" in line for line in v_logs), v_logs
+    assert any(":strike:" in line for line in r_logs), r_logs
+    # 至少两名 V 在移动
+    moving_v = sum(1 for v in vs if v.action == "move")
+    assert moving_v >= 2, [(v.action, v.action_args) for v in vs]
+
+
+def test_assess_threats_ignores_enemy_worker_for_near(config: TacticConfig) -> None:
+    """敌方 WORKER 不计入 has_near_threat。"""
+    from bot.combat import assess_threats
+
+    turn = StubTurn(
+        core=StubCore(position=(10, 10)),
+        visible_enemies=[
+            StubEnemy(position=(12, 10), unit_type="WORKER"),
+            StubEnemy(position=(30, 30), unit_type="VANGUARD"),
+        ],
+    )
+    t = assess_threats(turn, (10, 10), config=config)
+    assert t["has_near_threat"] is False
+    assert t["count"] == 2
+    assert len(t["combat_positions"]) == 1

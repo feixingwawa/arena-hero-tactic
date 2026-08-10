@@ -11,7 +11,7 @@ from typing import Any, Optional, Sequence
 
 from bot.config import TacticConfig, DEFAULT_CONFIG
 from bot.memory import MemoryMap
-from bot.rules import unit_cost_for
+from bot.rules import core_resource_capacity, unit_cost_for
 from bot.pathing import (
     CARDINAL_DELTAS,
     NAME_TO_DELTA,
@@ -826,6 +826,35 @@ def choose_spawn(
         if _try_type("RANGER", ignore_reserve=True):
             return "RANGER"
 
+    # --- 资源满/充裕：按目标比例继续生产 W/V/R（可超 soft target，受 max_population 约束）---
+    # 「满」：resources >= capacity 的 80%，或绝对量足够再出一波编制
+    capacity = core_resource_capacity(pop)
+    res_full = resources >= max(int(capacity * 0.8), 1)
+    # 也把「远超最贵单位成本」视为充裕，避免 capacity 很小却不生产
+    max_unit_cost = max(
+        unit_cost_for("WORKER", pop + 1),
+        unit_cost_for("VANGUARD", pop + 1),
+        unit_cost_for("RANGER", pop + 1),
+    )
+    res_abundant = resources >= max(max_unit_cost * 2, config.reserve_resources + max_unit_cost)
+    if (res_full or res_abundant) and pop < config.max_population:
+        tw = max(1, int(config.target_workers))
+        tv = max(1, int(config.target_vanguards))
+        tr = max(1, int(config.target_rangers))
+        # 相对目标比例的缺口：越小越优先补
+        # 用 counts/target 比率，选最欠的类型
+        ratios = {
+            "WORKER": (w / tw) if tw else 999.0,
+            "VANGUARD": (v / tv) if tv else 999.0,
+            "RANGER": (r / tr) if tr else 999.0,
+        }
+        # 稳定次序：同比率时 W → V → R（经济优先）
+        order = sorted(ratios.keys(), key=lambda n: (ratios[n], {"WORKER": 0, "VANGUARD": 1, "RANGER": 2}[n]))
+        for name in order:
+            # 比例生产可吃 reserve，避免卡在 reserve 边界永远不造
+            if _try_type(name, ignore_reserve=True):
+                return name
+
     return None
 
 
@@ -863,9 +892,21 @@ def command_workers(
     }
     # 总人口（W+V+R）：本地探索度/人口阈值向信标推进用
     population = total_population(turn)
-    # 探索避敌：使用角色计划中的威胁位置（可见敌人）
+    # 探索避敌：使用角色计划中的威胁位置（战斗敌人，已忽略敌方 WORKER）
     enemy_positions: list[Position] = list(role_plan.threat_positions or [])
+    # 战斗敌人格作为软障碍：朝目的地寻路时绕开，而不是仅撤退回 Core
+    soft_enemy_obs: set[Position] = set(enemy_positions)
     tick = int(getattr(turn, "tick", 0) or 0)
+
+    def _path_obstacles_for_goal(goal: Optional[Position] = None) -> set[Position]:
+        """硬障碍 + 战斗敌人软障碍；目标格本身不挡（可走到矿/Core）。"""
+        obs: set[Position] = set(obstacles) | soft_enemy_obs
+        if goal is not None and goal in obs:
+            obs.discard(goal)
+        # 永不把己方 Core 当地形障碍
+        if core_position in obs:
+            obs.discard(core_position)
+        return obs
 
     # 资源目标去重：多个 worker 尽量分配不同资源点（本 tick）
     # 并与跨 tick `_claimed_targets` 合并，避免「一矿全员 to_resource」。
@@ -1105,7 +1146,7 @@ def command_workers(
                     direction, dep_tag = _return_deposit_step(
                         pos,
                         core_position,
-                        obstacles,
+                        _path_obstacles_for_goal(core_position),
                         wkey,
                         uid,
                         config,
@@ -1190,7 +1231,7 @@ def command_workers(
                 wkey = _worker_key(uid)
                 _set_intent(wkey, target=core_position, phase="retreat", role=str(role))
                 direction, repath = _guided_move(
-                    pos, core_position, obstacles, wkey, config, tick=tick, memory=memory
+                    pos, core_position, _path_obstacles_for_goal(core_position), wkey, config, tick=tick, memory=memory
                 )
                 if direction and hasattr(w, "move"):
                     w.move(_resolve_direction(w, direction))
@@ -1224,7 +1265,7 @@ def command_workers(
             direction, dep_tag = _return_deposit_step(
                 pos,
                 core_position,
-                obstacles,
+                _path_obstacles_for_goal(core_position),
                 wkey,
                 uid,
                 config,
@@ -1276,7 +1317,7 @@ def command_workers(
                 del _pending_return_mines[wkey]
             else:
                 direction, repath = _guided_move(
-                    pos, P, obstacles, wkey, config, tick=tick, memory=memory
+                    pos, P, _path_obstacles_for_goal(P), wkey, config, tick=tick, memory=memory
                 )
                 if direction and hasattr(w, "move"):
                     w.move(_resolve_direction(w, direction))
@@ -1306,7 +1347,7 @@ def command_workers(
                     logs.append(f"worker:{uid}:wait:bad_target")
             else:
                 direction, repath = _guided_move(
-                    pos, P, obstacles, wkey, config, tick=tick, memory=memory
+                    pos, P, _path_obstacles_for_goal(P), wkey, config, tick=tick, memory=memory
                 )
                 if direction and hasattr(w, "move"):
                     w.move(_resolve_direction(w, direction))
@@ -1366,7 +1407,7 @@ def command_workers(
             else:
                 wkey = _worker_key(uid)
                 direction, repath = _guided_move(
-                    pos, target, obstacles, wkey, config, tick=tick, memory=memory
+                    pos, target, _path_obstacles_for_goal(target), wkey, config, tick=tick, memory=memory
                 )
                 if direction and hasattr(w, "move"):
                     w.move(_resolve_direction(w, direction))
