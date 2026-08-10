@@ -218,13 +218,18 @@ def assign_roles(
         )
 
     # --- Vanguards：默认 GUARD ---
+    # 治疗阈值：至少 unit_heal_hp_threshold，且不低于 max_hp//2（V 满血 4 → ≤2 回城）
+    # 避免「只剩 1 血才撤」导致路上撞墙/阵亡；无邻格敌人时才 HEAL，贴身继续扫。
     vanguards = list(getattr(turn, "vanguards", None) or ())
+    v_heal_th = max(
+        int(config.unit_heal_hp_threshold),
+        max(1, int(config.vanguard_max_hp) // 2),
+    )
     for i, v in enumerate(vanguards):
         snap = snapshot_from_unit(v, "VANGUARD", config.vanguard_max_hp)
         role = Role.GUARD
         hint = None
-        if snap.hp <= config.unit_heal_hp_threshold and snap.hp < snap.max_hp:
-            # 严重受伤且无邻格敌人时回城
+        if snap.hp <= v_heal_th and snap.hp < snap.max_hp:
             adjacent_enemy = any(
                 manhattan(snap.position, ep) <= 1 for ep in enemies
             )
@@ -244,12 +249,17 @@ def assign_roles(
         )
 
     # --- Rangers：默认 GUARD ---
+    # Ranger max_hp=2 → 阈值 max(1, 1)=1，半血即回城
     rangers = list(getattr(turn, "rangers", None) or ())
+    r_heal_th = max(
+        int(config.unit_heal_hp_threshold),
+        max(1, int(config.ranger_max_hp) // 2),
+    )
     for r in rangers:
         snap = snapshot_from_unit(r, "RANGER", config.ranger_max_hp)
         role = Role.GUARD
         hint = None
-        if snap.hp <= config.unit_heal_hp_threshold and snap.hp < snap.max_hp:
+        if snap.hp <= r_heal_th and snap.hp < snap.max_hp:
             role = Role.HEAL
             hint = core_position
         plan.assignments.append(

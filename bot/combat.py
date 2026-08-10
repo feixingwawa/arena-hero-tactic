@@ -1,4 +1,9 @@
-"""战斗与防守模块：威胁评估、防守圈、sweep/shoot、治疗。"""
+"""战斗与防守模块：威胁评估、防守圈、sweep/shoot、治疗。
+
+Vanguard/Ranger 移动与 Worker 对齐：guided_step_toward + LoopTracker +
+memory.obstacles 合并，避免贪心 clamp 贴墙空转。受伤回 Core 治疗仅短暂
+同格 heal，下一决策 tick 非 HEAL 时 leave_core 立即让出。
+"""
 
 from __future__ import annotations
 
@@ -8,12 +13,14 @@ from uuid import UUID
 from bot.config import TacticConfig, DEFAULT_CONFIG
 from bot.pathing import (
     NAME_TO_DELTA,
+    LoopTracker,
     Position,
     add_pos,
     cells_toward_ring,
     clamp_step_toward,
     defense_ring_slots,
     direction_between,
+    guided_step_toward,
     is_adjacent,
     is_in_range_cardinal_or_diag,
     manhattan,
@@ -21,22 +28,27 @@ from bot.pathing import (
 )
 from bot.roles import Role, RolePlan, _as_position
 
+# 战斗单位与 Worker 同级的引导寻路状态（防贴墙空转 / 小范围绕圈）
+_combat_loop_trackers: dict[str, LoopTracker] = {}
+_combat_last_move_dir: dict[str, str] = {}
 
-def _pick_unused_slot(
-    slot_candidates: list[tuple[int,int]],
-    taken_positions: set[tuple[int,int]],
-) -> Optional[tuple[int,int]]:
-    """从 slot_candidates 中选第一个未被 taken 的；若全部占用则横向 +1 相位偏移再找一轮。"""
-    for slot in slot_candidates:
-        if slot not in taken_positions:
-            return slot
-    # 偏移一轮
-    for slot in slot_candidates:
-        alt = (slot[0]+1, slot[1])
-        if alt not in taken_positions: return alt
-        alt = (slot[0], slot[1]+1)
-        if alt not in taken_positions: return alt
-    return slot_candidates[0] if slot_candidates else None
+
+def _combat_key(kind: str, uid: Any) -> str:
+    return f"{kind}:{uid}"
+
+
+def _get_combat_tracker(ckey: str) -> LoopTracker:
+    st = _combat_loop_trackers.get(ckey)
+    if st is None:
+        st = LoopTracker()
+        _combat_loop_trackers[ckey] = st
+    return st
+
+
+def reset_combat_path_state() -> None:
+    """测试 / 会话清理：清空战斗单位寻路足迹。"""
+    _combat_loop_trackers.clear()
+    _combat_last_move_dir.clear()
 
 
 def _obstacle_cells(turn: Any) -> set[Position]:
@@ -44,6 +56,78 @@ def _obstacle_cells(turn: Any) -> set[Position]:
     if cells is None:
         return set()
     return {_as_position(c) for c in cells}
+
+
+def _merge_obstacles(turn: Any, memory: Any = None) -> set[Position]:
+    """可见障碍 + memory 永久障碍（与 economy._guided_move 一致）。"""
+    blocked = _obstacle_cells(turn)
+    if memory is not None:
+        mem_obs = getattr(memory, "obstacles", None)
+        if mem_obs is not None:
+            try:
+                blocked |= {_as_position(c) for c in mem_obs}
+            except Exception:
+                try:
+                    blocked |= set(mem_obs)
+                except Exception:
+                    pass
+    return blocked
+
+
+def _guided_combat_step(
+    pos: Position,
+    target: Position,
+    obstacles: set[Position],
+    ckey: str,
+    config: TacticConfig,
+    *,
+    tick: int = 0,
+    memory: Any = None,
+    prefer_bfs: bool = True,
+) -> tuple[Optional[str], bool]:
+    """战斗单位朝目标一步：LoopTracker + memory 障碍 + 短 BFS（对齐 Worker）。"""
+    if pos == target:
+        return None, False
+    tracker = _get_combat_tracker(ckey)
+    direction, new_last, did_repath = guided_step_toward(
+        pos,
+        target,
+        obstacles,
+        last_dir=_combat_last_move_dir.get(ckey),
+        prefer_bfs=prefer_bfs,
+        tracker=tracker,
+        memory=memory,
+        window=int(getattr(config, "loop_window_ticks", 12) or 12),
+        min_unique=int(getattr(config, "loop_min_unique", 4) or 4),
+        bbox_diameter_max=int(getattr(config, "loop_bbox_diameter", 3) or 3),
+        static_ticks=int(getattr(config, "loop_static_ticks", 4) or 4),
+        repath_cooldown=int(getattr(config, "loop_repath_cooldown", 5) or 5),
+        tick=tick,
+    )
+    if direction:
+        _combat_last_move_dir[ckey] = direction
+    elif new_last is None and did_repath:
+        _combat_last_move_dir.pop(ckey, None)
+    return direction, did_repath
+
+
+def _pick_unused_slot(
+    slot_candidates: list[tuple[int, int]],
+    taken_positions: set[tuple[int, int]],
+) -> Optional[tuple[int, int]]:
+    """从 slot_candidates 中选第一个未被 taken 的；若全部占用则横向 +1 相位偏移再找一轮。"""
+    for slot in slot_candidates:
+        if slot not in taken_positions:
+            return slot
+    # 偏移一轮
+    for slot in slot_candidates:
+        alt = (slot[0] + 1, slot[1])
+        if alt not in taken_positions:
+            return alt
+        alt = (slot[0], slot[1] + 1)
+        if alt not in taken_positions:
+            return alt
+    return slot_candidates[0] if slot_candidates else None
 
 
 def _leave_core_step(
@@ -137,8 +221,9 @@ def command_vanguards(
     role_plan: RolePlan,
     config: TacticConfig = DEFAULT_CONFIG,
     core_position: Optional[Position] = None,
+    memory: Any = None,
 ) -> list[str]:
-    """Vanguard：邻格 sweep，否则守环/朝威胁移动。"""
+    """Vanguard：邻格 sweep，否则守环/朝威胁移动；低血 HEAL 回 Core 后立刻让位。"""
     logs: list[str] = []
     core = getattr(turn, "core", None)
     if core_position is None:
@@ -147,34 +232,54 @@ def command_vanguards(
         core_position = _as_position(core.position)
 
     enemies = _enemies(turn)
-    obstacles = _obstacle_cells(turn)
+    obstacles = _merge_obstacles(turn, memory)
+    tick = int(getattr(turn, "tick", 0) or 0)
     vanguards = list(getattr(turn, "vanguards", None) or ())
     slots = defense_ring_slots(
         core_position,
         config.defense_radius,
         count=max(len(vanguards), 1),
-        phase=int(getattr(turn, "tick", 0) or 0) % 8,
+        phase=tick % 8,
     )
-    taken: set[tuple[int,int]] = set()
+    taken: set[tuple[int, int]] = set()
 
     for i, v in enumerate(vanguards):
         uid = v.id
+        ckey = _combat_key("vanguard", uid)
         assignment = role_plan.get(uid)
         pos = _as_position(v.position)
 
-        # 治疗回城（允许短暂与 Core 同格 heal；下 tick 非 HEAL 会 leave_core）
+        # 治疗回城：仅本 tick 在 Core 上 heal；下一 tick 非 HEAL 走 leave_core
         if assignment and assignment.role == Role.HEAL:
             if pos == core_position and hasattr(v, "heal"):
                 v.heal()
                 logs.append(f"vanguard:{uid}:heal")
+                # 足迹清掉，避免治疗后带着旧 route 卡死
+                _combat_loop_trackers.pop(ckey, None)
+                _combat_last_move_dir.pop(ckey, None)
             else:
-                direction = clamp_step_toward(pos, core_position, obstacles)
+                direction, repath = _guided_combat_step(
+                    pos,
+                    core_position,
+                    obstacles,
+                    ckey,
+                    config,
+                    tick=tick,
+                    memory=memory,
+                    prefer_bfs=True,
+                )
                 if direction and hasattr(v, "move"):
                     v.move(_resolve_direction(direction))
-                    logs.append(f"vanguard:{uid}:to_heal:{direction}")
+                    tag = f"vanguard:{uid}:to_heal:{direction}"
+                    if repath:
+                        tag += ":repath"
+                    logs.append(tag)
+                elif hasattr(v, "wait"):
+                    v.wait()
+                    logs.append(f"vanguard:{uid}:to_heal:wait")
             continue
 
-        # 禁止与 Core 重叠：立即移开（优先朝防守环）
+        # 禁止与 Core 重叠：立即移开（优先朝防守环）—— 治疗后不长期占 Core
         ring_pref = cells_toward_ring(pos, core_position, config.defense_radius)
         if _leave_core_step(
             v,
@@ -186,6 +291,7 @@ def command_vanguards(
             kind="vanguard",
             logs=logs,
         ):
+            _combat_last_move_dir.pop(ckey, None)
             continue
 
         # 邻格有敌人 → sweep
@@ -214,10 +320,22 @@ def command_vanguards(
                 tpos = _as_position(target.position)
                 # 限制：不要跑出 threat_radius + 2
                 if manhattan(pos, core_position) <= config.threat_radius + 2:
-                    direction = clamp_step_toward(pos, tpos, obstacles)
+                    direction, repath = _guided_combat_step(
+                        pos,
+                        tpos,
+                        obstacles,
+                        ckey,
+                        config,
+                        tick=tick,
+                        memory=memory,
+                        prefer_bfs=True,
+                    )
                     if direction and hasattr(v, "move"):
                         v.move(_resolve_direction(direction))
-                        logs.append(f"vanguard:{uid}:intercept:{direction}")
+                        tag = f"vanguard:{uid}:intercept:{direction}"
+                        if repath:
+                            tag += ":repath"
+                        logs.append(tag)
                         continue
 
         # 默认：守在防守环
@@ -235,10 +353,22 @@ def command_vanguards(
                 v.wait()
             logs.append(f"vanguard:{uid}:hold")
         else:
-            direction = clamp_step_toward(pos, slot, obstacles)
+            direction, repath = _guided_combat_step(
+                pos,
+                slot,
+                obstacles,
+                ckey,
+                config,
+                tick=tick,
+                memory=memory,
+                prefer_bfs=True,
+            )
             if direction and hasattr(v, "move"):
                 v.move(_resolve_direction(direction))
-                logs.append(f"vanguard:{uid}:to_ring:{direction}")
+                tag = f"vanguard:{uid}:to_ring:{direction}"
+                if repath:
+                    tag += ":repath"
+                logs.append(tag)
             elif hasattr(v, "wait"):
                 v.wait()
                 logs.append(f"vanguard:{uid}:wait")
@@ -251,8 +381,9 @@ def command_rangers(
     role_plan: RolePlan,
     config: TacticConfig = DEFAULT_CONFIG,
     core_position: Optional[Position] = None,
+    memory: Any = None,
 ) -> list[str]:
-    """Ranger：射程内 shoot，否则守外圈。"""
+    """Ranger：射程内 shoot，否则守外圈；低血 HEAL 回 Core 后立刻让位。"""
     logs: list[str] = []
     core = getattr(turn, "core", None)
     if core_position is None:
@@ -261,19 +392,21 @@ def command_rangers(
         core_position = _as_position(core.position)
 
     enemies = _enemies(turn)
-    obstacles = _obstacle_cells(turn)
+    obstacles = _merge_obstacles(turn, memory)
+    tick = int(getattr(turn, "tick", 0) or 0)
     rangers = list(getattr(turn, "rangers", None) or ())
     slots = defense_ring_slots(
         core_position,
         config.ranger_radius,
         count=max(len(rangers), 1),
-        phase=(int(getattr(turn, "tick", 0) or 0) + 3) % 8,
+        phase=(tick + 3) % 8,
     )
     ranger_fire_ledger: dict = {}
-    taken: set[tuple[int,int]] = set()
+    taken: set[tuple[int, int]] = set()
 
     for i, r in enumerate(rangers):
         uid = r.id
+        ckey = _combat_key("ranger", uid)
         assignment = role_plan.get(uid)
         pos = _as_position(r.position)
 
@@ -281,11 +414,28 @@ def command_rangers(
             if pos == core_position and hasattr(r, "heal"):
                 r.heal()
                 logs.append(f"ranger:{uid}:heal")
+                _combat_loop_trackers.pop(ckey, None)
+                _combat_last_move_dir.pop(ckey, None)
             else:
-                direction = clamp_step_toward(pos, core_position, obstacles)
+                direction, repath = _guided_combat_step(
+                    pos,
+                    core_position,
+                    obstacles,
+                    ckey,
+                    config,
+                    tick=tick,
+                    memory=memory,
+                    prefer_bfs=True,
+                )
                 if direction and hasattr(r, "move"):
                     r.move(_resolve_direction(direction))
-                    logs.append(f"ranger:{uid}:to_heal:{direction}")
+                    tag = f"ranger:{uid}:to_heal:{direction}"
+                    if repath:
+                        tag += ":repath"
+                    logs.append(tag)
+                elif hasattr(r, "wait"):
+                    r.wait()
+                    logs.append(f"ranger:{uid}:to_heal:wait")
             continue
 
         # 禁止与 Core 重叠：立即移开（优先朝 Ranger 环）
@@ -300,6 +450,7 @@ def command_rangers(
             kind="ranger",
             logs=logs,
         ):
+            _combat_last_move_dir.pop(ckey, None)
             continue
 
         # 射程内敌人 → shoot
@@ -337,7 +488,9 @@ def command_rangers(
                         # stub 可能签名不同，退回 shoot_cell
                         if hasattr(r, "shoot_cell"):
                             r.shoot_cell(_as_position(target.position))
-                            logs.append(f"ranger:{uid}:shoot_cell:{_as_position(target.position)}")
+                            logs.append(
+                                f"ranger:{uid}:shoot_cell:{_as_position(target.position)}"
+                            )
                     continue
                 if hasattr(r, "shoot_cell"):
                     r.shoot_cell(_as_position(target.position))
@@ -351,11 +504,22 @@ def command_rangers(
                 tpos = _as_position(target_e.position)
                 # 尝试走到能射击的位置：先向威胁靠近一格，但不远离 Core 太多
                 if manhattan(pos, core_position) <= config.ranger_radius + 2:
-                    direction = clamp_step_toward(pos, tpos, obstacles)
+                    direction, repath = _guided_combat_step(
+                        pos,
+                        tpos,
+                        obstacles,
+                        ckey,
+                        config,
+                        tick=tick,
+                        memory=memory,
+                        prefer_bfs=True,
+                    )
                     if direction and hasattr(r, "move"):
-                        wpos = pos  # 仅一步
                         r.move(_resolve_direction(direction))
-                        logs.append(f"ranger:{uid}:reposition:{direction}")
+                        tag = f"ranger:{uid}:reposition:{direction}"
+                        if repath:
+                            tag += ":repath"
+                        logs.append(tag)
                         continue
 
         # 默认守外圈
@@ -373,10 +537,22 @@ def command_rangers(
                 r.wait()
             logs.append(f"ranger:{uid}:hold")
         else:
-            direction = clamp_step_toward(pos, slot, obstacles)
+            direction, repath = _guided_combat_step(
+                pos,
+                slot,
+                obstacles,
+                ckey,
+                config,
+                tick=tick,
+                memory=memory,
+                prefer_bfs=True,
+            )
             if direction and hasattr(r, "move"):
                 r.move(_resolve_direction(direction))
-                logs.append(f"ranger:{uid}:to_ring:{direction}")
+                tag = f"ranger:{uid}:to_ring:{direction}"
+                if repath:
+                    tag += ":repath"
+                logs.append(tag)
             elif hasattr(r, "wait"):
                 r.wait()
                 logs.append(f"ranger:{uid}:wait")

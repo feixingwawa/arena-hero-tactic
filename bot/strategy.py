@@ -173,12 +173,12 @@ def decide(
         f":min_core={min_core_d}:min_w={min_worker_d}:res_vis={resource_n}"
     )
 
-    # 2) 战斗单位优先（有威胁时先排攻击/就位）
+    # 2) 战斗单位优先（有威胁时先排攻击/就位；与 Worker 共用 memory 障碍寻路）
     v_logs = command_vanguards(
-        turn, role_plan, config=config, core_position=core_pos
+        turn, role_plan, config=config, core_position=core_pos, memory=mem
     )
     r_logs = command_rangers(
-        turn, role_plan, config=config, core_position=core_pos
+        turn, role_plan, config=config, core_position=core_pos, memory=mem
     )
     result.logs.extend(v_logs)
     result.logs.extend(r_logs)

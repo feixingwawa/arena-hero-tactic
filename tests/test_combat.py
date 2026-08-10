@@ -239,3 +239,112 @@ def test_TR_7_3_ranger_fire_ledger_overkill(config: TacticConfig) -> None:
     assert len(set(shot_ids)) <= 2, f"shoot 目标超过 2 个敌人: {shot_ids}"
     # 至少有不超过 2 次实际 shoot（因为两个敌人各只需要 1 次伤害）
     assert len(shot_ids) <= 2, f"实际 shoot 次数 {len(shot_ids)} 超过敌人 HP 总和: {shot_ids}"
+
+
+def test_vanguard_guided_detours_around_wall(config: TacticConfig) -> None:
+    """Vanguard 回城治疗应绕过墙（memory/可见障碍），不贪心撞墙。"""
+    from bot.memory import MemoryMap
+    from bot.pathing import NAME_TO_DELTA, add_pos
+
+    core_pos = (10, 10)
+    # 起点在 Core 右侧，中间 (11,10) 是墙 → 贪心会 RIGHT 撞墙
+    start = (12, 10)
+    wall = (11, 10)
+    vanguard = StubUnit(position=start, hp=1, unit_type="VANGUARD")
+    turn = StubTurn(
+        tick=5,
+        core=StubCore(position=core_pos),
+        vanguards=[vanguard],
+        visible_enemies=[],
+        obstacle_cells=[wall],
+    )
+    mem = MemoryMap()
+    mem.obstacles.add(wall)
+    plan = assign_roles(turn, config=config)
+    assert plan.get(vanguard.id) is not None
+    assert plan.get(vanguard.id).role.value == "heal"  # type: ignore[union-attr]
+    logs = command_vanguards(
+        turn, plan, config=config, core_position=core_pos, memory=mem
+    )
+    assert vanguard.action == "move", (vanguard.action, logs)
+    arg = vanguard.action_args
+    name = getattr(arg, "value", arg) if arg is not None else None
+    name = str(name) if name is not None else ""
+    assert name in NAME_TO_DELTA, (arg, name, logs)
+    nxt = add_pos(start, NAME_TO_DELTA[name])
+    assert nxt != wall, f"不应走进墙 {wall}: dir={name} nxt={nxt} logs={logs}"
+    assert any("to_heal" in line for line in logs), logs
+
+
+def test_vanguard_heals_at_core_then_leaves_next_tick(config: TacticConfig) -> None:
+    """受伤 Vanguard 在 Core 上 heal；满血下一 tick 必须 leave_core，不长期占 Core。"""
+    from bot.pathing import NAME_TO_DELTA
+
+    core_pos = (10, 10)
+    # tick1: 低血在 Core → heal
+    v1 = StubUnit(position=core_pos, hp=1, unit_type="VANGUARD")
+    turn1 = StubTurn(
+        tick=1,
+        core=StubCore(position=core_pos),
+        vanguards=[v1],
+        visible_enemies=[],
+    )
+    plan1 = assign_roles(turn1, config=config)
+    logs1 = command_vanguards(turn1, plan1, config=config, core_position=core_pos)
+    assert v1.action == "heal", (v1.action, logs1)
+    assert any(":heal" in line for line in logs1), logs1
+
+    # tick2: 已满血仍在 Core → leave_core（非 HEAL）
+    v2 = StubUnit(position=core_pos, hp=4, unit_type="VANGUARD")
+    turn2 = StubTurn(
+        tick=2,
+        core=StubCore(position=core_pos),
+        vanguards=[v2],
+        visible_enemies=[],
+    )
+    plan2 = assign_roles(turn2, config=config)
+    assert plan2.get(v2.id) is not None
+    assert plan2.get(v2.id).role.value != "heal"  # type: ignore[union-attr]
+    logs2 = command_vanguards(turn2, plan2, config=config, core_position=core_pos)
+    assert v2.action == "move", (v2.action, logs2)
+    assert any("leave_core" in line for line in logs2), logs2
+    arg = v2.action_args
+    name = getattr(arg, "value", arg) if arg is not None else None
+    name = str(name) if name is not None else ""
+    assert name in NAME_TO_DELTA, (arg, name, logs2)
+
+
+def test_ranger_heal_role_and_guided_to_core(config: TacticConfig) -> None:
+    """Ranger 半血触发 HEAL，用引导寻路朝 Core 移动。"""
+    core_pos = (10, 10)
+    ranger = StubUnit(position=(14, 10), hp=1, unit_type="RANGER")
+    turn = StubTurn(
+        tick=3,
+        core=StubCore(position=core_pos),
+        rangers=[ranger],
+        visible_enemies=[],
+    )
+    plan = assign_roles(turn, config=config)
+    assert plan.get(ranger.id) is not None
+    assert plan.get(ranger.id).role.value == "heal"  # type: ignore[union-attr]
+    logs = command_rangers(turn, plan, config=config, core_position=core_pos)
+    assert ranger.action == "move", (ranger.action, logs)
+    assert any("to_heal" in line for line in logs), logs
+
+
+def test_vanguard_half_hp_triggers_heal_without_adjacent_enemy(
+    config: TacticConfig,
+) -> None:
+    """Vanguard max_hp=4 时 hp<=2 且无邻敌 → HEAL（半血阈值）。"""
+    core_pos = (10, 10)
+    v = StubUnit(position=(13, 10), hp=2, unit_type="VANGUARD")
+    turn = StubTurn(
+        core=StubCore(position=core_pos),
+        vanguards=[v],
+        visible_enemies=[],
+    )
+    plan = assign_roles(turn, config=config)
+    a = plan.get(v.id)
+    assert a is not None
+    assert a.role.value == "heal"
+    assert a.hint_target == core_pos

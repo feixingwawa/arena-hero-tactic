@@ -23,6 +23,7 @@ def _clean_global_state() -> None:
     测试必须清理，避免跨测试污染。
     """
     from bot.config import DEFAULT_CONFIG
+    from bot.combat import reset_combat_path_state
     from bot.economy import (
         _deposit_progress,
         _last_move_dir,
@@ -39,6 +40,7 @@ def _clean_global_state() -> None:
     _loop_trackers.clear()
     _pending_return_mines.clear()
     _deposit_progress.clear()
+    reset_combat_path_state()
     health_tracker["last_deposit_tick"] = 0
     health_tracker["stall_ticks"] = 0
     WORLD_MEMORY.resource_points.clear()
