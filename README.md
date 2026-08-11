@@ -14,7 +14,8 @@
 **没有官方通关**——有效目标是 Core 存活、资源正循环、编制扩张；Champion Beacon 是可选双倍采集乘数。
 
 详细理解见：[`docs/GAME_UNDERSTANDING.md`](docs/GAME_UNDERSTANDING.md)
-战术原则见：[`docs/STRATEGY.md`](docs/STRATEGY.md)
+战术原则见：[`docs/STRATEGY.md`](docs/STRATEGY.md)  
+变更记录见：[`CHANGELOG.md`](CHANGELOG.md)
 
 ### v2 升级速览
 
@@ -47,6 +48,7 @@
 ```
 arena-hero-tactic/
   README.md
+  CHANGELOG.md           # 版本变更记录（Keep a Changelog）
   deploy.bat / deploy.sh # 一键部署入口（Windows 双击 / Unix）
   docs/
     GAME_UNDERSTANDING.md   # 游戏怎么运行 / 目标 / Agent 职责
