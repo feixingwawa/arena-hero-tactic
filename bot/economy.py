@@ -23,6 +23,7 @@ from bot.pathing import (
     bfs_next_step,
     chunk_of,
     clamp_step_toward_memo,
+    cells_toward_ring,
     estimate_path_steps,
     guided_step_toward,
     manhattan,
@@ -35,6 +36,7 @@ from bot.pathing import (
 from bot.roles import (
     Role,
     RolePlan,
+    collect_enemy_positions,
     count_by_type,
     total_population,
     _as_position,
@@ -892,20 +894,45 @@ def command_workers(
     }
     # 总人口（W+V+R）：本地探索度/人口阈值向信标推进用
     population = total_population(turn)
-    # 探索避敌：使用角色计划中的威胁位置（战斗敌人，已忽略敌方 WORKER）
-    enemy_positions: list[Position] = list(role_plan.threat_positions or [])
-    # 战斗敌人格作为软障碍：朝目的地寻路时绕开，而不是仅撤退回 Core
+    # 撤退威胁仍只用战斗单位（role_plan.threat_positions 不含敌方 WORKER）
+    # 寻路/探索绕行：含敌方 WORKER，避免矿工对撞叠格却不绕开
+    combat_enemy_positions: list[Position] = list(role_plan.threat_positions or [])
+    enemy_positions: list[Position] = list(collect_enemy_positions(turn))
+    if not enemy_positions and combat_enemy_positions:
+        # 兼容无 visible_enemies 仅注入 threat 的旧单测
+        enemy_positions = list(combat_enemy_positions)
     soft_enemy_obs: set[Position] = set(enemy_positions)
     tick = int(getattr(turn, "tick", 0) or 0)
 
     def _path_obstacles_for_goal(goal: Optional[Position] = None) -> set[Position]:
-        """硬障碍 + 战斗敌人软障碍；目标格本身不挡（可走到矿/Core）。"""
+        """硬障碍 + 可见敌人（含敌方 WORKER）软障碍；目标格本身不挡。"""
         obs: set[Position] = set(obstacles) | soft_enemy_obs
         if goal is not None and goal in obs:
             obs.discard(goal)
         # 永不把己方 Core 当地形障碍
         if core_position in obs:
             obs.discard(core_position)
+        return obs
+
+    def _deposit_path_obstacles(self_pos: Position, w_uid: Any = None) -> set[Position]:
+        """交付寻路：绕开其它己方单位（除自己与 Core），减少核周叠堵。"""
+        obs = _path_obstacles_for_goal(core_position)
+        for ox in workers:
+            if w_uid is not None and ox.id == w_uid:
+                continue
+            op = _as_position(ox.position)
+            if op == self_pos or op == core_position:
+                continue
+            # 满货自己人仍挡路：逼分散进核，避免全员叠同一邻格 escape:stall
+            obs.add(op)
+        # 战斗单位也当软障
+        for ox in list(getattr(turn, "vanguards", None) or ()) + list(
+            getattr(turn, "rangers", None) or ()
+        ):
+            op = _as_position(ox.position)
+            if op == core_position:
+                continue
+            obs.add(op)
         return obs
 
     # 资源目标去重：多个 worker 尽量分配不同资源点（本 tick）
@@ -1146,7 +1173,7 @@ def command_workers(
                     direction, dep_tag = _return_deposit_step(
                         pos,
                         core_position,
-                        _path_obstacles_for_goal(core_position),
+                        _deposit_path_obstacles(pos, uid),
                         wkey,
                         uid,
                         config,
@@ -1169,6 +1196,10 @@ def command_workers(
                     _last_move_dir.pop(wkey, None)
                     _clear_deposit_progress(wkey)
                 elif role == Role.HEAL and hasattr(w, "heal"):
+                    # 上核即 heal：Worker 一 tick 回满。禁止因「场上有人满货」
+                    # 先 yield_core——线上任意 deposit 工人都会导致核↔邻格抖动、
+                    # 永远 heal 不到（Dashboard 终点也像停在核心上一格）。
+                    # 满血后下一 tick 不再是 HEAL，自然让出 Core 给 deposit。
                     _set_intent(wkey, target=core_position, phase="heal", role=str(role))
                     w.heal()
                     logs.append(f"worker:{uid}:heal_at_core")
@@ -1229,19 +1260,84 @@ def command_workers(
                         )
             else:
                 wkey = _worker_key(uid)
-                _set_intent(wkey, target=core_position, phase="retreat", role=str(role))
-                direction, repath = _guided_move(
-                    pos, core_position, _path_obstacles_for_goal(core_position), wkey, config, tick=tick, memory=memory
-                )
-                if direction and hasattr(w, "move"):
-                    w.move(_resolve_direction(w, direction))
-                    tag = f"worker:{uid}:retreat:{direction}"
-                    if repath:
-                        tag += ":repath:loop"
-                    logs.append(tag)
-                elif hasattr(w, "wait"):
-                    w.wait()
-                    logs.append(f"worker:{uid}:wait")
+                # 空货 RETREAT：只撤到 Core 外围 hold 半径，禁止踩核堵 deposit。
+                # HEAL / 满货仍可走向 Core（满货在上方已转 return_deposit）。
+                hold_r = max(1, int(getattr(config, "retreat_hold_radius", 2) or 2))
+                man_core = manhattan(pos, core_position)
+                empty_retreat = role == Role.RETREAT and cargo <= 0
+                if empty_retreat and man_core <= hold_r:
+                    # 已在 hold 带：外散 / 避敌，不朝 Core 再进一步
+                    leave_dir = None
+                    best_score = -10**9
+                    for name, delta in NAME_TO_DELTA.items():
+                        nxt = add_pos(pos, delta)
+                        if nxt in obstacles or nxt == core_position:
+                            continue
+                        if enemy_positions:
+                            d_en = min(manhattan(nxt, ep) for ep in enemy_positions)
+                        else:
+                            d_en = 99
+                        d_core = manhattan(nxt, core_position)
+                        # 优先远离敌人，其次略拉开与 Core 的距离（腾核周）
+                        score = d_en * 100 + d_core
+                        if score > best_score:
+                            best_score = score
+                            leave_dir = name
+                    if leave_dir and hasattr(w, "move"):
+                        _set_intent(
+                            wkey,
+                            target=core_position,
+                            phase="retreat_hold",
+                            role=str(role),
+                        )
+                        w.move(_resolve_direction(w, leave_dir))
+                        _last_move_dir[wkey] = leave_dir
+                        logs.append(f"worker:{uid}:retreat_hold:{leave_dir}")
+                    else:
+                        # 无路可散：恢复探索，禁止 wait 堵门
+                        logs.extend(
+                            _explore_spiral_step(
+                                w=w,
+                                workers=workers,
+                                wkey=wkey,
+                                uid=uid,
+                                pos=pos,
+                                core_position=core_position,
+                                obstacles=obstacles,
+                                enemy_positions=enemy_positions,
+                                config=config,
+                                memory=memory,
+                                tick=tick,
+                                population=population,
+                            )
+                        )
+                else:
+                    # 空货 RETREAT → hold 环；HEAL 始终目标 Core（须踩核才能 heal）。
+                    # 禁止再把 HEAL 改到 heal_hold：终点会停在「核心上一格」，单位到不了核。
+                    if empty_retreat:
+                        goal = cells_toward_ring(pos, core_position, hold_r)
+                        phase = "retreat_to_hold"
+                    else:
+                        goal = core_position
+                        phase = "retreat" if role == Role.RETREAT else "heal"
+                    _set_intent(wkey, target=goal, phase=phase, role=str(role))
+                    path_obs = _path_obstacles_for_goal(goal)
+                    # 空货撤退：Core 也当软障，避免路径穿核
+                    if empty_retreat:
+                        path_obs = set(path_obs)
+                        path_obs.add(core_position)
+                    direction, repath = _guided_move(
+                        pos, goal, path_obs, wkey, config, tick=tick, memory=memory
+                    )
+                    if direction and hasattr(w, "move"):
+                        w.move(_resolve_direction(w, direction))
+                        tag = f"worker:{uid}:{phase}:{direction}"
+                        if repath:
+                            tag += ":repath:loop"
+                        logs.append(tag)
+                    elif hasattr(w, "wait"):
+                        w.wait()
+                        logs.append(f"worker:{uid}:wait")
             continue
 
         # 有货物且在 Core → deposit
@@ -1265,7 +1361,7 @@ def command_workers(
             direction, dep_tag = _return_deposit_step(
                 pos,
                 core_position,
-                _path_obstacles_for_goal(core_position),
+                _deposit_path_obstacles(pos, uid),
                 wkey,
                 uid,
                 config,
@@ -1574,13 +1670,13 @@ def _beacon_push_ready(
     memory: Optional[MemoryMap],
     population: int,
 ) -> bool:
-    """本地探索度 ≥ 阈值 **或** 人口 ≥ 阈值 → 应向信标推进。"""
+    """本地探索度 ≥ 阈值 **并且** 人口 ≥ 阈值 → 应向信标推进。"""
     pop_th = int(getattr(config, "beacon_push_population", 10) or 10)
-    if int(population) >= pop_th:
-        return True
     ratio_th = float(getattr(config, "beacon_push_explore_ratio", 0.8) or 0.8)
     radius = max(1, int(getattr(config, "spiral_max_ring", 24) or 24))
-    return _local_explore_ratio(memory, core_position, radius) >= ratio_th
+    pop_ok = int(population) >= pop_th
+    explore_ok = _local_explore_ratio(memory, core_position, radius) >= ratio_th
+    return pop_ok and explore_ok
 
 
 def _beacon_chase_allowed(
@@ -1596,9 +1692,8 @@ def _beacon_chase_allowed(
     - Beacon 缺失 → False
     - Core→Beacon 曼哈顿 > beacon_max_chase → False（默认极大≈不限距）
     - 允许条件（满足其一即可）：
-      1) 总人口 ≥ beacon_push_population（默认 10）
-      2) 本地探索度 ≥ beacon_push_explore_ratio（默认 0.8）
-      3) worker_count ≥ beacon_min_workers（早期 dedicated 兼容）
+      1) 探索度 ≥ 阈值 **且** 总人口 ≥ 阈值（_beacon_push_ready）
+      2) worker_count ≥ beacon_min_workers（早期 dedicated 兼容）
     """
     beacon = config.beacon_position
     if beacon is None:
@@ -2001,10 +2096,10 @@ def _explore_spiral_step(
             st.target = None
             st.stalled_ticks = 0
 
-    # ---- Beacon 策略（混合高效 + 探索度/人口推进）----
+    # ---- Beacon 策略（混合高效 + 探索度且人口推进）----
     # 1) 远距 / 未满足 chase：禁止 dedicated，已 dedicated 也降级 local
     # 2) chase_ok + widx==0：专职 dedicated beacon
-    # 3) 本地探索度≥阈值 或 人口≥阈值：空闲探索 Worker 集体 phase=beacon
+    # 3) 探索度≥阈值 **且** 人口≥阈值：空闲探索 Worker 集体 phase=beacon
     # 4) 非 dedicated 残留 beacon：仅 chase 不允许时强制回 local；push_ready 保留
     if st.dedicated and not chase_ok:
         tag = "beacon_abort:far" if config.beacon_position is not None else "beacon_abort:gone"
@@ -2020,7 +2115,7 @@ def _explore_spiral_step(
     elif st.dedicated and chase_ok and config.beacon_position is not None:
         st.phase = "beacon"
     elif push_ready and not st.dedicated and st.phase != "beacon":
-        # 中后期：探索度/人口达标 → 非 dedicated 也向信标推进
+        # 中后期：探索度 **且** 人口达标 → 非 dedicated 也向信标推进
         st.phase = "beacon"
         st.target = None
         st.stalled_ticks = 0

@@ -500,7 +500,11 @@ def _bfs_path(
 def _downsample_waypoints(
     wps: list[list[int]], *, max_points: int = 80
 ) -> list[list[int]]:
-    """过密路点降采样，保留首尾与转折，便于前端绘制。"""
+    """过密路点降采样，保留首尾与转折，便于前端绘制。
+
+    **禁止**抽掉拐点后留下非四连通邻接（否则 canvas lineTo 会画成斜线）。
+    降采样后必须再经 ``_ensure_cardinal_chain``。
+    """
     if len(wps) <= max_points:
         return wps
     keep = {0, len(wps) - 1}
@@ -523,7 +527,116 @@ def _downsample_waypoints(
         if idxs[-1] not in core:
             core.append(idxs[-1])
         idxs = sorted(set(core))
-    return [wps[i] for i in idxs]
+    return _ensure_cardinal_chain([wps[i] for i in idxs])
+
+
+def _manhattan_staircase(
+    a: tuple[int, int],
+    b: tuple[int, int],
+    *,
+    obstacles: Optional[set[tuple[int, int]]] = None,
+    prefer_horizontal_first: bool = True,
+) -> list[list[int]]:
+    """在 a→b 之间插入四连通阶梯（不含 a，含 b）。
+
+    用于滤障删点 / 降采样后避免 canvas 直接斜线。若某步踩障则换轴顺序；
+    仍无法前进则停止（不穿障）。
+    """
+    ax, ay = int(a[0]), int(a[1])
+    bx, by = int(b[0]), int(b[1])
+    if (ax, ay) == (bx, by):
+        return []
+    hard = obstacles or set()
+    out: list[list[int]] = []
+    x, y = ax, ay
+
+    def _try_axis(h_first: bool) -> list[list[int]]:
+        cx, cy = ax, ay
+        pts: list[list[int]] = []
+        # 限制步数，防止异常坐标爆炸
+        budget = abs(bx - ax) + abs(by - ay) + 2
+        while (cx, cy) != (bx, by) and budget > 0:
+            budget -= 1
+            moved = False
+            order = []
+            if h_first:
+                if cx != bx:
+                    order.append((1 if bx > cx else -1, 0))
+                if cy != by:
+                    order.append((0, 1 if by > cy else -1))
+            else:
+                if cy != by:
+                    order.append((0, 1 if by > cy else -1))
+                if cx != bx:
+                    order.append((1 if bx > cx else -1, 0))
+            for dx, dy in order:
+                nx, ny = cx + dx, cy + dy
+                if (nx, ny) in hard and (nx, ny) != (bx, by):
+                    continue
+                # 终点若在障上仍允许最后一格由调用方决定；此处不主动踏障
+                if (nx, ny) in hard:
+                    continue
+                cx, cy = nx, ny
+                pts.append([cx, cy])
+                moved = True
+                break
+            if not moved:
+                break
+        return pts
+
+    first = _try_axis(prefer_horizontal_first)
+    if first and first[-1] == [bx, by]:
+        return first
+    second = _try_axis(not prefer_horizontal_first)
+    if second and second[-1] == [bx, by]:
+        return second
+    # 退路：无障阶梯（仅可视化补全；穿障由 filter 上游尽量避免）
+    x, y = ax, ay
+    while x != bx:
+        x += 1 if bx > x else -1
+        out.append([x, y])
+    while y != by:
+        y += 1 if by > y else -1
+        out.append([x, y])
+    return out
+
+
+def _ensure_cardinal_chain(
+    wps: list[list[int]],
+    *,
+    obstacles: Optional[set[tuple[int, int]]] = None,
+    max_points: int = 160,
+) -> list[list[int]]:
+    """保证相邻路点均为四连通一步；空隙用曼哈顿阶梯填满。
+
+    Dashboard 黄线 = 可执行步序列；禁止出现 (dx,dy) 同时非 0 的斜跳。
+    """
+    if not wps:
+        return wps
+    out: list[list[int]] = [[int(wps[0][0]), int(wps[0][1])]]
+    for p in wps[1:]:
+        tx, ty = int(p[0]), int(p[1])
+        if out[-1] == [tx, ty]:
+            continue
+        lx, ly = out[-1][0], out[-1][1]
+        dx, dy = abs(tx - lx), abs(ty - ly)
+        if dx + dy == 1:
+            out.append([tx, ty])
+        elif dx + dy == 0:
+            continue
+        else:
+            # 非邻接（含对角/远跳）：展开为四连通阶梯
+            fill = _manhattan_staircase(
+                (lx, ly), (tx, ty), obstacles=obstacles
+            )
+            for q in fill:
+                if out[-1] != q:
+                    out.append(q)
+                if len(out) >= max_points:
+                    return out
+        if len(out) >= max_points:
+            break
+    return out
 
 
 def _filter_obstacle_waypoints(
@@ -536,22 +649,24 @@ def _filter_obstacle_waypoints(
     """剥离路径中的障碍格；禁止画线与障碍重合。
 
     仅保留起点（单位当前格，即使异常叠障也要有起点），其余障碍格一律剔除。
+    剔除后若出现非四连通空隙，用自由格阶梯补全（仍不踏障），避免前端斜线。
     目的地菱形由前端 destination 单独绘制，不依赖 waypoints 含 target 障格。
     """
     if not wps:
         return wps
-    out: list[list[int]] = []
+    raw: list[list[int]] = []
     for p in wps:
         t = (int(p[0]), int(p[1]))
         # 除 origin 外，障碍格一律不进折线
         if t in obstacles and t != origin:
             continue
-        if out and out[-1] == [t[0], t[1]]:
+        if raw and raw[-1] == [t[0], t[1]]:
             continue
-        out.append([t[0], t[1]])
-    if not out:
+        raw.append([t[0], t[1]])
+    if not raw:
         return [[origin[0], origin[1]]]
-    return out
+    # 滤障可能造成跳跃：强制四连通阶梯（绕开 hard）
+    return _ensure_cardinal_chain(raw, obstacles=obstacles, max_points=160)
 
 
 def _runtime_expand_cap(man: int) -> int:

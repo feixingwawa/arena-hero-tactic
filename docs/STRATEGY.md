@@ -69,8 +69,8 @@ target_rangers: int = 4
 # Beacon
 beacon_max_chase: int = 10000       # Core→Beacon 超距放弃（默认≈不限）
 beacon_min_workers: int = 3         # 早期全员采
-beacon_push_population: int = 10    # 人口达标向信标推进
-beacon_push_explore_ratio: float = 0.8  # 本地探索度达标向信标推进
+beacon_push_population: int = 10    # 与探索度同时达标才集体推进
+beacon_push_explore_ratio: float = 0.8  # 探索度≥此值 且 人口≥阈值 → 向信标
 # 探索
 spiral_base_ring: int = 3
 spiral_max_ring: int = 24

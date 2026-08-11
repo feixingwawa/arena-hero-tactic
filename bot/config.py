@@ -25,6 +25,8 @@ class TacticConfig:
         target_workers / target_vanguards / target_rangers: 编制目标（默认 12/4/4）。
         defense_radius / ranger_radius / threat_radius: 防守与威胁半径。
         retreat_adjacent / retreat_radius: Worker 遇敌撤退阈值。
+        retreat_hold_radius: 空货撤退逼近 Core 的停靠距离（不进核）。
+        max_core_healers: 同时回 Core 治疗的战斗单位上限（V+R 合计）。
         core_heal_hp_threshold / core_shield_threshold / unit_heal_hp_threshold: 治疗阈值。
         reserve_resources: spawn 前应急预留。
         early_game_pop: 低于此人口时 reserve=0，加速首批 Worker。
@@ -36,8 +38,8 @@ class TacticConfig:
         beacon_step_radius: Beacon 阶段单步目标距离。
         beacon_max_chase: Core→Beacon 曼哈顿超过此值则**全体不追**（默认极大≈不限，仍可由单测收紧）。
         beacon_min_workers: 至少 N 名 Worker 才允许 1 人 dedicated（否则全员 local）。
-        beacon_push_population: 总人口 ≥ 此值时允许/推动向 Beacon 推进。
-        beacon_push_explore_ratio: 本地（Core 周围 spiral_max_ring）探索度 ≥ 此比例时推动向 Beacon。
+        beacon_push_population: 向信标推进的人口阈值（须与探索度同时满足）。
+        beacon_push_explore_ratio: 本地探索度阈值（须与人口同时满足才集体推进）。
         beacon_position: 运行期由 decide() 写入；economy 只读。
     """
 
@@ -52,6 +54,10 @@ class TacticConfig:
     threat_radius: int = 8
     retreat_adjacent: int = 1  # 空货 worker 仅邻格（真正贴身）才撤
     retreat_radius: int = 3  # 满货遇敌保护半径（略收紧，减少误撤）
+    # 空货 RETREAT：逼近 Core 到此曼哈顿距离后停止并外散，禁止踩上 Core 堵 deposit
+    retreat_hold_radius: int = 2
+    # 同时允许回 Core 治疗的战斗单位上限（V+R 合计）；多伤员排队守环，避免挤死交付
+    max_core_healers: int = 1
 
     core_heal_hp_threshold: int = 3
     core_shield_threshold: int = 2
@@ -92,7 +98,7 @@ class TacticConfig:
     beacon_max_chase: int = 10000
     # 至少这么多 Worker 才允许 widx==0 dedicated；早期 1～2 人全采
     beacon_min_workers: int = 3
-    # 中后期推进：本地探索度 ≥ 比例 **或** 总人口 ≥ 阈值 → 向信标推进
+    # 中后期推进：本地探索度 ≥ 比例 **并且** 总人口 ≥ 阈值 → 向信标推进
     beacon_push_population: int = 10
     beacon_push_explore_ratio: float = 0.8
     # 运行期 Beacon 位置：**仅 decide() 每 tick 写入**，economy 只读。

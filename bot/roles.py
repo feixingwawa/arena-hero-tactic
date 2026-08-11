@@ -208,8 +208,12 @@ def assign_roles(
             widx = 0
         sector_id = widx % max(1, config.sector_count)
 
-        # 低血：优先回 Core 治疗
-        if snap.hp <= config.unit_heal_hp_threshold and snap.hp < snap.max_hp:
+        # 低血：仅空货可 HEAL；满货必须先 deposit（交付优先于治疗，避免占核）
+        if (
+            snap.cargo <= 0
+            and snap.hp <= config.unit_heal_hp_threshold
+            and snap.hp < snap.max_hp
+        ):
             role = Role.HEAL
             hint = core_position
         else:
@@ -267,27 +271,59 @@ def assign_roles(
             )
         )
 
-    # --- Vanguards：默认 GUARD；可见敌 Core 时最多 2 个 STRIKE ---
-    # 治疗阈值：至少 unit_heal_hp_threshold，且不低于 max_hp//2（V 满血 4 → ≤2 回城）
-    # 避免「只剩 1 血才撤」导致路上撞墙/阵亡；无邻格敌人时才 HEAL，贴身继续扫。
+    # --- Vanguards / Rangers 战斗角色 ---
+    # 治疗：半血阈值；但全军同时进核 heal 名额有限（max_core_healers），
+    # 优先已在 Core 上的伤员，其次更残、更近 Core 的，其余继续 GUARD 守环。
+    # 避免线上 5+ Ranger 同时 to_heal 堵死 deposit。
     vanguards = list(getattr(turn, "vanguards", None) or ())
+    rangers = list(getattr(turn, "rangers", None) or ())
     v_heal_th = max(
         int(config.unit_heal_hp_threshold),
         max(1, int(config.vanguard_max_hp) // 2),
     )
+    r_heal_th = max(
+        int(config.unit_heal_hp_threshold),
+        max(1, int(config.ranger_max_hp) // 2),
+    )
+    heal_budget = max(0, int(getattr(config, "max_core_healers", 1) or 0))
+
+    # 候选伤员：(priority, kind, index, unit, snap)
+    # priority 越小越优先：已在 Core → 更残 → 更近 Core → 稳定下标
+    heal_candidates: list[tuple] = []
+    for i, v in enumerate(vanguards):
+        snap = snapshot_from_unit(v, "VANGUARD", config.vanguard_max_hp)
+        if snap.hp <= v_heal_th and snap.hp < snap.max_hp:
+            adjacent_enemy = any(
+                manhattan(snap.position, ep) <= 1 for ep in combat_enemies
+            )
+            if not adjacent_enemy:
+                on_core = 0 if snap.position == core_position else 1
+                dist = manhattan(snap.position, core_position)
+                heal_candidates.append(
+                    (on_core, snap.hp, dist, 0, i, "V", v, snap)
+                )
+    for i, r in enumerate(rangers):
+        snap = snapshot_from_unit(r, "RANGER", config.ranger_max_hp)
+        if snap.hp <= r_heal_th and snap.hp < snap.max_hp:
+            on_core = 0 if snap.position == core_position else 1
+            dist = manhattan(snap.position, core_position)
+            heal_candidates.append(
+                (on_core, snap.hp, dist, 1, i, "R", r, snap)
+            )
+    heal_candidates.sort(key=lambda t: (t[0], t[1], t[2], t[3], t[4]))
+    heal_ids: set = set()
+    for cand in heal_candidates[:heal_budget]:
+        heal_ids.add(cand[7].id)
+
     strike_v_budget = 2 if enemy_core_pos is not None else 0
     strike_v_assigned = 0
     for i, v in enumerate(vanguards):
         snap = snapshot_from_unit(v, "VANGUARD", config.vanguard_max_hp)
         role = Role.GUARD
         hint = None
-        if snap.hp <= v_heal_th and snap.hp < snap.max_hp:
-            adjacent_enemy = any(
-                manhattan(snap.position, ep) <= 1 for ep in combat_enemies
-            )
-            if not adjacent_enemy:
-                role = Role.HEAL
-                hint = core_position
+        if snap.id in heal_ids:
+            role = Role.HEAL
+            hint = core_position
         elif strike_v_assigned < strike_v_budget and enemy_core_pos is not None:
             role = Role.STRIKE
             hint = enemy_core_pos
@@ -304,20 +340,13 @@ def assign_roles(
             )
         )
 
-    # --- Rangers：默认 GUARD；可见敌 Core 时最多 2 个 STRIKE ---
-    # Ranger max_hp=2 → 阈值 max(1, 1)=1，半血即回城
-    rangers = list(getattr(turn, "rangers", None) or ())
-    r_heal_th = max(
-        int(config.unit_heal_hp_threshold),
-        max(1, int(config.ranger_max_hp) // 2),
-    )
     strike_r_budget = 2 if enemy_core_pos is not None else 0
     strike_r_assigned = 0
     for r in rangers:
         snap = snapshot_from_unit(r, "RANGER", config.ranger_max_hp)
         role = Role.GUARD
         hint = None
-        if snap.hp <= r_heal_th and snap.hp < snap.max_hp:
+        if snap.id in heal_ids:
             role = Role.HEAL
             hint = core_position
         elif strike_r_assigned < strike_r_budget and enemy_core_pos is not None:

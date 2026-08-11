@@ -34,38 +34,114 @@ _BACKOFF_MAX = 30.0
 
 # 自愈：连续 TICK_MISMATCH / 会话无 tick 进度 → 强制结束会话并重连
 STALE_STREAK_RECONNECT = 3  # 连续提交过期次数
-SESSION_IDLE_RECONNECT_SEC = 60.0  # 未收到/处理新 turn 的墙钟秒数
+SESSION_IDLE_RECONNECT_SEC = 60.0  # 未收到/处理新 turn 的墙钟秒数 → 强制关 WS
+# close() 半死连接可能卡死；超过该 idle 仍无进度 → 进程硬退出（交外部 watchdog）
+SESSION_IDLE_HARD_EXIT_SEC = 120.0
 WATCHDOG_POLL_SEC = 5.0
 EMPTY_SESSION_PROCESS_EXIT = 2  # 连续空会话次数 → 进程退出，交外部 watchdog 重启
+FORCE_CLOSE_JOIN_SEC = 2.0  # 优雅 close 最长等待；超时改强杀 socket
 
 
 class SessionNeedsReconnect(Exception):
     """可恢复：当前 WS 会话假活/过期风暴，应退出 run_session 并重连。"""
 
 
-def _try_close_game(game: Any, reason: str) -> None:
-    """尽力关闭 SDK 客户端 / 底层 WS，打断阻塞的 turns() 迭代。"""
-    logger.warning("force_close_game reason=%s", reason)
-    for name in ("close", "disconnect", "stop", "shutdown"):
-        fn = getattr(game, name, None)
+def _hard_kill_socket(sock_obj: Any) -> bool:
+    """对 websockets Connection / 原始 socket 做非阻塞强杀（不握手等待）。"""
+    if sock_obj is None:
+        return False
+    killed = False
+    # websockets.sync.connection.Connection.close_socket：跳过握手直接拆 TCP
+    for name in ("close_socket", "terminate_pending_pings"):
+        fn = getattr(sock_obj, name, None)
         if callable(fn):
+            try:
+                fn()
+                killed = True
+            except Exception:  # noqa: BLE001
+                pass
+    # 底层 transport / raw socket
+    for attr in ("socket", "transport", "_socket", "raw_socket"):
+        raw = getattr(sock_obj, attr, None)
+        if raw is None:
+            continue
+        try:
+            import socket as _socket_mod
+
+            if hasattr(raw, "shutdown"):
+                try:
+                    raw.shutdown(_socket_mod.SHUT_RDWR)
+                except Exception:  # noqa: BLE001
+                    pass
+            if hasattr(raw, "close"):
+                raw.close()
+                killed = True
+        except Exception:  # noqa: BLE001
+            pass
+    # 最后才尝试会阻塞的 close()
+    fn = getattr(sock_obj, "close", None)
+    if callable(fn):
+        try:
+            fn()
+            killed = True
+        except Exception:  # noqa: BLE001
+            pass
+    return killed
+
+
+def _try_close_game(game: Any, reason: str) -> None:
+    """尽力关闭 SDK 客户端 / 底层 WS，打断阻塞的 turns() 迭代。
+
+    根因：websockets Connection.close() 会等待对端完成握手；半死连接上会
+    与主线程卡在 ``for msg in websocket`` 形成互锁。顺序必须是：
+    1) 先标 _closed，阻止 SDK events() 内层静默重连；
+    2) 对 _socket 做 close_socket / shutdown（非阻塞强杀）；
+    3) 再在短超时线程里调 game.close()。
+    """
+    logger.warning("force_close_game reason=%s", reason)
+
+    # 1) 阻止 SDK 在 ConnectionClosed 后 sleep+重连（client.events while not _closed）
+    try:
+        setattr(game, "_closed", True)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 2) 强杀底层 WS（优先于会阻塞的 close）
+    for attr in (
+        "_socket",
+        "_ws",
+        "ws",
+        "_websocket",
+        "websocket",
+        "connection",
+        "_connection",
+    ):
+        obj = getattr(game, attr, None)
+        if obj is not None:
+            _hard_kill_socket(obj)
+
+    # 3) 短超时优雅 close（含 httpx pool）；超时则放弃，不堵看门狗线程
+    def _do_close() -> None:
+        for name in ("close", "disconnect", "stop", "shutdown"):
+            fn = getattr(game, name, None)
+            if not callable(fn):
+                continue
             try:
                 fn()
                 return
             except Exception:  # noqa: BLE001
-                pass
-    for attr in ("_ws", "ws", "_websocket", "websocket", "connection", "_connection"):
-        obj = getattr(game, attr, None)
-        if obj is None:
-            continue
-        for name in ("close", "disconnect", "cancel"):
-            fn = getattr(obj, name, None)
-            if callable(fn):
-                try:
-                    fn()
-                    return
-                except Exception:  # noqa: BLE001
-                    pass
+                continue
+
+    t = threading.Thread(target=_do_close, name="force-close-game", daemon=True)
+    t.start()
+    t.join(timeout=FORCE_CLOSE_JOIN_SEC)
+    if t.is_alive():
+        logger.error(
+            "force_close_game still blocking after %.1fs reason=%s — socket hard-killed; "
+            "main may need hard exit if still stuck",
+            FORCE_CLOSE_JOIN_SEC,
+            reason,
+        )
 
 
 def mask_api_key(key: str) -> str:
@@ -161,7 +237,14 @@ def _import_sdk():
         ) from exc
 
     fatal_types: tuple = ()
+    # ConnectionClosed / keepalive 超时属于可恢复；勿当致命
     recoverable_types: tuple = (ConnectionError, TimeoutError, OSError)
+    try:
+        from websockets.exceptions import ConnectionClosed
+
+        recoverable_types = recoverable_types + (ConnectionClosed,)
+    except ImportError:
+        pass
     try:
         from arena_hero import (
             AuthenticationError,
@@ -173,6 +256,8 @@ def _import_sdk():
             ArenaHeroError,
         )
 
+        # ConfigurationError 多数是编程错误，但 “client is closed” 在 force_close
+        # 后很常见——由 _is_fatal_error / _is_client_closed_error 再细分。
         fatal_types = (AuthenticationError, PolicyViolationError, ConfigurationError)
         recoverable_types = recoverable_types + (
             TransportError,
@@ -188,6 +273,9 @@ def _import_sdk():
 
 def _is_fatal_error(exc: BaseException, fatal_types: tuple) -> bool:
     """判断是否为不应重连的致命错误（Key 无效、策略违规等）。"""
+    # force_close / keepalive 半死后的 closed 类错误可恢复，绝不当致命
+    if _is_client_closed_error(exc):
+        return False
     if fatal_types and isinstance(exc, fatal_types):
         return True
     name = type(exc).__name__.lower()
@@ -219,14 +307,27 @@ def _is_stale_tick_error(exc: BaseException) -> bool:
 
 
 def _is_client_closed_error(exc: BaseException) -> bool:
-    """WS/客户端已关闭（常见于 force_close 后 turns 迭代残留）。"""
+    """WS/客户端已关闭（force_close、keepalive 超时、半死连接）。
+
+    这些错误应升为 SessionNeedsReconnect，而不是当致命/未知异常刷堆栈。
+    """
     msg = str(exc).lower()
     name = type(exc).__name__.lower()
+    # SDK / websockets 常见类型名
+    if "connectionclosed" in name or "connectionclosederror" in name:
+        return True
     if "configurationerror" in name and "closed" in msg:
         return True
     if "client is closed" in msg or "the client is closed" in msg:
         return True
     if "websocket" in msg and ("closed" in msg or "close" in msg):
+        return True
+    # keepalive ping failed / 1011 keepalive ping timeout
+    if "keepalive" in msg and ("ping" in msg or "timeout" in msg or "fail" in msg):
+        return True
+    if "1011" in msg and ("keepalive" in msg or "ping" in msg or "timeout" in msg):
+        return True
+    if "connection closed" in msg or "connectionclosed" in msg.replace(" ", ""):
         return True
     return False
 
@@ -274,23 +375,73 @@ def run_session(
             return time.monotonic() - last_progress_mono
 
     def _session_watchdog() -> None:
-        """后台线程：超过 SESSION_IDLE_RECONNECT_SEC 无 turn 进度则强关 WS。"""
+        """两阶段会话看门狗（根因自愈，不依赖手动重启）：
+
+        1) soft：idle >= SESSION_IDLE_RECONNECT_SEC → 非阻塞 force_close，
+           **不 return**，继续轮询（旧实现 force_close 一次就 return，
+           若 close 卡死 / turns 仍堵在 recv，进程会假活数小时）。
+        2) hard：idle >= SESSION_IDLE_HARD_EXIT_SEC 仍无进度 → os._exit(42)，
+           交外部 agent_watchdog 拉起干净进程。
+        """
+        soft_attempted = False
         while not watchdog_stop.wait(WATCHDOG_POLL_SEC):
             idle = _idle_sec()
             if idle < SESSION_IDLE_RECONNECT_SEC:
+                soft_attempted = False
                 continue
-            g = game_holder.get("game")
-            logger.error(
-                "session_watchdog: idle=%.1fs >= %.1fs — force close WS to reconnect",
-                idle,
-                SESSION_IDLE_RECONNECT_SEC,
-            )
+
             nonlocal idle_forced
             idle_forced = True
-            if g is not None:
-                _try_close_game(g, f"idle_{idle:.0f}s")
-            # 关闭后 turns() 应抛错/结束；若仍卡死由进程外 watchdog 兜底
-            return
+            g = game_holder.get("game")
+
+            # 阶段 2：硬退出（force_close 后仍假活）
+            if idle >= SESSION_IDLE_HARD_EXIT_SEC:
+                logger.error(
+                    "session_watchdog: HARD EXIT idle=%.1fs >= %.1fs "
+                    "(soft_attempted=%s) — process exit 42 for external watchdog",
+                    idle,
+                    SESSION_IDLE_HARD_EXIT_SEC,
+                    soft_attempted,
+                )
+                try:
+                    if g is not None:
+                        _try_close_game(g, f"hard_exit_idle_{idle:.0f}s")
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    save_world_memory()
+                except Exception:  # noqa: BLE001
+                    pass
+                # 不可用 sys.exit：主线程可能仍卡在 for msg in websocket，
+                # 只有 os._exit 能立刻结束整个解释器。
+                os._exit(42)
+
+            # 阶段 1：软强关（可重复尝试，但避免每 5s 刷爆日志）
+            if not soft_attempted:
+                logger.error(
+                    "session_watchdog: idle=%.1fs >= %.1fs — force close WS "
+                    "(hard_exit in %.0fs if still stuck)",
+                    idle,
+                    SESSION_IDLE_RECONNECT_SEC,
+                    max(0.0, SESSION_IDLE_HARD_EXIT_SEC - idle),
+                )
+                soft_attempted = True
+                if g is not None:
+                    try:
+                        _try_close_game(g, f"idle_{idle:.0f}s")
+                    except Exception as close_exc:  # noqa: BLE001
+                        logger.error(
+                            "session_watchdog: force_close raised %s: %s",
+                            type(close_exc).__name__,
+                            close_exc,
+                        )
+            else:
+                logger.warning(
+                    "session_watchdog: still idle=%.1fs after soft close — "
+                    "waiting hard_exit at %.0fs",
+                    idle,
+                    SESSION_IDLE_HARD_EXIT_SEC,
+                )
 
     with ArenaHeroClient(**client_kwargs) as game:
         game_holder["game"] = game
@@ -304,9 +455,10 @@ def run_session(
         try:
             logger.info(
                 "WebSocket 已连接，开始接收 turns "
-                "(stale_streak_limit=%s idle_reconnect=%.0fs)",
+                "(stale_streak_limit=%s idle_reconnect=%.0fs hard_exit=%.0fs)",
                 STALE_STREAK_RECONNECT,
                 SESSION_IDLE_RECONNECT_SEC,
+                SESSION_IDLE_HARD_EXIT_SEC,
             )
             for turn in game.turns():
                 _touch_progress()
@@ -432,6 +584,19 @@ def run_session(
                     logger.info("达到 max_turns=%s，退出", max_turns)
                     stop_for_max = True
                     break
+        except SessionNeedsReconnect:
+            raise
+        except Exception as loop_exc:
+            # turns() 本身在迭代器层抛出（非 tick 内 try）：keepalive / force_close
+            if _is_client_closed_error(loop_exc) or idle_forced:
+                logger.warning(
+                    "turns 迭代结束（连接关闭/idle）: %s",
+                    loop_exc,
+                )
+                raise SessionNeedsReconnect(
+                    f"turns_closed idle_forced={idle_forced}: {loop_exc}"
+                ) from loop_exc
+            raise
         finally:
             watchdog_stop.set()
             game_holder["game"] = None
@@ -600,6 +765,25 @@ def run_loop(
             backoff = _BACKOFF_INITIAL
             continue
         except Exception as exc:
+            # WS 半死 / force_close 后的 ConnectionClosed 等：短退避重连
+            if _is_client_closed_error(exc):
+                empty_session_streak = 0
+                wait_s = min(backoff, _BACKOFF_INITIAL)
+                logger.warning(
+                    "会话 #%s 连接已关闭 (%s): %s — %.1fs 后重连",
+                    session,
+                    type(exc).__name__,
+                    exc,
+                    wait_s,
+                )
+                try:
+                    time.sleep(wait_s)
+                except KeyboardInterrupt:
+                    logger.info("收到 Ctrl+C，停止")
+                    raise
+                backoff = _BACKOFF_INITIAL
+                continue
+
             if _is_fatal_error(exc, fatal_types):
                 logger.error(
                     "致命错误，停止重连: %s: %s",

@@ -10,6 +10,7 @@
   5. 结束旧 bot.main 进程（避免双开抢 8765）
   6. 后台启动 bot.main -v --dashboard
   7. 探测 /health 与日志，打印结果
+  8. 后台拉起 agent_watchdog（tick 停滞 / 僵死进程自动杀启）
 
 用法（仓库根目录）：
   python scripts/deploy.py
@@ -18,6 +19,7 @@
   python scripts/deploy.py --port 8765
   python scripts/deploy.py --skip-pip         # 跳过 pip（已装好时）
   python scripts/deploy.py --api-key KEY      # 写入/覆盖 .env 中的 Key（不打印明文）
+  python scripts/deploy.py --no-watchdog      # 不拉起外部看门狗
 
 Windows 也可双击根目录 deploy.bat。
 """
@@ -330,16 +332,100 @@ def start_agent(
 
     out = open(LOGS / "agent.stdout", "w", encoding="utf-8")
     err = open(LOGS / "agent.stderr", "w", encoding="utf-8")
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(ROOT),
-        env=env,
-        stdout=out,
-        stderr=err,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
-    )
+    popen_kw: dict = {
+        "cwd": str(ROOT),
+        "env": env,
+        "stdout": out,
+        "stderr": err,
+    }
+    if sys.platform == "win32":
+        popen_kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kw["start_new_session"] = True
+    proc = subprocess.Popen(cmd, **popen_kw)
     (LOGS / "agent.pid").write_text(str(proc.pid), encoding="ascii")
     _info(f"已后台启动 PID={proc.pid}（logs/agent.pid）")
+    return proc.pid
+
+
+def start_watchdog(*, stall_sec: float = 90.0, poll_sec: float = 10.0) -> int | None:
+    """后台拉起 scripts/agent_watchdog.py（单实例；tick 停滞则 ensure_single 重启）。
+
+    根因兜底：进程内 session_watchdog 硬退出 / WS 假活后，必须有进程外监护。
+    """
+    LOGS.mkdir(exist_ok=True)
+    py = _venv_python()
+    script = ROOT / "scripts" / "agent_watchdog.py"
+    if not script.exists():
+        _warn(f"未找到 {script}，跳过外部看门狗")
+        return None
+
+    # 结束旧 watchdog（避免多实例；agent_watchdog 自身也有 singleton）
+    try:
+        import psutil
+
+        me = os.getpid()
+        for p in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                cl = p.info.get("cmdline") or []
+                low = " ".join(str(x).lower() for x in cl)
+                if "agent_watchdog.py" not in low or "python" not in low:
+                    continue
+                pid = int(p.info["pid"])
+                if pid == me:
+                    continue
+                p.kill()
+                _info(f"已结束旧 agent_watchdog pid={pid}")
+            except Exception:
+                continue
+        time.sleep(0.5)
+    except ImportError:
+        try:
+            subprocess.run(
+                ["pkill", "-f", r"agent_watchdog\.py"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(ROOT)
+    cmd = [
+        str(py),
+        "-u",
+        str(script),
+        "--stall-sec",
+        str(stall_sec),
+        "--poll-sec",
+        str(poll_sec),
+    ]
+    out = open(LOGS / "watchdog.stdout", "a", encoding="utf-8")
+    err = open(LOGS / "watchdog.stderr", "a", encoding="utf-8")
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    out.write(f"\n----- deploy start_watchdog {stamp} -----\n")
+    err.write(f"\n----- deploy start_watchdog {stamp} -----\n")
+    out.flush()
+    err.flush()
+
+    popen_kw: dict = {
+        "cwd": str(ROOT),
+        "env": env,
+        "stdout": out,
+        "stderr": err,
+    }
+    if sys.platform == "win32":
+        popen_kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kw["start_new_session"] = True
+
+    proc = subprocess.Popen(cmd, **popen_kw)
+    (LOGS / "watchdog.pid").write_text(str(proc.pid), encoding="ascii")
+    _info(
+        f"已后台启动 agent_watchdog PID={proc.pid} "
+        f"(stall={stall_sec:.0f}s poll={poll_sec:.0f}s → logs/watchdog.log)"
+    )
     return proc.pid
 
 
@@ -413,6 +499,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--api-key", type=str, default=None, help="写入 .env 的 ARENA_HERO_API_KEY")
     p.add_argument("--quiet", action="store_true", help="启动时不加 -v")
     p.add_argument("--no-kill", action="store_true", help="不结束旧 bot.main")
+    p.add_argument(
+        "--no-watchdog",
+        action="store_true",
+        help="不后台拉起 agent_watchdog（默认会拉起，防 WS 假活僵死）",
+    )
     return p.parse_args(argv)
 
 
@@ -471,6 +562,13 @@ def main(argv: list[str] | None = None) -> int:
         verbose=not args.quiet,
     )
 
+    # 外部看门狗：进程内两阶段 idle 仍不够时的最终兜底（前台模式不拉）
+    if not args.foreground and not args.no_watchdog:
+        try:
+            start_watchdog(stall_sec=90.0, poll_sec=10.0)
+        except Exception as exc:  # noqa: BLE001
+            _warn(f"启动 agent_watchdog 失败: {exc}")
+
     # 后台：等 health（假 Key 会很快 401 退出，不宜等太久）
     time.sleep(2)
     ok = wait_health(args.port, timeout=18.0)
@@ -482,7 +580,8 @@ def main(argv: list[str] | None = None) -> int:
         _info(f"Dashboard 本机: {local_url}")
         _info(f"Dashboard 监听: {args.host}:{args.port}（0.0.0.0 表示对公网开放）")
         _info("日志: logs/agent.log  |  PID: logs/agent.pid")
-        _info("停止: 结束 bot.main 进程，或再运行本脚本（会先 kill 旧进程）")
+        _info("看门狗: logs/watchdog.log | PID: logs/watchdog.pid")
+        _info("停止: 结束 bot.main / agent_watchdog，或再运行本脚本（会先 kill 旧进程）")
         return 0
 
     _warn("Agent 可能仍在连接游戏服务器；若日志持续无 tick，检查 API Key / 网络")

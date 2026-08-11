@@ -270,8 +270,8 @@ python -m bot.main --dashboard --dashboard-host 127.0.0.1 --dashboard-port 8765
 | `sector_count` | **4** | Worker 扇区分散 |
 | `beacon_max_chase` | **64** | 超距不追 Beacon |
 | `beacon_min_workers` | **3** | 早期全员采，够人再 1 人侦察 |
-| `beacon_push_population` | **10** | 总人口 ≥ 此值 → 向信标推进 |
-| `beacon_push_explore_ratio` | **0.8** | 本地（spiral_max_ring）探索度 ≥ 此比例 → 向信标推进 |
+| `beacon_push_population` | **10** | 与探索度**同时**达标才集体向信标推进 |
+| `beacon_push_explore_ratio` | **0.8** | 本地探索度 ≥ 此比例 **且** 人口达标 → 向信标推进 |
 | `recall_stall_ticks` | 6 | 无进展软回撤 |
 | `retreat_adjacent` | 1 | 空货贴身才撤 |
 | `retreat_radius` | 3 | 满货保护半径 |

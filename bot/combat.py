@@ -3,6 +3,9 @@
 Vanguard/Ranger 移动与 Worker 对齐：guided_step_toward + LoopTracker +
 memory.obstacles 合并，避免贪心 clamp 贴墙空转。受伤回 Core 治疗仅短暂
 同格 heal，下一决策 tick 非 HEAL 时 leave_core 立即让出。
+
+非必要不进核：非 HEAL 寻路把 Core 当软障；HEAL 名额由 roles.max_core_healers
+限制，其余伤员守环，避免堵 deposit。
 """
 
 from __future__ import annotations
@@ -71,6 +74,24 @@ def _merge_obstacles(turn: Any, memory: Any = None) -> set[Position]:
                     blocked |= set(mem_obs)
                 except Exception:
                     pass
+    return blocked
+
+
+def _combat_path_obstacles(
+    turn: Any,
+    core_position: Position,
+    memory: Any = None,
+    *,
+    allow_core: bool = False,
+) -> set[Position]:
+    """战斗寻路障碍：地形 +（默认）己方 Core 软障。
+
+    allow_core=True 仅 HEAL 进核时使用；否则 Core 格不可作为途经点，
+    防止 to_ring/intercept 路径穿核堵 deposit。
+    """
+    blocked = _merge_obstacles(turn, memory)
+    if not allow_core:
+        blocked.add(core_position)
     return blocked
 
 
@@ -261,7 +282,9 @@ def command_vanguards(
         core_position = _as_position(core.position)
 
     enemies = _enemies(turn)
-    obstacles = _merge_obstacles(turn, memory)
+    # 默认把 Core 当软障；HEAL 分支单独 allow_core
+    obstacles = _combat_path_obstacles(turn, core_position, memory, allow_core=False)
+    obstacles_heal = _combat_path_obstacles(turn, core_position, memory, allow_core=True)
     tick = int(getattr(turn, "tick", 0) or 0)
     vanguards = list(getattr(turn, "vanguards", None) or ())
     slots = defense_ring_slots(
@@ -290,7 +313,7 @@ def command_vanguards(
                 direction, repath = _guided_combat_step(
                     pos,
                     core_position,
-                    obstacles,
+                    obstacles_heal,
                     ckey,
                     config,
                     tick=tick,
@@ -456,7 +479,8 @@ def command_rangers(
         core_position = _as_position(core.position)
 
     enemies = _enemies(turn)
-    obstacles = _merge_obstacles(turn, memory)
+    obstacles = _combat_path_obstacles(turn, core_position, memory, allow_core=False)
+    obstacles_heal = _combat_path_obstacles(turn, core_position, memory, allow_core=True)
     tick = int(getattr(turn, "tick", 0) or 0)
     rangers = list(getattr(turn, "rangers", None) or ())
     slots = defense_ring_slots(
@@ -484,7 +508,7 @@ def command_rangers(
                 direction, repath = _guided_combat_step(
                     pos,
                     core_position,
-                    obstacles,
+                    obstacles_heal,
                     ckey,
                     config,
                     tick=tick,

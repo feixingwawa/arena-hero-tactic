@@ -288,6 +288,30 @@ const logContainer=$('logContainer');
 
 function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
 
+/** 将路点展成四连通折线：禁止 canvas 对角 lineTo（单位不能斜走）。 */
+function expandCardinalWaypoints(wps){
+  if(!Array.isArray(wps)||wps.length===0)return [];
+  const out=[[Number(wps[0][0]),Number(wps[0][1])]];
+  const maxPts=200;
+  for(let i=1;i<wps.length;i++){
+    let tx=Number(wps[i][0]), ty=Number(wps[i][1]);
+    if(!Number.isFinite(tx)||!Number.isFinite(ty))continue;
+    let lx=out[out.length-1][0], ly=out[out.length-1][1];
+    if(lx===tx&&ly===ty)continue;
+    // 先水平再竖直的曼哈顿阶梯（与后端 _manhattan_staircase 一致）
+    while(lx!==tx&&out.length<maxPts){
+      lx+=tx>lx?1:-1;
+      out.push([lx,ly]);
+    }
+    while(ly!==ty&&out.length<maxPts){
+      ly+=ty>ly?1:-1;
+      out.push([lx,ly]);
+    }
+    if(out.length>=maxPts)break;
+  }
+  return out;
+}
+
 function normUnit(u){
   if(!u)return u;
   // 保留 path_estimate / id / type 等原始字段，仅展平 econ
@@ -651,7 +675,9 @@ function drawPaths(units){
     if(!dest)continue;
 
     // 1) 仅绘制后端真实绕障路点（禁止 origin→dest 直线兜底，会穿障）
-    const wps=(pe&&Array.isArray(pe.waypoints)) ? pe.waypoints : [];
+    // 单位只能四连通走：相邻路点若非 cardinal，前端展开曼哈顿阶梯，禁止斜线
+    const wpsRaw=(pe&&Array.isArray(pe.waypoints)) ? pe.waypoints : [];
+    const wps=expandCardinalWaypoints(wpsRaw);
     mctx.strokeStyle=color;
     mctx.lineWidth=1.8;
     mctx.globalAlpha=0.9;
