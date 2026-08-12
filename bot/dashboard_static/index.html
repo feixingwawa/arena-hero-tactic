@@ -189,8 +189,9 @@ input[type=text]:focus{border-color:var(--ifm-color-primary);box-shadow:0 0 0 1p
       <button id="btnPause" title="暂停/继续">⏸</button>
       <button id="btnFwd1" title="前进1帧">▶</button>
       <button id="btnFwd10" title="前进10帧">⏩</button>
-      <span id="modeLabel" class="mode-label live">实时</span>
+      <span id="modeLabel" class="mode-label live">决策观测</span>
       <span id="pollAge" class="poll-age" title="距上次成功拉取快照">--</span>
+      <span id="dataKind" class="poll-age" title="快照数据类型">--</span>
     </div>
     <canvas id="trend" width="600" height="60"></canvas>
   </div>
@@ -201,13 +202,14 @@ input[type=text]:focus{border-color:var(--ifm-color-primary);box-shadow:0 0 0 1p
     <div id="mapWrap">
       <canvas id="map"></canvas>
       <div id="mapToolbar">
-        <label><input type="checkbox" id="cbPaths" checked> 导航路径</label>
-        <label><input type="checkbox" id="cbDest" checked> 目的地标签</label>
+        <label><input type="checkbox" id="cbPaths" checked> 本 tick 一步</label>
+        <label><input type="checkbox" id="cbPlanPaths"> 计划路径(虚线)</label>
+        <label><input type="checkbox" id="cbDest" checked> 动作/目的标签</label>
         <label><input type="checkbox" id="cbObstacles" checked> 障碍物</label>
         <label><input type="checkbox" id="cbExplored" checked> 已探视野</label>
         <label><input type="checkbox" id="cbHeatmap"> 障碍热图</label>
         <button id="btnResetView" style="margin-top:4px" title="双击地图亦可">重置缩放/居中</button>
-        <div style="font-size:10px;color:var(--muted);line-height:1.35;max-width:140px">拖动平移 · 滚轮缩放<br>绿=视野已探 琥珀=陈旧 蓝框=Core格 · 官方视距W3/V4/R5/C5</div>
+        <div style="font-size:10px;color:var(--muted);line-height:1.35;max-width:160px">拖动平移 · 滚轮缩放<br>实线=本 tick 一步 · 虚线=多 tick 计划<br>绿=视野已探 琥珀=陈旧 · 官方视距W3/V4/R5/C5<br>观测=决策输入位，非官方结算动画</div>
       </div>
       <div id="unitPopover"></div>
     </div>
@@ -249,7 +251,8 @@ window.STATE = {
   keywordFilter:'',
   scrollPaused:false,
   cellSize:8,
-  showPaths:true,
+  showPaths:true,       // 默认画本 tick 一步（step_path）
+  showPlanPaths:false,  // 多 tick 计划路径：默认关，开则虚线
   showDestLabels:true,
   showObstacles:true,
   showExplored:true,
@@ -270,7 +273,7 @@ window.STATE = {
   lastFetchOkAt:0,
   lastSnapTick:null,
   lastPollError:null,
-  pollMs:500,
+  pollMs:150,  // 里程碑 B：live 更快轮询，降低观感延迟
   historyMax:120,
   historyFetchedAt:0,
 };
@@ -314,20 +317,23 @@ function expandCardinalWaypoints(wps){
 
 function normUnit(u){
   if(!u)return u;
-  // 保留 path_estimate / id / type 等原始字段，仅展平 econ
-  if(u.econ){
-    return {
-      ...u,
-      target:u.econ.target,
-      ring:u.econ.ring,
-      sector:u.econ.sector,
-      phase:u.econ.phase,
-      role:u.econ.role,
-      dedicated:u.econ.dedicated,
-      path_estimate:u.path_estimate||null,
-    };
-  }
-  return u;
+  // 展平 econ，并保留 action/direction/next_cell/step_path（指令真源）
+  const base=u.econ?{
+    ...u,
+    target:u.econ.target,
+    ring:u.econ.ring,
+    sector:u.econ.sector,
+    phase:u.econ.phase,
+    role:u.econ.role,
+    dedicated:u.econ.dedicated,
+    path_estimate:u.path_estimate||null,
+  }:Object.assign({},u);
+  if(base.action==null&&u.action!=null)base.action=u.action;
+  if(base.direction==null&&u.direction!=null)base.direction=u.direction;
+  if(base.next_cell==null&&u.next_cell!=null)base.next_cell=u.next_cell;
+  if(base.step_path==null&&u.step_path!=null)base.step_path=u.step_path;
+  if(base.command==null&&u.command!=null)base.command=u.command;
+  return base;
 }
 
 function world2canvas(wx,wy){
@@ -416,7 +422,7 @@ function drawMap(snap){
   if(STATE.showObstacles&&snap.obstacles)drawObstacles(snap.obstacles);
   if(snap.resource_cells)drawResources(snap.resource_cells);
   if(snap.beacon)drawBeacon(snap.beacon,snap.units);
-  if(STATE.showPaths&&snap.units)drawPaths(snap.units);
+  if(snap.units&&(STATE.showPaths||STATE.showPlanPaths||STATE.showDestLabels))drawPaths(snap.units);
   if(snap.core)drawRingIndicator(snap.core);
   if(snap.visible_enemies)drawEnemies(snap.visible_enemies);
   drawUnits(snap.units,snap.core,snap.beacon);
@@ -439,14 +445,15 @@ function phasePathColor(phase){
 }
 
 function phaseLabel(phase){
+  // phase = 任务意图（次要展示）；to_cargo 勿译成「货箱」
   const p=(phase||'').toLowerCase();
   const map={
-    beacon:'信标', local:'探索', explore:'探索',
-    deposit:'交付', return_deposit:'交付',
-    to_resource:'采矿', harvest:'采集', to_cargo:'货箱',
-    retreat:'撤退', heal:'治疗', guard:'守卫', idle:'空闲'
+    beacon:'前往信标', local:'本地探索', explore:'探索',
+    deposit:'交付', return_deposit:'回城交付',
+    to_resource:'前往矿点', harvest:'采集中', to_cargo:'前往掉落',
+    retreat:'撤退', heal:'回城治疗', guard:'守卫', idle:'空闲'
   };
-  return map[p]||(phase||'目标');
+  return map[p]||(phase||'任务');
 }
 
 function unitTypeLabel(t){
@@ -457,13 +464,23 @@ function unitTypeLabel(t){
 function roleLabel(role){
   if(role==null)return '';
   const p=String(role).toUpperCase();
-  const map={HARVEST:'采集',HARVESTER:'采集',GUARD:'守卫',SCOUT:'侦察',IDLE:'空闲'};
+  const map={HARVEST:'采集',HARVESTER:'采集',GUARD:'守卫',SCOUT:'侦察',IDLE:'空闲',HEAL:'治疗',RETREAT:'撤退'};
   return map[p]||role;
 }
+
+const DIR_ZH={N:'北',S:'南',E:'东',W:'西',NORTH:'北',SOUTH:'南',EAST:'东',WEST:'西',UP:'北',DOWN:'南',LEFT:'西',RIGHT:'东',U:'北',D:'南',L:'西',R:'东'};
 
 function actionLabel(action){
   if(!action)return '无';
   const a=String(action);
+  // 单位本 tick 动作（主展示）
+  const simple={
+    move:'移动', harvest:'采集', deposit:'交付', heal:'治疗',
+    wait:'等待', sweep:'横扫', shoot:'射击', spawn:'生产',
+    repair:'修理', repair_shield:'修盾',
+  };
+  const low=a.toLowerCase();
+  if(simple[low])return simple[low];
   return a
     .replace(/^core:/,'核心:')
     .replace(/^spawn:/,'生产:')
@@ -472,6 +489,35 @@ function actionLabel(action){
     .replace(/VANGUARD/g,'先锋')
     .replace(/RANGER/g,'射手')
     .replace(/heal/gi,'治疗');
+}
+
+/** 本 tick 指令主标签：action 优先于 phase */
+function unitCommandLabel(u){
+  if(!u)return '';
+  const act=u.action?String(u.action).toLowerCase():'';
+  if(act==='move'){
+    const d=u.direction?DIR_ZH[String(u.direction).toUpperCase()]||String(u.direction):'';
+    return d?`移动→${d}`:'移动';
+  }
+  if(act){
+    const base=actionLabel(act);
+    if(act==='spawn'&&u.command&&u.command.meta&&u.command.meta.spawn_type){
+      return `${base}:${unitTypeLabel(String(u.command.meta.spawn_type).toUpperCase())}`;
+    }
+    return base;
+  }
+  if(u.phase)return `任务:${phaseLabel(u.phase)}`;
+  return '';
+}
+
+function actionPathColor(action,phase){
+  const a=(action||'').toLowerCase();
+  if(a==='deposit')return cssVar('--deposit-line','#f0c14b');
+  if(a==='harvest')return cssVar('--resource-line','#3ecf8e');
+  if(a==='heal'||a==='wait')return cssVar('--red','#e85d75');
+  if(a==='sweep'||a==='shoot')return cssVar('--logo-stroke','#4591c5');
+  if(a==='move')return phasePathColor(phase);
+  return phasePathColor(phase);
 }
 
 function drawGrid(W,H){
@@ -658,6 +704,7 @@ function drawBeacon(beacon,units){
 }
 
 function drawPaths(units){
+  // 默认：只画本 tick 一步（step_path / next_cell）；计划路径可选虚线
   const s=STATE.cellSize;
   mctx.save();
   mctx.lineJoin='round';
@@ -665,67 +712,101 @@ function drawPaths(units){
   for(const raw of units){
     const pe=raw&&raw.path_estimate;
     const u=normUnit(raw);
-    const hasTarget=u.target&&Array.isArray(u.target)&&u.target.length>=2;
-    if(u.type!=='WORKER'&&!(pe&&pe.waypoints&&pe.waypoints.length))continue;
-    if(!hasTarget&&!(pe&&pe.destination))continue;
+    const color=actionPathColor(u.action,u.phase);
+    const cmdLabel=unitCommandLabel(u);
 
-    const color=phasePathColor(u.phase);
-    const dest= (pe&&pe.destination) ? pe.destination
-              : (hasTarget ? u.target : null);
-    if(!dest)continue;
+    // --- step path（实线，默认）---
+    let stepWps=null;
+    if(Array.isArray(u.step_path)&&u.step_path.length>=2){
+      stepWps=expandCardinalWaypoints(u.step_path);
+    }else if(Array.isArray(pe&&pe.step_path)&&pe.step_path.length>=2){
+      stepWps=expandCardinalWaypoints(pe.step_path);
+    }else if(Array.isArray(u.next_cell)&&u.next_cell.length>=2&&u.x!=null&&u.y!=null){
+      stepWps=expandCardinalWaypoints([[u.x,u.y],[u.next_cell[0],u.next_cell[1]]]);
+    }
 
-    // 1) 仅绘制后端真实绕障路点（禁止 origin→dest 直线兜底，会穿障）
-    // 单位只能四连通走：相邻路点若非 cardinal，前端展开曼哈顿阶梯，禁止斜线
-    const wpsRaw=(pe&&Array.isArray(pe.waypoints)) ? pe.waypoints : [];
-    const wps=expandCardinalWaypoints(wpsRaw);
-    mctx.strokeStyle=color;
-    mctx.lineWidth=1.8;
-    mctx.globalAlpha=0.9;
-    // 仅真实路点折线；完整规划实线，partial/approx 虚线；不足 2 点不画线
-    // planned=runtime/astar/bfs 均为可执行同源路径；runtime 即使 partial 也画实线（正在执行）
-    if(wps.length>=2){
-      const planned=pe&&pe.planned;
-      const isRuntime=planned==='runtime'||planned==='astar';
-      const isPartial=pe&&(pe.partial||pe.approx||planned==='none')&&!isRuntime;
-      const isSolid=pe&&planned&&planned!=='none'&&(!isPartial||isRuntime);
-      mctx.setLineDash(isSolid ? [] : [5,4]);
+    if(STATE.showPaths&&stepWps&&stepWps.length>=2){
+      mctx.strokeStyle=color;
+      mctx.lineWidth=2.2;
+      mctx.globalAlpha=0.95;
+      mctx.setLineDash([]);
       mctx.beginPath();
-      for(let i=0;i<wps.length;i++){
-        const pt=world2canvas(wps[i][0],wps[i][1]);
+      for(let i=0;i<stepWps.length;i++){
+        const pt=world2canvas(stepWps[i][0],stepWps[i][1]);
         if(i===0)mctx.moveTo(pt.x,pt.y);else mctx.lineTo(pt.x,pt.y);
       }
       mctx.stroke();
-      mctx.setLineDash([]);
+      // 下一步格小菱形
+      const last=stepWps[stepWps.length-1];
+      const d=world2canvas(last[0],last[1]);
+      mctx.globalAlpha=1;
+      mctx.fillStyle=color;
+      mctx.beginPath();
+      const r=Math.max(2.5,s*0.28);
+      mctx.moveTo(d.x,d.y-r);mctx.lineTo(d.x+r,d.y);mctx.lineTo(d.x,d.y+r);mctx.lineTo(d.x-r,d.y);
+      mctx.closePath();mctx.fill();
+      mctx.strokeStyle='#fff';mctx.lineWidth=1;mctx.stroke();
     }
 
-    // 2) 被堵障碍高亮
-    if(pe&&Array.isArray(pe.blocked)){
-      for(const b of pe.blocked){
-        const bp=world2canvas(b[0],b[1]);
-        mctx.fillStyle='rgba(232,93,117,.55)';
-        mctx.fillRect(bp.x-s/2+1,bp.y-s/2+1,s-2,s-2);
+    // --- plan path（虚线，可选）---
+    if(STATE.showPlanPaths&&pe&&Array.isArray(pe.waypoints)&&pe.waypoints.length>=2){
+      const planned=pe.planned;
+      // step-only 估路与 step 重合则跳过
+      if(planned!=='step'||!(stepWps&&stepWps.length===pe.waypoints.length)){
+        const wps=expandCardinalWaypoints(pe.waypoints);
+        if(wps.length>=2){
+          mctx.strokeStyle=color;
+          mctx.lineWidth=1.4;
+          mctx.globalAlpha=0.55;
+          mctx.setLineDash([5,4]);
+          mctx.beginPath();
+          for(let i=0;i<wps.length;i++){
+            const pt=world2canvas(wps[i][0],wps[i][1]);
+            if(i===0)mctx.moveTo(pt.x,pt.y);else mctx.lineTo(pt.x,pt.y);
+          }
+          mctx.stroke();
+          mctx.setLineDash([]);
+        }
+      }
+      if(Array.isArray(pe.blocked)){
+        for(const b of pe.blocked){
+          const bp=world2canvas(b[0],b[1]);
+          mctx.fillStyle='rgba(232,93,117,.45)';
+          mctx.fillRect(bp.x-s/2+1,bp.y-s/2+1,s-2,s-2);
+        }
       }
     }
 
-    // 3) 目的地菱形 + 阶段标签
-    const d=world2canvas(dest[0],dest[1]);
-    mctx.globalAlpha=1;
-    mctx.fillStyle=color;
-    mctx.beginPath();
-    const r=Math.max(3,s*0.35);
-    mctx.moveTo(d.x,d.y-r);mctx.lineTo(d.x+r,d.y);mctx.lineTo(d.x,d.y+r);mctx.lineTo(d.x-r,d.y);
-    mctx.closePath();mctx.fill();
-    mctx.strokeStyle='#fff';mctx.lineWidth=1;mctx.stroke();
-
-    if(STATE.showDestLabels){
-      const label=phaseLabel(u.phase);
-      const steps=pe&&pe.steps!=null?` ${pe.steps}步`:'';
+    // --- 非 move：单位旁动作 chip（不画假长线）---
+    const act=(u.action||'').toLowerCase();
+    const isStationary=act&&act!=='move'&&act!=='sweep';
+    if(STATE.showDestLabels&&(cmdLabel||isStationary)){
+      const p=world2canvas(u.x,u.y);
+      const text=cmdLabel||actionLabel(act);
+      if(text){
+        mctx.font='10px system-ui,sans-serif';
+        mctx.textAlign='left';mctx.textBaseline='bottom';
+        const tw=mctx.measureText(text).width;
+        const lx=p.x+s*0.45,ly=p.y-s*0.35;
+        mctx.globalAlpha=1;
+        mctx.fillStyle='rgba(27,27,29,.85)';
+        mctx.fillRect(lx-3,ly-11,tw+6,13);
+        mctx.fillStyle=color;
+        mctx.fillText(text,lx,ly);
+      }
+    }else if(STATE.showDestLabels&&STATE.showPlanPaths&&pe&&pe.destination){
+      // 仅开计划路径时在终点标任务
+      const dest=pe.destination;
+      const d=world2canvas(dest[0],dest[1]);
+      const label=u.phase?`计划:${phaseLabel(u.phase)}`:cmdLabel||'计划';
+      const steps=pe.steps!=null?` ${pe.steps}步`:'';
       const text=`${label} (${dest[0]},${dest[1]})${steps}`;
       mctx.font='10px system-ui,sans-serif';
       mctx.textAlign='left';mctx.textBaseline='bottom';
       const tw=mctx.measureText(text).width;
       const lx=d.x+6,ly=d.y-6;
-      mctx.fillStyle='rgba(27,27,29,.82)';
+      mctx.globalAlpha=1;
+      mctx.fillStyle='rgba(27,27,29,.75)';
       mctx.fillRect(lx-3,ly-11,tw+6,13);
       mctx.fillStyle=color;
       mctx.fillText(text,lx,ly);
@@ -858,13 +939,16 @@ function renderHeaderAndChart(){
   actEl.className='chip chip-blue';
   const ml=$('modeLabel');
   const ageEl=$('pollAge');
+  const dkEl=$('dataKind');
   const ageMs=STATE.lastFetchOkAt?Date.now()-STATE.lastFetchOkAt:null;
   const stale=ageMs!=null&&ageMs>8000;
+  const tickN=s.tick!=null?s.tick:(STATE.lastSnapTick!=null?STATE.lastSnapTick:'?');
   if(STATE.mode==='live'){
-    ml.textContent=stale?'掉线/停滞':'实时';
+    ml.textContent=stale?`掉线/停滞 · tick ${tickN}`:`决策观测 · tick ${tickN}`;
     ml.className='mode-label '+(stale?'stale':'live');
+    ml.title='展示本 tick 决策输入位与已排队指令，不等于官方客户端结算动画帧';
   }else{
-    ml.textContent=`暂停(-${STATE.historyCursor})`;
+    ml.textContent=`暂停回放(-${STATE.historyCursor}) · tick ${tickN}`;
     ml.className='mode-label paused';
   }
   $('btnPause').textContent=STATE.mode==='live'?'⏸':'▶';
@@ -876,11 +960,17 @@ function renderHeaderAndChart(){
       ageEl.textContent='等待数据';
       ageEl.title='尚未成功拉取快照';
     }else{
-      const sec=Math.max(0,Math.round(ageMs/1000));
-      const tickTxt=STATE.lastSnapTick!=null?` tick ${STATE.lastSnapTick}`:'';
-      ageEl.textContent=sec<=1?`刚刚${tickTxt}`:`${sec}s前${tickTxt}`;
-      ageEl.title=`上次成功拉取距今 ${ageMs}ms`;
+      const sec=(ageMs/1000);
+      const tickTxt=STATE.lastSnapTick!=null?` · 决策tick ${STATE.lastSnapTick}`:'';
+      ageEl.textContent=ageMs<800?`刚刚${tickTxt}`:`${sec.toFixed(1)}s前${tickTxt}`;
+      ageEl.title=`上次成功拉取距今 ${ageMs}ms · poll=${STATE.pollMs}ms`;
     }
+  }
+  if(dkEl){
+    const kind=s.data_kind||(s.compact?'compact':'--');
+    const nCmd=Array.isArray(s.commands)?s.commands.length:null;
+    dkEl.textContent=nCmd!=null?`${kind} · ${nCmd}令`:`${kind}`;
+    dkEl.title='data_kind=command 表示单位 action 来自 Command Ledger';
   }
   try{renderTrend();}catch(err){console.warn('renderTrend',err);}
 }
@@ -966,21 +1056,26 @@ function showUnitPopover(u,cx,cy){
   if(u.shield!=null){
     rows.push(`<div class="row"><span class="k">护盾</span><span class="v">${u.shield}/${u.shield_max||5}</span></div>`);
   }
-  if(u.cargo!=null)rows.push(`<div class="row"><span class="k">货箱</span><span class="v">${u.cargo}</span></div>`);
+  // 本 tick 指令（主展示）
+  const cmdTxt=unitCommandLabel(u)||(u.action?actionLabel(u.action):'');
+  if(cmdTxt)rows.push(`<div class="row"><span class="k">本tick动作</span><span class="v">${cmdTxt}</span></div>`);
+  if(u.direction)rows.push(`<div class="row"><span class="k">方向</span><span class="v">${DIR_ZH[String(u.direction).toUpperCase()]||u.direction}</span></div>`);
+  if(u.next_cell&&Array.isArray(u.next_cell))rows.push(`<div class="row"><span class="k">下一步</span><span class="v">(${u.next_cell[0]},${u.next_cell[1]})</span></div>`);
+  if(u.cargo!=null)rows.push(`<div class="row"><span class="k">载货</span><span class="v">${u.cargo}</span></div>`);
   if(u.role)rows.push(`<div class="row"><span class="k">角色</span><span class="v">${roleLabel(u.role)}</span></div>`);
   if(u.ring!=null)rows.push(`<div class="row"><span class="k">环数</span><span class="v">${u.ring}</span></div>`);
   if(u.sector!=null)rows.push(`<div class="row"><span class="k">扇区</span><span class="v">${u.sector}</span></div>`);
-  if(u.phase)rows.push(`<div class="row"><span class="k">阶段</span><span class="v">${phaseLabel(u.phase)}</span></div>`);
+  if(u.phase)rows.push(`<div class="row"><span class="k">任务</span><span class="v">${phaseLabel(u.phase)}</span></div>`);
   if(u.target&&Array.isArray(u.target))rows.push(`<div class="row"><span class="k">目标</span><span class="v">(${u.target[0]},${u.target[1]})</span></div>`);
   const pe=u.path_estimate;
   if(pe){
-    if(pe.destination)rows.push(`<div class="row"><span class="k">目的地</span><span class="v">(${pe.destination[0]},${pe.destination[1]})</span></div>`);
-    if(pe.steps!=null)rows.push(`<div class="row"><span class="k">路径步数</span><span class="v">${pe.steps}${pe.approx?' ≈':''}</span></div>`);
-    if(pe.waypoints)rows.push(`<div class="row"><span class="k">路点数</span><span class="v">${pe.waypoints.length}</span></div>`);
-    if(pe.planned)rows.push(`<div class="row"><span class="k">规划</span><span class="v">${pe.planned}</span></div>`);
+    if(pe.destination)rows.push(`<div class="row"><span class="k">计划终点</span><span class="v">(${pe.destination[0]},${pe.destination[1]})</span></div>`);
+    if(pe.steps!=null)rows.push(`<div class="row"><span class="k">计划步数</span><span class="v">${pe.steps}${pe.approx?' ≈':''}</span></div>`);
+    if(pe.step_path)rows.push(`<div class="row"><span class="k">一步路径</span><span class="v">${pe.step_path.length}点</span></div>`);
+    if(pe.waypoints)rows.push(`<div class="row"><span class="k">计划路点</span><span class="v">${pe.waypoints.length}</span></div>`);
+    if(pe.planned)rows.push(`<div class="row"><span class="k">规划源</span><span class="v">${pe.planned}</span></div>`);
     if(pe.blocked&&pe.blocked.length)rows.push(`<div class="row"><span class="k">受阻格</span><span class="v">${pe.blocked.length}</span></div>`);
   }
-  if(u.action&&u.type==='CORE')rows.push(`<div class="row"><span class="k">动作</span><span class="v">${actionLabel(u.action)}</span></div>`);
   unitPopover.innerHTML=rows.join('');
   unitPopover.style.display='block';
   const wrapRect=$('mapWrap').getBoundingClientRect();
@@ -1005,6 +1100,8 @@ function bindControls(){
   $('btnFwd1').onclick=()=>{STATE.mode='paused';STATE.historyCursor=Math.max(STATE.historyCursor-1,0);tickOnce();};
   $('btnFwd10').onclick=()=>{STATE.mode='paused';STATE.historyCursor=Math.max(STATE.historyCursor-10,0);tickOnce();};
   $('cbPaths').onchange=e=>{STATE.showPaths=e.target.checked;drawMap(STATE.latestSnap);};
+  const cbPlan=$('cbPlanPaths');
+  if(cbPlan)cbPlan.onchange=e=>{STATE.showPlanPaths=e.target.checked;drawMap(STATE.latestSnap);};
   const cbDest=$('cbDest');
   if(cbDest)cbDest.onchange=e=>{STATE.showDestLabels=e.target.checked;drawMap(STATE.latestSnap);};
   const cbObs=$('cbObstacles');

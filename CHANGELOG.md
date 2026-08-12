@@ -16,7 +16,24 @@
 
 ## [Unreleased]
 
-（无）
+### Added
+
+- **Dashboard 指令真源（Command Ledger）**：[`bot/command_ledger.py`](bot/command_ledger.py) 记录本 tick 实际 SDK 动作；`instrument_turn` 包装 move/deposit/heal/harvest/sweep/shoot/wait/spawn 等，避免 intent≠command。
+- 快照单位字段：`action` / `direction` / `next_cell` / `step_path` / `command`；顶层 `commands`、`data_kind: "command"`、`prev_commands` / `prev_tick`。
+- 前端「决策观测」：主标签优先真实 action；默认只画本 tick 一步实线；工具栏可开计划路径虚线；`to_cargo`→前往掉落、cargo→载货；poll **150ms**；展示 data_kind·令数与拉取年龄。
+
+### Changed
+
+- 方向统一为运行时 **UP/DOWN/LEFT/RIGHT**（ledger 接受 N/E/S/W 别名）；历史紧凑帧保留 action/step_path。
+- Dashboard 模式文案由「实时」改为「决策观测 · tick N」，降低与官方同帧误解。
+
+### Docs
+
+- [`task.md`](task.md) 里程碑 A 关闭；B 轻量 / C 后端轻量注明。
+
+### 验证
+
+- 本地 `pytest tests/`：**241 passed**（含 `tests/test_command_ledger.py`）
 
 ---
 

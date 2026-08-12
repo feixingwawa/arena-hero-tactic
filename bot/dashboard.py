@@ -71,6 +71,11 @@ def _compact_history_frame(snap: dict) -> dict:
             "cargo": u.get("cargo"),
             "phase": econ.get("phase") or u.get("phase"),
             "role": econ.get("role") or u.get("role"),
+            # 指令真源轻量字段（暂停回放仍能看本 tick 动作）
+            "action": u.get("action"),
+            "direction": u.get("direction"),
+            "next_cell": u.get("next_cell"),
+            "step_path": u.get("step_path"),
         })
     # decision_logs 仅保留字符串摘要，供趋势图 deposit 标记
     dlogs_raw = snap.get("decision_logs") or []
@@ -106,6 +111,9 @@ def _compact_history_frame(snap: dict) -> dict:
         "decision_logs": dlogs,
         "data_source": snap.get("data_source", "arena_hero_sdk_turn"),
         "provider": snap.get("provider", "official SDK pipeline"),
+        "data_kind": snap.get("data_kind", "command"),
+        "commands": snap.get("commands") or [],
+        "prev_tick": snap.get("prev_tick"),
         "compact": True,
     }
 
@@ -907,6 +915,7 @@ def _build_unit(
     econ_states: Optional[dict],
     obstacles: Optional[set[tuple[int, int]]] = None,
     path_cache: Optional[dict] = None,
+    cmd_by_unit: Optional[dict] = None,
 ) -> dict:
     uid = str(getattr(u, "id", ""))
     pos_obj = getattr(u, "position", None)
@@ -961,10 +970,51 @@ def _build_unit(
     else:
         econ = {"target": None, "ring": None, "sector": None,
                 "phase": None, "role": None, "dedicated": None}
+
+    # 指令真源（本 tick 实际 SDK 调用）
+    cmd = None
+    if cmd_by_unit and uid in cmd_by_unit:
+        cmd = cmd_by_unit[uid]
+        if isinstance(cmd, dict):
+            pass
+        else:
+            cmd = getattr(cmd, "to_dict", lambda: None)() or None
+    action = None
+    direction = None
+    next_cell: Optional[list] = None
+    if isinstance(cmd, dict):
+        action = cmd.get("action")
+        direction = cmd.get("direction")
+        nc = cmd.get("next_cell")
+        if isinstance(nc, (list, tuple)) and len(nc) >= 2:
+            next_cell = [int(nc[0]), int(nc[1])]
+        # 无 econ target 时用指令 target
+        if tgt_list is None:
+            tc = cmd.get("target_cell")
+            if isinstance(tc, (list, tuple)) and len(tc) >= 2:
+                tgt_list = [int(tc[0]), int(tc[1])]
+                econ = dict(econ)
+                econ["target"] = tgt_list
+        if econ.get("phase") is None and cmd.get("phase"):
+            econ = dict(econ)
+            econ["phase"] = cmd.get("phase")
+        if econ.get("role") is None and cmd.get("role"):
+            econ = dict(econ)
+            econ["role"] = cmd.get("role")
+
     path_estimate = None
-    # 仅 Worker 估路径；优先 runtime A* 航点，与 guided 实际执行一致
     utype = str(getattr(u, "type", getattr(u, "unit_type", "")) or "")
-    if (tgt_list is not None or runtime_route) and "WORKER" in utype.upper():
+    # step_path：本 tick 真实一步（move 的 next_cell）— 前端默认只画这个
+    step_path: Optional[list] = None
+    if next_cell is not None:
+        step_path = [[int(ux), int(uy)], [int(next_cell[0]), int(next_cell[1])]]
+
+    # 多步计划：Worker 优先 runtime route；非 move 不强制长线
+    want_plan = (
+        (tgt_list is not None or runtime_route)
+        and ("WORKER" in utype.upper() or action == "move")
+    )
+    if want_plan and action in (None, "move", "sweep"):
         dest = tgt_list
         if dest is None and runtime_route:
             try:
@@ -972,6 +1022,8 @@ def _build_unit(
                 dest = [int(last[0]), int(last[1])]
             except Exception:
                 dest = None
+        if dest is None and next_cell is not None:
+            dest = list(next_cell)
         if dest is not None:
             path_estimate = _build_path_estimate(
                 (int(ux), int(uy)),
@@ -980,12 +1032,37 @@ def _build_unit(
                 cache=path_cache,
                 runtime_route=runtime_route,
             )
-    return {"id": uid,
-            "type": utype,
-            "x": int(ux), "y": int(uy),
-            "hp": int(getattr(u, "hp", 0) or 0),
-            "cargo": int(getattr(u, "cargo", 0) or 0),
-            "econ": econ, "path_estimate": path_estimate}
+    # 仅有一步时也给出最小 path_estimate，保证前端有东西画
+    if path_estimate is None and step_path is not None:
+        path_estimate = {
+            "steps": 1,
+            "waypoints": step_path,
+            "blocked": [],
+            "destination": list(next_cell) if next_cell else step_path[-1],
+            "approx": False,
+            "partial": False,
+            "planned": "step",
+        }
+    if path_estimate is not None and step_path is not None:
+        path_estimate = dict(path_estimate)
+        path_estimate["step_path"] = step_path
+        path_estimate["step_only_default"] = True
+
+    return {
+        "id": uid,
+        "type": utype,
+        "x": int(ux),
+        "y": int(uy),
+        "hp": int(getattr(u, "hp", 0) or 0),
+        "cargo": int(getattr(u, "cargo", 0) or 0),
+        "econ": econ,
+        "path_estimate": path_estimate,
+        "action": str(action) if action is not None else None,
+        "direction": str(direction) if direction is not None else None,
+        "next_cell": next_cell,
+        "step_path": step_path,
+        "command": cmd if isinstance(cmd, dict) else None,
+    }
 
 
 def build_snapshot(turn: Any, result: Any, memory: Any, econ_states: Optional[dict] = None) -> Optional[dict]:
@@ -1053,11 +1130,52 @@ def build_snapshot(turn: Any, result: Any, memory: Any, econ_states: Optional[di
     path_obstacles = _obstacle_set_from_memory(memory)
     # 同帧路径估算缓存：多 Worker 常指向同一 Core/矿点
     path_cache: dict = {}
+    # 本 tick 指令真源
+    commands_raw: list = []
+    try:
+        commands_raw = list(getattr(result, "commands", None) or [])
+    except Exception:
+        commands_raw = []
+    if not commands_raw:
+        try:
+            from bot.command_ledger import get_commands_dicts
+
+            commands_raw = get_commands_dicts()
+        except Exception:
+            commands_raw = []
+    cmd_by_unit: dict = {}
+    for c in commands_raw:
+        if not isinstance(c, dict):
+            continue
+        cid = str(c.get("unit_id") or "")
+        if cid:
+            cmd_by_unit[cid] = c
+    prev_commands_raw: list = []
+    prev_tick_val = None
+    try:
+        prev_commands_raw = list(getattr(result, "prev_commands", None) or [])
+        prev_tick_val = getattr(result, "prev_tick", None)
+    except Exception:
+        pass
+    if not prev_commands_raw:
+        try:
+            from bot.command_ledger import get_prev_commands_dicts, get_prev_tick
+
+            prev_commands_raw = get_prev_commands_dicts()
+            prev_tick_val = get_prev_tick()
+        except Exception:
+            pass
     units_list = []
     for u in all_units:
         try:
             units_list.append(
-                _build_unit(u, econ_states, path_obstacles, path_cache=path_cache)
+                _build_unit(
+                    u,
+                    econ_states,
+                    path_obstacles,
+                    path_cache=path_cache,
+                    cmd_by_unit=cmd_by_unit,
+                )
             )
         except Exception:
             continue
@@ -1094,6 +1212,7 @@ def build_snapshot(turn: Any, result: Any, memory: Any, econ_states: Optional[di
         # 数据来源标识（EXP-817061：明确标识真实来源，禁止前端把模拟数据当真实）
         "data_source": "arena_hero_sdk_turn",
         "provider": "bot.main run_session → official SDK submit pipeline",
+        "data_kind": "command",
         "tick": tick,
         "ts_ms": int(time.time() * 1000),
         "resources": int(resources_raw) if resources_raw is not None else None,
@@ -1108,6 +1227,9 @@ def build_snapshot(turn: Any, result: Any, memory: Any, econ_states: Optional[di
         "resource_cells": _safe_resource_cells(turn),
         "obstacles": _safe_obstacles(memory),
         "visible_enemies": _safe_visible_enemies(turn),
+        "commands": list(commands_raw),
+        "prev_commands": list(prev_commands_raw),
+        "prev_tick": int(prev_tick_val) if prev_tick_val is not None else None,
         "memory": {
             "explored_chunks": _safe_explored_chunks(memory),
             "explored_cells": _safe_explored_cells(memory),

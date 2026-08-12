@@ -34,13 +34,20 @@ class DecisionResult:
     has_near_threat: bool = False
     core_action: str = "none"
     logs: list[str] = field(default_factory=list)
+    # 本 tick 实际排队指令（Command Ledger 真源；Dashboard 优先展示）
+    commands: list[dict] = field(default_factory=list)
+    # 上一 tick 指令（跨 tick 结算对照，里程碑 C）
+    prev_commands: list[dict] = field(default_factory=list)
+    prev_tick: Optional[int] = None
 
     def summary(self) -> str:
         threat = "THREAT" if self.has_near_threat else "CLEAR"
+        n_cmd = len(self.commands) if self.commands else 0
         return (
             f"tick={self.tick} pop={self.population} res={self.resources} "
             f"W{self.counts.get('WORKER', 0)}/V{self.counts.get('VANGUARD', 0)}/"
             f"R{self.counts.get('RANGER', 0)} [{threat}] core={self.core_action}"
+            f" cmds={n_cmd}"
         )
 
 
@@ -74,6 +81,19 @@ def decide(
     pop = total_population(turn)
     core_pos = _core_position(turn)
     mem = memory if memory is not None else WORLD_MEMORY
+
+    # 指令真源：每 tick 清空 ledger 并对单位插桩（move/deposit/... 自动入账）
+    from bot.command_ledger import (
+        clear as clear_command_ledger,
+        enrich_from_intents,
+        get_commands_dicts,
+        get_prev_commands_dicts,
+        get_prev_tick,
+        instrument_turn,
+    )
+
+    clear_command_ledger(tick)
+    instrument_turn(turn, tick)
 
     result = DecisionResult(
         tick=tick,
@@ -222,6 +242,16 @@ def decide(
                 result.logs.extend(c_logs)
                 result.core_action = c_logs[-1] if c_logs else "heal"
 
+    # 用 Worker intent 回填 phase/role/target；导出本 tick + 上一 tick 指令
+    try:
+        from bot.economy import get_worker_states
+
+        enrich_from_intents(get_worker_states())
+    except Exception:
+        pass
+    result.commands = get_commands_dicts()
+    result.prev_commands = get_prev_commands_dicts()
+    result.prev_tick = get_prev_tick()
     return result
 
 
