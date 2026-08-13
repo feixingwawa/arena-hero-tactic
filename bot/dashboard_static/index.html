@@ -204,7 +204,7 @@ input[type=text]:focus{border-color:var(--ifm-color-primary);box-shadow:0 0 0 1p
       <div id="mapToolbar">
         <label><input type="checkbox" id="cbPaths" checked> 本 tick 一步</label>
         <label><input type="checkbox" id="cbPlanPaths"> 计划路径(虚线)</label>
-        <label><input type="checkbox" id="cbDest" checked> 动作/目的标签</label>
+        <label><input type="checkbox" id="cbDest" checked> 目的地标签</label>
         <label><input type="checkbox" id="cbObstacles" checked> 障碍物</label>
         <label><input type="checkbox" id="cbExplored" checked> 已探视野</label>
         <label><input type="checkbox" id="cbHeatmap"> 障碍热图</label>
@@ -713,7 +713,6 @@ function drawPaths(units){
     const pe=raw&&raw.path_estimate;
     const u=normUnit(raw);
     const color=actionPathColor(u.action,u.phase);
-    const cmdLabel=unitCommandLabel(u);
 
     // --- step path（实线，默认）---
     let stepWps=null;
@@ -777,39 +776,37 @@ function drawPaths(units){
       }
     }
 
-    // --- 非 move：单位旁动作 chip（不画假长线）---
-    const act=(u.action||'').toLowerCase();
-    const isStationary=act&&act!=='move'&&act!=='sweep';
-    if(STATE.showDestLabels&&(cmdLabel||isStationary)){
-      const p=world2canvas(u.x,u.y);
-      const text=cmdLabel||actionLabel(act);
-      if(text){
+    // --- 目的地菱形 + 阶段标签（标在终点，不是单位旁动作 chip）---
+    const hasTarget=u.target&&Array.isArray(u.target)&&u.target.length>=2;
+    const dest=(pe&&pe.destination)?pe.destination:(hasTarget?u.target:null);
+    if(dest){
+      const d=world2canvas(dest[0],dest[1]);
+      const sameAsStep=stepWps&&stepWps.length>=2
+        && Number(stepWps[stepWps.length-1][0])===Number(dest[0])
+        && Number(stepWps[stepWps.length-1][1])===Number(dest[1]);
+      if(!sameAsStep){
+        mctx.globalAlpha=1;
+        mctx.fillStyle=color;
+        mctx.beginPath();
+        const r=Math.max(3,s*0.35);
+        mctx.moveTo(d.x,d.y-r);mctx.lineTo(d.x+r,d.y);mctx.lineTo(d.x,d.y+r);mctx.lineTo(d.x-r,d.y);
+        mctx.closePath();mctx.fill();
+        mctx.strokeStyle='#fff';mctx.lineWidth=1;mctx.stroke();
+      }
+      if(STATE.showDestLabels){
+        const label=phaseLabel(u.phase);
+        const steps=pe&&pe.steps!=null?` ${pe.steps}步`:'';
+        const text=`${label} (${dest[0]},${dest[1]})${steps}`;
         mctx.font='10px system-ui,sans-serif';
         mctx.textAlign='left';mctx.textBaseline='bottom';
         const tw=mctx.measureText(text).width;
-        const lx=p.x+s*0.45,ly=p.y-s*0.35;
+        const lx=d.x+6,ly=d.y-6;
         mctx.globalAlpha=1;
-        mctx.fillStyle='rgba(27,27,29,.85)';
+        mctx.fillStyle='rgba(27,27,29,.82)';
         mctx.fillRect(lx-3,ly-11,tw+6,13);
         mctx.fillStyle=color;
         mctx.fillText(text,lx,ly);
       }
-    }else if(STATE.showDestLabels&&STATE.showPlanPaths&&pe&&pe.destination){
-      // 仅开计划路径时在终点标任务
-      const dest=pe.destination;
-      const d=world2canvas(dest[0],dest[1]);
-      const label=u.phase?`计划:${phaseLabel(u.phase)}`:cmdLabel||'计划';
-      const steps=pe.steps!=null?` ${pe.steps}步`:'';
-      const text=`${label} (${dest[0]},${dest[1]})${steps}`;
-      mctx.font='10px system-ui,sans-serif';
-      mctx.textAlign='left';mctx.textBaseline='bottom';
-      const tw=mctx.measureText(text).width;
-      const lx=d.x+6,ly=d.y-6;
-      mctx.globalAlpha=1;
-      mctx.fillStyle='rgba(27,27,29,.75)';
-      mctx.fillRect(lx-3,ly-11,tw+6,13);
-      mctx.fillStyle=color;
-      mctx.fillText(text,lx,ly);
     }
   }
   mctx.globalAlpha=1;
